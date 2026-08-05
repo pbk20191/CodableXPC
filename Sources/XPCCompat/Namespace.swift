@@ -10,9 +10,13 @@ import XPC
 ///
 ///     typealias XPCDictionary = XPCCompat.Dictionary
 ///
-/// - Important: Declare only stored properties and initializers inside this enum's body.
-///   Every other member belongs in a file-scope `extension XPCCompat.X`. Inside the enum
-///   body, an unqualified `Array` resolves to `XPCCompat.Array` rather than `Swift.Array`,
-///   and `Array()` compiles cleanly while producing the wrong type.
+/// - Important: Never write an unqualified `Array` or `Dictionary` anywhere lexically
+///   inside `enum XPCCompat` or any `extension XPCCompat`. In those scopes the bare name
+///   resolves to `XPCCompat.Array` / `XPCCompat.Dictionary` rather than to `Swift.Array` /
+///   `Swift.Dictionary`, and `Array()` *compiles cleanly while producing the wrong type* —
+///   only `Array(repeating:count:)` errors out. Always spell them out: `Swift.Array` /
+///   `Swift.Dictionary` for the standard library types, `XPCCompat.Array` /
+///   `XPCCompat.Dictionary` for these. `Tests/XPCCompatTests/ShadowingLintTests.swift`
+///   enforces this across the whole module.
 @available(macOS 10.15, iOS 13, tvOS 13, watchOS 6, *)
 public enum XPCCompat {}
