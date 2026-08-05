@@ -1744,6 +1744,17 @@ extension XPCCompat.Endpoint: CustomDebugStringConvertible {
 
 - [ ] **Step 4: Create SharedMemory**
 
+> **Corrected during execution — the code below is superseded.** Two defects were found:
+> `xpc_shmem_create` requires a region obtained from `mmap` with `MAP_SHARED` (`xpc/xpc.h:1081-1096`
+> explicitly warns that `malloc`-family memory is unsafe to share), so `posix_memalign` is wrong; and
+> `xpc_shmem_create` does not take ownership of the caller's mapping, so the initializer below leaks a
+> page-aligned mapping on every call. As shipped, `SharedMemory` is a `final class` holding
+> `private let owned: (UnsafeMutableRawPointer, Int)?` — non-nil only when the instance allocated the
+> region — with `init(_:)` setting `owned = nil`, `init?(byteCount:)` using
+> `mmap(nil, byteCount, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0)` and setting `owned`, and
+> `deinit` calling `munmap` only when `owned` is non-nil. `Endpoint` remains a struct; only `SharedMemory`
+> owns a resource. See `Sources/XPCCompat/SharedMemory.swift`.
+
 Create `Sources/XPCCompat/SharedMemory.swift`:
 
 ```swift
