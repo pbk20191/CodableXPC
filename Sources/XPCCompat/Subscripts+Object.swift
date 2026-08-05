@@ -126,6 +126,18 @@ extension XPCCompat.Array {
         return XPCCompat.Dictionary(value)
     }
 
+    /// Reads or writes a nested dictionary at `index`. The child is stored by reference, not copied.
+    public subscript(index: Int) -> XPCCompat.Dictionary? {
+        get { self[index, as: XPCCompat.Dictionary.self] }
+        set {
+            guard let newValue else {
+                preconditionFailure("XPCCompat.Array does not support removing elements by assigning nil")
+            }
+            precondition(index >= 0 && index < xpc_array_get_count(underlying), "index out of range")
+            xpc_array_set_value(underlying, index, newValue.underlying)
+        }
+    }
+
     /// Reads a nested array at `index`.
     public subscript(index: Int, as type: XPCCompat.Array.Type = XPCCompat.Array.self) -> XPCCompat.Array? {
         guard let value = self[index, as: xpc_object_t.self],
@@ -133,11 +145,54 @@ extension XPCCompat.Array {
         return XPCCompat.Array(value)
     }
 
+    /// Reads or writes a nested array at `index`. The child is stored by reference, not copied.
+    public subscript(index: Int) -> XPCCompat.Array? {
+        get { self[index, as: XPCCompat.Array.self] }
+        set {
+            guard let newValue else {
+                preconditionFailure("XPCCompat.Array does not support removing elements by assigning nil")
+            }
+            precondition(index >= 0 && index < xpc_array_get_count(underlying), "index out of range")
+            xpc_array_set_value(underlying, index, newValue.underlying)
+        }
+    }
+
     /// Reads an endpoint at `index`.
     public subscript(index: Int, as type: XPCCompat.Endpoint.Type = XPCCompat.Endpoint.self) -> XPCCompat.Endpoint? {
         guard let value = self[index, as: xpc_object_t.self],
               xpc_get_type(value) == XPC_TYPE_ENDPOINT else { return nil }
         return XPCCompat.Endpoint(value)
+    }
+
+    /// Reads or writes an endpoint at `index`.
+    public subscript(index: Int) -> XPCCompat.Endpoint? {
+        get { self[index, as: XPCCompat.Endpoint.self] }
+        set {
+            guard let newValue else {
+                preconditionFailure("XPCCompat.Array does not support removing elements by assigning nil")
+            }
+            precondition(index >= 0 && index < xpc_array_get_count(underlying), "index out of range")
+            xpc_array_set_value(underlying, index, newValue.underlying)
+        }
+    }
+
+    /// Reads a shared memory object at `index`.
+    public subscript(index: Int, as type: XPCCompat.SharedMemory.Type = XPCCompat.SharedMemory.self) -> XPCCompat.SharedMemory? {
+        guard let value = self[index, as: xpc_object_t.self],
+              xpc_get_type(value) == XPC_TYPE_SHMEM else { return nil }
+        return XPCCompat.SharedMemory(value)
+    }
+
+    /// Reads or writes a shared memory object at `index`.
+    public subscript(index: Int) -> XPCCompat.SharedMemory? {
+        get { self[index, as: XPCCompat.SharedMemory.self] }
+        set {
+            guard let newValue else {
+                preconditionFailure("XPCCompat.Array does not support removing elements by assigning nil")
+            }
+            precondition(index >= 0 && index < xpc_array_get_count(underlying), "index out of range")
+            xpc_array_set_value(underlying, index, newValue.underlying)
+        }
     }
 
     /// Reads the raw object at `index`.
