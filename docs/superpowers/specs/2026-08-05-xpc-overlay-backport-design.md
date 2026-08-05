@@ -330,6 +330,42 @@ Because decision 2 adopts Apple's envelope, the bridge carries Codable payloads 
 dictionaries — a `XPCCompat.Session` on one end and an `XPC.XPCSession` on the other can exchange typed
 values in both directions. Test 10 asserts exactly that.
 
+#### `XPCSession.init(fromConnection:)` — exported, undeclared, and it works
+
+`libswiftXPC.tbd` exports eight symbols for a family of initializers that appear in **no** public
+`.swiftinterface`, and the module ships no `.private.swiftinterface` either:
+
+```
+XPCSession.__allocating_init(fromConnection: OS_xpc_object, targetQueue: OS_dispatch_queue?,
+                             options: InitializationOptions,
+                             cancellationHandler: ((XPCRichError) -> ())?) throws -> XPCSession
+```
+
+plus three more taking the same `incomingMessageHandler` shapes as the public `xpcService:`/`machService:`
+families (`XPCDictionary`, `XPCReceivedMessage`, and a generic `Message: Decodable`), each in allocating
+(`fC`) and initializing (`fc`) form.
+
+This was verified end to end, not just by symbol lookup. Declaring the mangled name with `@_silgen_name`
+and passing the metatype as a trailing parameter links and runs: it produced
+`Session<(anonymous)>(Active)` from a plain `xpc_connection_create_from_endpoint` handle, auto-activated on
+empty options, and successfully sent a `Codable` payload that arrived at a raw C listener carrying the full
+coder-version-1 envelope.
+
+What this is good for, and what it is not:
+
+- It does **not** help the backport. `XPCSession` is macOS 14+, so like the `_4SWIFT` C symbols this only
+  exists where a caller could already use Apple's overlay directly.
+- It is the strongest **interop** route available, and strictly better than the `_4SWIFT` C pair for that
+  purpose, because it yields a real Swift `XPCSession` rather than a C handle. Combined with
+  `-[NSXPCConnection _xpcConnection]` above, it completes a path from legacy `NSXPCConnection` all the way
+  to Apple's modern typed session.
+- It is doubly unsafe to ship: undeclared SPI *and* dependent on `__allocating_init`'s calling convention
+  lining up with a global function declaration. Nothing guarantees that across toolchain or OS updates, and
+  a mismatch would corrupt registers rather than fail cleanly.
+
+Recorded as evidence for the Phase 5 ship-private-API decision, not as committed scope. The public
+`XPCEndpoint` bridge remains the only bridge in scope.
+
 #### NSXPCConnection
 
 A third bridge exists, to the older Foundation API. `NSXPCConnection` has a private ObjC method
