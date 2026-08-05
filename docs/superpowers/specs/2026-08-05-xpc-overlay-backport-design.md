@@ -59,55 +59,97 @@ All required C primitives are macOS 10.7 (`xpc_connection_create_mach_service`,
 `shmem_create`, `fd_create`, `equal`, `hash`), except `xpc_connection_activate` at 10.12 — all below the
 10.15 floor.
 
-### 2. Codable wire format: keep CodableXPC's native representation
+### 2. Codable wire format: reproduce Apple's envelope (coder version 1)
 
-**Apple does not encode Codable into typed XPC containers.** The macOS 15 build serializes the entire
-Codable graph into a custom tag-length-value byte stream and puts it in a *single* `xpc_data`, inside an
-envelope:
+**Apple does not encode Codable into typed XPC containers.** It serializes the whole Codable graph into a
+node-graph byte stream carried in a single `xpc_data`, inside an envelope. We reproduce it, so that
+`XPCCompat` interoperates with peers using Apple's `XPCSession` Codable overloads.
 
-| key | value |
-| --- | --- |
-| `_CodableBody` | `xpc_data` — the whole graph as one opaque TLV blob |
-| `_CodableIsSync` | `xpc_BOOL` |
-| `_CodableError` | present on the error path, carries an `XPCRichError` |
-| *(17-char key)* | `xpc_array` side table holding xpc-native handles, referenced from the blob by index |
+The format below is **not** taken from the decompiled dump. It was measured directly on this machine
+(macOS 27.0, build 26A5388g) by running Apple's real `XPCSession` against a plain C `xpc_connection`
+listener and dumping the bytes that crossed the wire. The probe is committed at
+`Tools/WireProbe/main.swift` and is the regression oracle for this decision.
 
-The TLV format itself: one tag byte (`wireType + 1`), then payload. `Int`, `Int64` and `UInt64` are
-**distinct wire types that never interconvert** (tags 2, 6, 11). Strings carry a `UInt64` little-endian
-`utf8count + 1` plus a trailing NUL. Length prefixes exclude themselves. `Data`, `Date`, `UUID` and
-`FileDescriptor` are **not** special-cased — this module has zero Foundation references, so they fall
-through to their stock `Codable` conformances (a `Date` becomes a `Double`). Keyed entries are emitted in
-Swift `Dictionary` hash order, which is per-process seeded, so even Apple's own output is not byte-stable
-across runs.
+This matters because the dump and the shipping binary disagree. The macOS 15-era dump implements an
+`EncodingBuffer` TLV stream where keyed entries come out in Swift `Dictionary` hash order — per-process
+seeded, so not even byte-stable run to run. The shipping macOS 26/27 build replaced that with the
+`GraphEncodingNode` design the RuntimeBrowser headers name, and **that design emits keys in declaration
+order**, which is what makes byte-exact reproduction achievable at all. Encoding against the dump would
+have produced a format no current OS speaks.
 
-And then Apple **replaced this whole design** between macOS 15 and 26/27, from `EncodingBuffer`-based TLV to
-the `GraphEncodingNode` family that the RuntimeBrowser headers describe.
+#### Envelope
 
-The conclusion is decisive: **Apple's Codable-over-XPC wire format is a private, unstable implementation
-detail that changed within two OS releases.** Chasing byte-compatibility with it is chasing a target that
-carries no compatibility guarantee, is unreproducible even run-to-run, and would replace `CodableXPC`'s
-readable native-XPC output with an opaque blob.
+| key | type | value |
+| --- | --- | --- |
+| `_CodableBody` | `data` | the node-graph byte stream (below) |
+| `_CodableCoderVersion` | `int64` | `1` on macOS 26/27; absent in the macOS 15 build |
+| `_CodableIsSync` | `bool` | true when sent by `sendSync` |
+| `_CodableOutOfLine` | `array` | large/opaque leaves referenced from the stream by index |
+| `_CodableOutOfLine4CodableObject` | `array` | xpc-native handles (connections, endpoints, fds) |
+| `_CodableError` | — | present only on the error-reply path |
 
-So: `XPCCompat` keeps `CodableXPC`'s existing representation — a Codable value maps to a natural
-`xpc_dictionary` / `xpc_array` with typed leaves. This is inspectable with `xpc_copy_description`, readable
-by non-Swift XPC peers, and stable because we define it.
+`_CodableCoderVersion` is the compatibility lever: emit `1`, and refuse to decode a body whose version is
+absent or greater than `1` rather than misparsing it.
 
-**Consequence, stated plainly: `XPCCompat` will not interoperate with a peer that uses Apple's `XPCSession`
-Codable overloads.** Interop with such a peer is possible only at the `XPCDictionary` level, where both
-sides speak plain XPC objects. This is the one deliberate incompatibility in the package and it goes in the
-README, not a footnote.
+#### Node graph
 
-### 3. `isSync` is recoverable; `expectsReply` needs a choice
+The payload is a flat sequence of nodes. The first node is the root; children are referenced by index and
+appended after it.
+
+```
+node      := 0x13 kind body
+kind      := 0x0a keyed | 0x0b unkeyed | 0x0c single-value
+separator := 0x15                 ; between nodes, absent after the last
+key       := 0x11 u64le(byteLen) utf8bytes 0x00      ; keyed nodes only
+childref  := 0x14 u32le(index)    ; 0-based over the nodes following the root
+```
+
+Keyed nodes are a flat run of `key value` pairs; unkeyed nodes a run of values; single-value nodes exactly
+one value. A value is either an inline primitive, a `childref`, or an out-of-line reference.
+
+#### Value tags
+
+| tag | type | payload | tag | type | payload |
+| --- | --- | --- | --- | --- | --- |
+| `0x00` | nil | none | `0x08` | `Int16` | 2 B LE |
+| `0x01` | `Bool` true | none | `0x09` | `Int32` | 4 B LE |
+| `0x02` | `Bool` false | none | `0x0a` | `Int64` | 8 B LE |
+| `0x03` | `String` | u64le byteLen, utf8, `0x00` | `0x0b` | `UInt` | 8 B LE |
+| `0x04` | `Float` | 4 B LE | `0x0c` | `UInt8` | 1 B |
+| `0x05` | `Double` | 8 B LE | `0x0d` | `UInt16` | 2 B LE |
+| `0x06` | `Int` | 8 B LE | `0x0e` | `UInt32` | 4 B LE |
+| `0x07` | `Int8` | 1 B | `0x0f` | `UInt64` | 8 B LE |
+| `0x12` | out-of-line | u32le index into `_CodableOutOfLine` | | | |
+
+Details that a naive implementation gets wrong, each verified by probe:
+
+- **`Int`, `Int64` and `UInt64` are distinct tags** (`0x06`, `0x0a`, `0x0f`) and never interconvert.
+  Normalizing everything to int64 will fail to decode against Apple.
+- **String length is UTF-8 *byte* count and excludes the trailing NUL.** `"é한"` encodes as
+  `03 05 00000000 00000000 c3 a9 ed 95 9c 00`. The macOS 15 build used `count + 1`; this one does not.
+- **`0x0a` is ambiguous by position** — keyed-node kind after `0x13`, `Int64` in a value slot.
+- **`Data` always goes out-of-line**, at any size: a 3-byte `Data` and a 40-byte `Data` both encode as an
+  unkeyed node holding `12 <u32 index>`, with the bytes in `_CodableOutOfLine`.
+- **`Date` becomes a `Double`** of `timeIntervalSinceReferenceDate` (epoch 0 → `-978307200.0`), not an
+  `xpc_date`. **`UUID` becomes a 36-character `String`.** Neither is special-cased — the overlay has no
+  Foundation dependency, so both fall through to their stock `Codable` conformances.
+- **A `nil` `Optional` property is omitted entirely**, because Swift's synthesized encoder calls
+  `encodeIfPresent`. An explicit `encodeNil(forKey:)` does emit tag `0x00`.
+- **The root node need not be keyed.** A top-level `Int` is `13 0c 06 …`; a top-level `[Int]` is
+  `13 0b 14 … 15 …`.
+
+`CodableXPC`'s existing `XPCEncoder`/`XPCDecoder`, which produce natural XPC containers, stay exactly as
+they are and remain the package's other product. `XPCCompat` adds a second, separate coder for this
+envelope. The two are not interchangeable and the README must say which is which.
+
+### 3. `isSync` needs no SPI; `expectsReply` does
 
 `XPCReceivedMessage.isSync` is not a C call — it reads a byte at metadata offset +17, populated from the
-`_CodableIsSync` key on the wire. It is a *protocol convention*, so it is fully backportable without SPI.
-Since we are not adopting Apple's envelope, `XPCCompat` defines its own single reserved key,
-`__xpccompat_sync`, set by `sendSync` and read by `ReceivedMessage.isSync`. Absent key reads as `false`,
-so messages from non-XPCCompat peers degrade cleanly.
+`_CodableIsSync` envelope key. It is a *protocol convention*, so adopting Apple's envelope gets it for free,
+with no SPI. Absent key reads as `false`, so messages from non-Swift peers degrade cleanly.
 
-Worth reproducing from Apple's design: when an incoming handler returns `nil` but the peer is blocked in
-`sendSync`, Apple synthesizes an error reply so the peer does not hang. `XPCCompat` does the same, using its
-own reserved error key.
+Reproduce Apple's safety net too: when an incoming handler returns `nil` but the peer is blocked in
+`sendSync`, Apple synthesizes an error reply under `_CodableError` so the peer does not hang.
 
 `expectsReply` is the one place Apple uses a genuinely undeclared symbol. `xpc_dictionary_expects_reply` is
 an exact export of libSystem (confirmed in `libSystem.B.tbd` and by `dlsym`) but appears in **no public
@@ -169,6 +211,9 @@ Sources/
   XPCCompat/      Namespace  Dictionary  Array  LiteralValue  Endpoint
                   SharedMemory  Activity  FileDescriptor  RichError
                   Session  Listener  ReceivedMessage  PeerRequirement  PeerHandler  Bridge
+                  Coder/  GraphEncoder  GraphDecoder  Envelope  OutOfLineTable  WireTag
+Tools/
+  WireProbe/      main.swift        # measures Apple's real output; oracle for test 4
 
 products: [.library("CodableXPC"), .library("XPCCompat")]
 ```
@@ -226,9 +271,16 @@ session layer does it before Swift sees anything — so this mapping is ours and
 
 ### Layer 3 — Codable
 
-No new machinery. `Session.send<Message: Encodable>`, `sendSync<Message, Reply>` and
-`ReceivedMessage.decode(as:)` call `CodableXPC.XPCEncoder` / `XPCDecoder` directly, producing native XPC
-containers per decision 2.
+A new `EnvelopeCoder` implementing the node-graph format in decision 2: `GraphEncoder` / `GraphDecoder`
+producing and consuming the `_CodableBody` byte stream, an out-of-line table manager for `Data` and
+xpc-native handles, and the envelope assembly around them. `Session.send<Message: Encodable>`,
+`sendSync<Message, Reply>` and `ReceivedMessage.decode(as:)` go through this.
+
+This is the largest single piece of new code in the package, and unlike everything else it is validated
+against an external oracle rather than against itself — see test 4.
+
+`CodableXPC.XPCEncoder` / `XPCDecoder` are untouched and keep producing natural XPC containers for callers
+who want that instead. Two coders, two purposes, both documented.
 
 ### Bridge — interop with the real overlay, SPI-free
 
@@ -249,8 +301,9 @@ They are rejected on two grounds: they are undeclared SPI, and they only exist w
 (macOS 13+), which is exactly where a caller could use Apple's overlay directly. They buy nothing a
 backport needs.
 
-Note the bridge carries messages, not Codable payloads — per decision 2 the two sides do not share a Codable
-wire format.
+Because decision 2 adopts Apple's envelope, the bridge carries Codable payloads too, not just raw
+dictionaries — a `XPCCompat.Session` on one end and an `XPC.XPCSession` on the other can exchange typed
+values in both directions. Test 10 asserts exactly that.
 
 ## Testing
 
@@ -261,9 +314,15 @@ wire format.
    repair, `xpc_equal`-based equality.
 3. **Divergence tests** — nil-assignment removes on every subscript; out-of-range integer assignment traps.
    These assert our *intended difference* from Apple, so they must not be written as parity tests.
-4. **Parity against the real overlay** — gated `@available(macOS 14, *)`, build the same message through
-   Apple's `XPC` and through `XPCCompat` at the `XPCDictionary` level, assert `xpc_equal`. Possible because
-   we do not re-export `XPC`. Explicitly **not** applied to Codable payloads.
+4. **Wire-format parity, byte for byte** — the load-bearing test for decision 2, and the reason
+   `Tools/WireProbe` is committed. Gated `@available(macOS 26, *)`, since coder version 1 is what we
+   implement. For a table of payloads covering every tag — each integer width, `Bool` both ways, empty and
+   non-ASCII `String`, nested and empty containers, explicit nil, `Data`, `Date`, `UUID`, and a non-keyed
+   root — encode through `XPCCompat` and through Apple's real `XPCSession`, then assert the `_CodableBody`
+   bytes are **identical**, not merely equivalent. Also assert `_CodableCoderVersion == 1` and that the
+   out-of-line arrays line up. Byte-exactness is only achievable because macOS 26/27 emits keys in
+   declaration order; if a future OS bumps the version, this test is what will catch it.
+   Round-trip the other direction too: decode Apple-produced bytes with our decoder.
 5. **Live IPC** — anonymous `Listener` plus `Session` over its `endpoint`, in-process, no launchd job.
    Covers send, sendSync, reply, reject, cancellation.
 6. **Sync safety net** — handler returns `nil` while peer is in `sendSync`; assert the peer gets an error
@@ -278,12 +337,16 @@ wire format.
 ## Delivery order
 
 1. **Values** — namespace, containers, subscript matrix, conformances. Tests 1, 2, 3, 11.
-2. **Transport** — `RichError`, `Session`, `Listener`, `ReceivedMessage`, `XPCPeerHandler`. Tests 5, 6, 9.
-3. **Descriptor and memory passing** — `SharedMemory`, `Activity`, FD/shmem subscripts. Tests 7, 8.
-4. **Bridge and parity** — endpoint interop. Tests 4, 10.
-5. **Peer requirements** — the spike below, then `PeerRequirement` or its `.unsupported` fallback.
+2. **Envelope coder** — the node-graph encoder and decoder, out-of-line tables, envelope assembly, and
+   test 4 against the real overlay. Deliberately placed second and verified in isolation, before any
+   transport code exists to confuse a failure: the oracle needs only two byte strings, not a live session.
+3. **Transport** — `RichError`, `Session`, `Listener`, `ReceivedMessage`, `XPCPeerHandler`. Tests 5, 6, 9.
+4. **Descriptor and memory passing** — `SharedMemory`, `Activity`, FD/shmem subscripts. Tests 7, 8.
+5. **Bridge** — endpoint interop, including typed payloads across the boundary. Test 10.
+6. **Peer requirements** — the spike below, then `PeerRequirement` or its `.unsupported` fallback.
 
-Phase 1 gates everything. Phases 2 and 3 are independent. Phases 4 and 5 depend on 2.
+Phase 1 gates everything. Phases 2 and 4 are independent of each other. Phase 3 depends on 2 (its
+`send<Encodable>` overloads need the coder). Phases 5 and 6 depend on 3.
 
 ## Open items
 
@@ -301,11 +364,22 @@ Phase 1 gates everything. Phases 2 and 3 are independent. Phases 4 and 5 depend 
    unspecified; do not test for a specific order.
 4. **`Activity` as a container value.** `XPC_TYPE_ACTIVITY` objects are delivered to activity handlers and
    are not known to appear inside messages. Confirm whether the container subscript is meaningful.
+5. **`_CodableOutOfLine4CodableObject` contents.** Every probe so far produced an empty array, because no
+   payload carried an xpc-native handle. Before implementing the out-of-line table, extend
+   `Tools/WireProbe` with a type conforming to `XPCCodableObjectRepresentable` — the protocol is exported
+   (`validXPCObjectTypes: Set<OpaquePointer>`, `init?(from: XPCCodable)`, `var xpcCodable: XPCCodable`) —
+   and measure how handles are indexed and whether connections use a distinct path, as the macOS 15 dump's
+   `xpc_array_set_connection` special case suggests.
+6. **Coder version drift.** We pin to version 1. Add a CI check that runs `Tools/WireProbe` on the newest
+   available OS and fails if `_CodableCoderVersion` is no longer `1`, so a format change is caught by us
+   rather than by a user's broken IPC.
 
 ## Explicitly out of scope
 
-- Byte-compatibility with Apple's Codable envelope (`_CodableBody` / TLV / `GraphEncodingNode`) — see
-  decision 2.
+- The macOS 15-era `EncodingBuffer` TLV format. We implement coder version 1 (macOS 26/27) only. A peer on
+  macOS 14–15 sends a body with no `_CodableCoderVersion` key and a different stream layout; we reject it
+  with a clear error rather than misparsing. Supporting it would mean a second encoder whose key order is
+  unreproducible by construction.
 - RAII shared-memory mapping and a typed activity-criteria builder.
 - `RawSpan` subscripts.
 - Re-exporting or shimming the `XPC` module.
