@@ -376,9 +376,35 @@ type encoding: @16@0:8
 returns:       OS_xpc_connection, xpc_get_type() == XPC_TYPE_CONNECTION
 ```
 
-Because `XPCCompat.Session` is built on `xpc_connection_t`, this would allow
+Because `XPCCompat.Session` is built on `xpc_connection_t`, it is tempting to conclude this allows
 `XPCCompat.Session(nsxpcConnection:)` — letting a codebase already using `NSXPCConnection` adopt typed
-messaging incrementally without replacing its transport.
+messaging without replacing its transport.
+
+**That does not work, and it was measured.** An earlier revision of this document claimed the accessor
+"completes a path from legacy `NSXPCConnection` to the modern typed session". It does not. Against an
+in-process `NSXPCListener`/`NSXPCConnection` pair:
+
+- Building a session directly on the extracted connection succeeds and reports `Active`, and the
+  `NSXPCConnection` keeps working *until the session is actually used*. The first `sendSync` fails with
+  "Underlying connection interrupted", the next `send` fails with "Attempting to send message using a
+  canceled session", and the `NSXPCConnection` is then dead — its next call returns "Couldn't communicate
+  with a helper application." So the session is non-functional **and** it destroys the connection it was
+  built on.
+- The endpoint detour — `xpc_endpoint_create` on the extracted connection, then
+  `xpc_connection_create_from_endpoint` — is explicitly undefined behaviour: `xpc/endpoint.h` states that
+  only connections obtained from `xpc_connection_create*()` may be passed. In practice it produces a
+  connection that talks to nothing; `sendSync` on it fails with "Underlying connection interrupted".
+
+The reason is that the `xpc_connection_t` under an `NSXPCConnection` is not a neutral pipe. NSXPC
+multiplexes its own framing over it, so injecting raw XPC dictionaries violates that protocol and the
+channel is torn down.
+
+**The supported alternative** is a second, separate channel rather than a takeover: have the far side create
+its own listener with `xpc_connection_create(nil, queue)`, pass the resulting `xpc_endpoint_t` across the
+existing `NSXPCConnection` as message content — endpoints exist to be embedded in messages — and build the
+session from `xpc_connection_create_from_endpoint` on that. That endpoint originates from a
+`xpc_connection_create*()` call, which is exactly what the header requires, and it is the same
+anonymous-listener-to-session path `Tools/WireProbe` already exercises.
 
 It is private API, so it is **not** part of the committed scope. It is recorded here as a viable Phase 5
 option, gated on the same question as `PeerRequirement`: whether this package is willing to ship private
