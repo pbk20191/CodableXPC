@@ -127,6 +127,10 @@ extension XPCCompat.Array {
     }
 
     /// Reads or writes a nested dictionary at `index`. The child is stored by reference, not copied.
+    /// - Precondition: on set, `index` is within bounds and `newValue` is non-nil.
+    ///   An `XPCCompat.Array` cannot remove elements, so assigning `nil` traps rather
+    ///   than doing nothing: `a[0] = someOptionalValue` is a crash when the optional
+    ///   is empty.
     public subscript(index: Int) -> XPCCompat.Dictionary? {
         get { self[index, as: XPCCompat.Dictionary.self] }
         set {
@@ -146,6 +150,10 @@ extension XPCCompat.Array {
     }
 
     /// Reads or writes a nested array at `index`. The child is stored by reference, not copied.
+    /// - Precondition: on set, `index` is within bounds and `newValue` is non-nil.
+    ///   An `XPCCompat.Array` cannot remove elements, so assigning `nil` traps rather
+    ///   than doing nothing: `a[0] = someOptionalValue` is a crash when the optional
+    ///   is empty.
     public subscript(index: Int) -> XPCCompat.Array? {
         get { self[index, as: XPCCompat.Array.self] }
         set {
@@ -165,6 +173,10 @@ extension XPCCompat.Array {
     }
 
     /// Reads or writes an endpoint at `index`.
+    /// - Precondition: on set, `index` is within bounds and `newValue` is non-nil.
+    ///   An `XPCCompat.Array` cannot remove elements, so assigning `nil` traps rather
+    ///   than doing nothing: `a[0] = someOptionalValue` is a crash when the optional
+    ///   is empty.
     public subscript(index: Int) -> XPCCompat.Endpoint? {
         get { self[index, as: XPCCompat.Endpoint.self] }
         set {
@@ -184,6 +196,10 @@ extension XPCCompat.Array {
     }
 
     /// Reads or writes a shared memory object at `index`.
+    /// - Precondition: on set, `index` is within bounds and `newValue` is non-nil.
+    ///   An `XPCCompat.Array` cannot remove elements, so assigning `nil` traps rather
+    ///   than doing nothing: `a[0] = someOptionalValue` is a crash when the optional
+    ///   is empty.
     public subscript(index: Int) -> XPCCompat.SharedMemory? {
         get { self[index, as: XPCCompat.SharedMemory.self] }
         set {
@@ -209,6 +225,10 @@ extension XPCCompat.Array {
     }
 
     /// Reads or writes a raw object at `index`.
+    /// - Precondition: on set, `index` is within bounds and `newValue` is non-nil.
+    ///   An `XPCCompat.Array` cannot remove elements, so assigning `nil` traps rather
+    ///   than doing nothing: `a[0] = someOptionalValue` is a crash when the optional
+    ///   is empty.
     public subscript(index: Int) -> xpc_object_t? {
         get { self[index, as: xpc_object_t.self] }
         set {

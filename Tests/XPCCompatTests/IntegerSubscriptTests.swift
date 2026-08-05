@@ -74,11 +74,12 @@ final class IntegerSubscriptTests: XCTestCase {
         XCTAssertEqual(d.count, 0)
     }
 
-    // Deliberate divergence: Apple silently drops an out-of-range unsigned
-    // assignment through the signed path. We refuse it loudly instead.
-    func testOutOfRangeUnsignedAssignmentTraps() {
-        // UInt.max cannot be represented as Int64; assigning it through the
-        // unsigned subscript is fine because it uses xpc_uint64.
+    // UInt.max cannot be represented as Int64, so Apple's signed path silently drops
+    // it. Ours refuses that loudly with a preconditionFailure — untestable here, since
+    // XCTest cannot assert a trap without a death-test harness. What this test does
+    // cover is the other half: the unsigned setter stores via xpc_uint64 and so
+    // round-trips UInt.max without loss.
+    func testUIntMaxRoundTripsThroughUnsignedSetter() {
         var d = XPCCompat.Dictionary()
         d["u"] = UInt.max
         XCTAssertEqual(d["u", as: UInt.self], UInt.max)

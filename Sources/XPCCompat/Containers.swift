@@ -10,6 +10,14 @@ extension XPCCompat {
     /// This is a struct with reference semantics: copying it retains the same underlying
     /// object, so mutating a copy is visible through the original. Use `copy(into:)` for
     /// an independent duplicate.
+    ///
+    /// - Note: An untyped integer literal is ambiguous on assignment. `d["n"] = 42` does
+    ///   not compile, because the literal fits both the `SignedInteger` and the
+    ///   `UnsignedInteger` setter and neither is more specialised. Say which you mean:
+    ///   `d["n"] = Int(42)` stores an `xpc_int64`, `d["n"] = UInt(42)` an `xpc_uint64`.
+    ///   This is inherent to matching Apple's overload shape, which is generic over
+    ///   `SignedInteger` and `UnsignedInteger` rather than concrete in `Int`. Reads are
+    ///   unaffected — `d["n", as: Int.self]` accepts either storage.
     public struct Dictionary {
         @usableFromInline
         internal let underlying: xpc_object_t

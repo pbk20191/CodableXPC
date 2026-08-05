@@ -12,10 +12,41 @@ final class CollectionOperationTests: XCTestCase {
         return d
     }
 
-    func testKeysAndValuesAgree() {
+    // `keys` and `values` are documented as being in the same order as each other.
+    // Iteration order itself is whatever xpc_dictionary_apply yields and is not
+    // specified, so this pins the pairing rather than a particular order: element i
+    // of `keys` and element i of `values` must be the same entry a single forEach
+    // pass sees at position i.
+    func testKeysAndValuesAgree() throws {
         let d = sampleDictionary()
         XCTAssertEqual(Swift.Set(d.keys), ["a", "b", "c"])
         XCTAssertEqual(d.values.count, 3)
+
+        var expectedKeys: [String] = []
+        var expectedValues: [xpc_object_t] = []
+        d.forEach { key, value in
+            expectedKeys.append(key)
+            expectedValues.append(value)
+        }
+
+        let keys = d.keys
+        let values = d.values
+        XCTAssertEqual(keys, expectedKeys)
+        XCTAssertEqual(keys.count, values.count)
+
+        for (index, (key, value)) in zip(keys, values).enumerated() {
+            XCTAssertEqual(key, expectedKeys[index], "keys[\(index)] out of step")
+            XCTAssertTrue(
+                xpc_equal(value, expectedValues[index]),
+                "values[\(index)] does not pair with keys[\(index)]"
+            )
+            // And the pair really is the entry stored under that key.
+            let stored = try XCTUnwrap(d[key, as: xpc_object_t.self])
+            XCTAssertTrue(
+                xpc_equal(value, stored),
+                "values[\(index)] is not the value stored under \(key)"
+            )
+        }
     }
 
     func testForEachVisitsEveryEntry() {
@@ -42,8 +73,11 @@ final class CollectionOperationTests: XCTestCase {
         XCTAssertEqual(visited, 1, "forEach must stop at the first throw")
     }
 
+    // removeValue(forKey:) is non-mutating, as in Apple's overlay: nothing in the
+    // struct changes, only the C object behind it. `let` here is the assertion — it
+    // would not compile if the method were marked `mutating`.
     func testRemoveValueReturnsOldValueAndRemovesKey() {
-        var d = sampleDictionary()
+        let d = sampleDictionary()
         let removed = d.removeValue(forKey: "a")
         XCTAssertNotNil(removed)
         XCTAssertEqual(d.count, 2)
@@ -51,19 +85,40 @@ final class CollectionOperationTests: XCTestCase {
     }
 
     func testRemoveValueForMissingKeyIsNil() {
-        var d = sampleDictionary()
+        let d = sampleDictionary()
         XCTAssertNil(d.removeValue(forKey: "zzz"))
         XCTAssertEqual(d.count, 3)
     }
 
     // copy(into:) is the escape hatch from reference semantics.
-    func testCopyIntoProducesIndependentDictionary() {
-        let source = sampleDictionary()
+    func testCopyIntoProducesIndependentDictionary() throws {
+        var source = sampleDictionary()
+        let child = XPCCompat.Dictionary()
+        source["child"] = child
+
         var destination = XPCCompat.Dictionary()
         source.copy(into: destination)
-        XCTAssertEqual(destination.count, 3)
+        XCTAssertEqual(destination.count, 4)
+
+        // Top level is independent: adding to one does not touch the other.
         destination["d"] = Int(4)
-        XCTAssertEqual(source.count, 3, "copy must be independent")
+        XCTAssertEqual(source.count, 4, "copy must be independent")
+
+        // But the copy is shallow: nested values are shared, not duplicated. The child
+        // is the same xpc object on both sides, so mutating it is visible through both.
+        let sourceChild = try XCTUnwrap(source["child", as: xpc_object_t.self])
+        let destinationChild = try XCTUnwrap(destination["child", as: xpc_object_t.self])
+        XCTAssertTrue(
+            xpc_equal(sourceChild, destinationChild),
+            "copy(into:) is documented as shallow: the child must be the same object"
+        )
+
+        var mutableChild = try XCTUnwrap(destination["child", as: XPCCompat.Dictionary.self])
+        mutableChild["added"] = Int(1)
+        XCTAssertEqual(
+            source["child", as: XPCCompat.Dictionary.self]?.count, 1,
+            "the shared child must be visible as mutated through the source too"
+        )
     }
 
     func testArrayForEachIsInIndexOrder() {

@@ -70,19 +70,41 @@ final class AppleParityTests: XCTestCase {
         let ours = XPCCompat.Dictionary(raw)
         let theirs = XPCDictionary(raw)
 
+        // Cross-comparisons alone would pass on mutual nil, so anchor each key
+        // absolutely as well as against Apple.
         XCTAssertEqual(ours["u", as: Int.self], theirs["u", as: Int.self])
+        XCTAssertEqual(ours["u", as: Int.self], 7, "uint64 storage must coerce to Int")
+        XCTAssertEqual(theirs["u", as: Int.self], 7)
+
         XCTAssertEqual(ours["d", as: Int.self], theirs["d", as: Int.self])
+        XCTAssertEqual(ours["d", as: Int.self], 3, "a whole double must coerce to Int")
+        XCTAssertEqual(theirs["d", as: Int.self], 3)
+
+        // A fractional double is the one that must be nil, on both sides.
         XCTAssertEqual(ours["frac", as: Int.self], theirs["frac", as: Int.self])
         XCTAssertNil(ours["frac", as: Int.self])
+        XCTAssertNil(theirs["frac", as: Int.self])
     }
 
     // Apple's Bool subscript is strict; confirm we are too.
     func testBoolStrictnessMatchesApple() {
         let raw = xpc_dictionary_create(nil, nil, 0)
         xpc_dictionary_set_int64(raw, "n", 1)
-        XCTAssertEqual(
-            XPCCompat.Dictionary(raw)["n", as: Bool.self],
-            XPCDictionary(raw)["n", as: Bool.self]
-        )
+        xpc_dictionary_set_bool(raw, "b", true)
+
+        let ours = XPCCompat.Dictionary(raw)
+        let theirs = XPCDictionary(raw)
+
+        // Strictness: an int64 1 is not a Bool. Both must say nil — and asserting the
+        // absolute value matters, because equal-and-both-nil is also what a subscript
+        // that never worked at all would produce.
+        XCTAssertEqual(ours["n", as: Bool.self], theirs["n", as: Bool.self])
+        XCTAssertNil(ours["n", as: Bool.self], "an int64 1 must not read as Bool")
+        XCTAssertNil(theirs["n", as: Bool.self])
+
+        // Positive control: a real xpc_bool does read, on both sides.
+        XCTAssertEqual(ours["b", as: Bool.self], theirs["b", as: Bool.self])
+        XCTAssertEqual(ours["b", as: Bool.self], true, "a real xpc_bool must read as true")
+        XCTAssertEqual(theirs["b", as: Bool.self], true)
     }
 }

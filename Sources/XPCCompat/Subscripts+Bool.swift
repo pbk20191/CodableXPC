@@ -48,6 +48,9 @@ extension XPCCompat.Array {
 
     /// Reads or writes a boolean at `index`.
     /// - Precondition: on set, `index` is within bounds and `newValue` is non-nil.
+    ///   An `XPCCompat.Array` cannot remove elements, so assigning `nil` traps rather
+    ///   than doing nothing: `a[0] = someOptionalValue` is a crash when the optional
+    ///   is empty.
     public subscript(index: Int) -> Bool? {
         get { self[index, as: Bool.self] }
         set {

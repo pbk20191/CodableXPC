@@ -60,6 +60,10 @@ extension XPCCompat.Array {
     }
 
     /// Reads or writes a floating-point value at `index`.
+    /// - Precondition: on set, `index` is within bounds and `newValue` is non-nil.
+    ///   An `XPCCompat.Array` cannot remove elements, so assigning `nil` traps rather
+    ///   than doing nothing: `a[0] = someOptionalValue` is a crash when the optional
+    ///   is empty.
     public subscript<T: BinaryFloatingPoint>(index: Int) -> T? {
         get { self[index, as: T.self] }
         set {

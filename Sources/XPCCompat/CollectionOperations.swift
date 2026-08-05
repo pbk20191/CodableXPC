@@ -50,8 +50,13 @@ extension XPCCompat.Dictionary {
     public var values: [xpc_object_t] { map { $0.value } }
 
     /// Removes `key` and returns the value it held, if any.
+    ///
+    /// Non-mutating, matching Apple's overlay (`.swiftinterface` line 337). Nothing in
+    /// the struct changes — the stored `xpc_object_t` is a `let` and it is the C object
+    /// behind it that is edited — so requiring `var` would only break `let d = …;
+    /// d.removeValue(forKey:)`, which compiles fine against Apple.
     @discardableResult
-    public mutating func removeValue(forKey key: String) -> xpc_object_t? {
+    public func removeValue(forKey key: String) -> xpc_object_t? {
         let existing = xpc_dictionary_get_value(underlying, key)
         xpc_dictionary_set_value(underlying, key, nil)
         return existing

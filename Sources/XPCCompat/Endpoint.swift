@@ -6,7 +6,7 @@ extension XPCCompat {
     /// A typed wrapper over an `XPC_TYPE_ENDPOINT` object.
     ///
     /// An endpoint is a transferable reference to a listener. Bridge to Apple's
-    /// `XPC.XPCEndpoint` by passing `underlyingEndpoint` to its public initializer.
+    /// `XPC.XPCEndpoint` by passing `underlying` to its public initializer.
     public struct Endpoint {
         @usableFromInline
         internal let underlyingEndpoint: xpc_object_t

@@ -1,6 +1,21 @@
 import XPC
 import Foundation
 
+/// Whether a raw value that `xpc_*_get_data` refused to hand bytes for is nonetheless
+/// an empty `Data`.
+///
+/// `xpc_dictionary_get_data` and `xpc_array_get_data` both signal "no bytes" by
+/// returning a null base pointer with a length of 0, and they do that for two
+/// unrelated situations: there is nothing readable there (missing key, or a value of
+/// some other type), and there is a real but empty `Data`. The out-parameters cannot
+/// distinguish the two, so the raw value has to be fetched separately and its type
+/// checked. Returns `true` only for the empty-`Data` case.
+@available(macOS 10.15, iOS 13, tvOS 13, watchOS 6, *)
+private func xpcIsEmptyData(_ value: xpc_object_t?) -> Bool {
+    guard let value else { return false }
+    return xpc_get_type(value) == XPC_TYPE_DATA
+}
+
 @available(macOS 10.15, iOS 13, tvOS 13, watchOS 6, *)
 extension XPCCompat.Dictionary {
 
@@ -30,12 +45,8 @@ extension XPCCompat.Dictionary {
         var length = 0
         let base = xpc_dictionary_get_data(underlying, key, &length)
         if base == nil && length == 0 {
-            // Distinguish between "key not found" and "valid empty data"
-            if let value = xpc_dictionary_get_value(underlying, key),
-               xpc_get_type(value) == XPC_TYPE_DATA {
-                return Data()
-            }
-            return nil
+            guard xpcIsEmptyData(xpc_dictionary_get_value(underlying, key)) else { return nil }
+            return Data()
         }
         guard let base = base else { return nil }
         return Data(bytes: base, count: length)
@@ -66,12 +77,8 @@ extension XPCCompat.Dictionary {
         var length = 0
         let base = xpc_dictionary_get_data(underlying, key, &length)
         if base == nil && length == 0 {
-            // Distinguish between "key not found" and "valid empty data"
-            if let value = xpc_dictionary_get_value(underlying, key),
-               xpc_get_type(value) == XPC_TYPE_DATA {
-                return try body(UnsafeRawBufferPointer(start: nil, count: 0))
-            }
-            return nil
+            guard xpcIsEmptyData(xpc_dictionary_get_value(underlying, key)) else { return nil }
+            return try body(UnsafeRawBufferPointer(start: nil, count: 0))
         }
         guard let base = base else { return nil }
         return try body(UnsafeRawBufferPointer(start: base, count: length))
@@ -89,6 +96,10 @@ extension XPCCompat.Array {
     }
 
     /// Reads or writes a string at `index`.
+    /// - Precondition: on set, `index` is within bounds and `newValue` is non-nil.
+    ///   An `XPCCompat.Array` cannot remove elements, so assigning `nil` traps rather
+    ///   than doing nothing: `a[0] = someOptionalValue` is a crash when the optional
+    ///   is empty.
     public subscript(index: Int) -> String? {
         get { self[index, as: String.self] }
         set {
@@ -106,18 +117,20 @@ extension XPCCompat.Array {
         var length = 0
         let base = xpc_array_get_data(underlying, index, &length)
         if base == nil && length == 0 {
-            // Distinguish between "index out of range" and "valid empty data"
-            let value = xpc_array_get_value(underlying, index)
-            if xpc_get_type(value) == XPC_TYPE_DATA {
-                return Data()
-            }
-            return nil
+            // Bounds were already checked above, so what is left to disambiguate here
+            // is a wrongly-typed element from a genuinely empty Data.
+            guard xpcIsEmptyData(xpc_array_get_value(underlying, index)) else { return nil }
+            return Data()
         }
         guard let base = base else { return nil }
         return Data(bytes: base, count: length)
     }
 
     /// Reads or writes binary data at `index`.
+    /// - Precondition: on set, `index` is within bounds and `newValue` is non-nil.
+    ///   An `XPCCompat.Array` cannot remove elements, so assigning `nil` traps rather
+    ///   than doing nothing: `a[0] = someOptionalValue` is a crash when the optional
+    ///   is empty.
     public subscript(index: Int) -> Data? {
         get { self[index, as: Data.self] }
         set {

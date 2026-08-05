@@ -78,6 +78,10 @@ extension XPCCompat.Array {
     }
 
     /// Reads or writes a signed integer at `index`.
+    /// - Precondition: on set, `index` is within bounds and `newValue` is non-nil.
+    ///   An `XPCCompat.Array` cannot remove elements, so assigning `nil` traps rather
+    ///   than doing nothing: `a[0] = someOptionalValue` is a crash when the optional
+    ///   is empty.
     public subscript<T: SignedInteger>(index: Int) -> T? {
         get { self[index, as: T.self] }
         set {
@@ -93,6 +97,10 @@ extension XPCCompat.Array {
     }
 
     /// Reads or writes an unsigned integer at `index`.
+    /// - Precondition: on set, `index` is within bounds and `newValue` is non-nil.
+    ///   An `XPCCompat.Array` cannot remove elements, so assigning `nil` traps rather
+    ///   than doing nothing: `a[0] = someOptionalValue` is a crash when the optional
+    ///   is empty.
     public subscript<T: UnsignedInteger>(index: Int) -> T? {
         get { self[index, as: T.self] }
         set {
