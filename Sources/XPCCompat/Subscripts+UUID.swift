@@ -1,6 +1,10 @@
 import XPC
 import Foundation
-import System
+
+// This file must not `import System`. See the `XPCCompatSystem` target — the
+// `System.FileDescriptor` subscripts live there so that `XPCCompat` itself
+// never links `libswiftSystem.dylib` (macOS 11+, not back-deployable), which
+// would abort a consumer at dyld time on macOS 10.15.
 
 @available(macOS 10.15, iOS 13, tvOS 13, watchOS 6, *)
 extension XPCCompat.Dictionary {
@@ -42,40 +46,6 @@ extension XPCCompat.Dictionary {
     }
 }
 
-@available(macOS 11, iOS 14, tvOS 14, watchOS 7, *)
-extension XPCCompat.Dictionary {
-
-    /// Reads a file descriptor. The returned descriptor is a duplicate owned by the
-    /// caller and must be closed.
-    public subscript(key: String, as type: FileDescriptor.Type = FileDescriptor.self) -> FileDescriptor? {
-        let raw = xpc_dictionary_dup_fd(underlying, key)
-        guard raw >= 0 else { return nil }
-        return FileDescriptor(rawValue: raw)
-    }
-
-    /// Reads or writes a file descriptor. The descriptor is duplicated on write.
-    /// Assigning `nil` removes the key.
-    public subscript(key: String) -> FileDescriptor? {
-        get { self[key, as: FileDescriptor.self] }
-        set {
-            guard let newValue else {
-                xpc_dictionary_set_value(underlying, key, nil)
-                return
-            }
-            xpc_dictionary_set_fd(underlying, key, newValue.rawValue)
-        }
-    }
-
-    /// Reads a file descriptor, falling back to `defaultValue`.
-    public subscript(
-        key: String,
-        as type: FileDescriptor.Type = FileDescriptor.self,
-        default defaultValue: @autoclosure () -> FileDescriptor
-    ) -> FileDescriptor {
-        self[key, as: FileDescriptor.self] ?? defaultValue()
-    }
-}
-
 @available(macOS 10.15, iOS 13, tvOS 13, watchOS 6, *)
 extension XPCCompat.Array {
 
@@ -91,6 +61,10 @@ extension XPCCompat.Array {
     }
 
     /// Reads or writes a UUID at `index`.
+    /// - Precondition: on set, `index` is within bounds and `newValue` is non-nil.
+    ///   An `XPCCompat.Array` cannot remove elements, so assigning `nil` traps
+    ///   rather than doing nothing: `a[0] = someOptionalUUID` is a crash when the
+    ///   optional is empty.
     public subscript(index: Int) -> uuid_t? {
         get { self[index, as: uuid_t.self] }
         set {
@@ -114,38 +88,5 @@ extension XPCCompat.Array {
         default defaultValue: @autoclosure () -> uuid_t
     ) -> uuid_t {
         self[index, as: uuid_t.self] ?? defaultValue()
-    }
-}
-
-@available(macOS 11, iOS 14, tvOS 14, watchOS 7, *)
-extension XPCCompat.Array {
-
-    /// Reads a file descriptor at `index`. The caller owns and must close it.
-    public subscript(index: Int, as type: FileDescriptor.Type = FileDescriptor.self) -> FileDescriptor? {
-        guard index >= 0, index < xpc_array_get_count(underlying) else { return nil }
-        let raw = xpc_array_dup_fd(underlying, index)
-        guard raw >= 0 else { return nil }
-        return FileDescriptor(rawValue: raw)
-    }
-
-    /// Reads or writes a file descriptor at `index`.
-    public subscript(index: Int) -> FileDescriptor? {
-        get { self[index, as: FileDescriptor.self] }
-        set {
-            guard let newValue else {
-                preconditionFailure("XPCCompat.Array does not support removing elements by assigning nil")
-            }
-            precondition(index >= 0 && index < xpc_array_get_count(underlying), "index out of range")
-            xpc_array_set_fd(underlying, index, newValue.rawValue)
-        }
-    }
-
-    /// Reads a file descriptor at `index`, falling back to `defaultValue`.
-    public subscript(
-        index: Int,
-        as type: FileDescriptor.Type = FileDescriptor.self,
-        default defaultValue: @autoclosure () -> FileDescriptor
-    ) -> FileDescriptor {
-        self[index, as: FileDescriptor.self] ?? defaultValue()
     }
 }
