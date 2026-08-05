@@ -614,10 +614,14 @@ extension XPCCompat.Dictionary {
 extension XPCCompat.Array {
 
     /// Reads a boolean. Returns `nil` if the index is out of range or the value is not a boolean.
+    ///
+    /// Note `xpc_array_get_value` returns a non-optional `xpc_object_t`, unlike
+    /// `xpc_dictionary_get_value`, so the bounds check and the type check are separate
+    /// statements rather than one `guard let` chain.
     public subscript(index: Int, as type: Bool.Type = Bool.self) -> Bool? {
-        guard index >= 0, index < xpc_array_get_count(underlying),
-              let value = xpc_array_get_value(underlying, index),
-              xpc_get_type(value) == XPC_TYPE_BOOL else { return nil }
+        guard index >= 0, index < xpc_array_get_count(underlying) else { return nil }
+        let value = xpc_array_get_value(underlying, index)
+        guard xpc_get_type(value) == XPC_TYPE_BOOL else { return nil }
         return xpc_bool_get_value(value)
     }
 
