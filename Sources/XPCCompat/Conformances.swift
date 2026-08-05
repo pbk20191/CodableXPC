@@ -4,7 +4,8 @@ import XPC
 @available(macOS 10.15, iOS 13, tvOS 13, watchOS 6, *)
 @usableFromInline
 internal func xpcDescription(_ object: xpc_object_t) -> String {
-    let raw = xpc_copy_description(object)
+    let raw: UnsafeMutablePointer<CChar>? = xpc_copy_description(object)
+    guard let raw = raw else { return "<xpc: no description>" }
     defer { free(raw) }
     return String(cString: raw)
 }
