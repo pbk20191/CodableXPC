@@ -305,6 +305,25 @@ Because decision 2 adopts Apple's envelope, the bridge carries Codable payloads 
 dictionaries — a `XPCCompat.Session` on one end and an `XPC.XPCSession` on the other can exchange typed
 values in both directions. Test 10 asserts exactly that.
 
+#### NSXPCConnection
+
+A third bridge exists, to the older Foundation API. `NSXPCConnection` has a private ObjC method
+`-_xpcConnection`, verified present and working on macOS 27:
+
+```
+type encoding: @16@0:8
+returns:       OS_xpc_connection, xpc_get_type() == XPC_TYPE_CONNECTION
+```
+
+Because `XPCCompat.Session` is built on `xpc_connection_t`, this would allow
+`XPCCompat.Session(nsxpcConnection:)` — letting a codebase already using `NSXPCConnection` adopt typed
+messaging incrementally without replacing its transport.
+
+It is private API, so it is **not** part of the committed scope. It is recorded here as a viable Phase 5
+option, gated on the same question as `PeerRequirement`: whether this package is willing to ship private
+API at all. If the answer there is no, this stays a documented recipe in the README rather than shipped
+code. Note the asymmetry — the `XPCEndpoint` bridge above needs no SPI, so it ships regardless.
+
 ## Testing
 
 1. **Value round-trip** — every XPC type through both container types, both subscript forms, `default:` on
