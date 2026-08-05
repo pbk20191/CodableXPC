@@ -12,13 +12,14 @@
 
 - Deployment floor: macOS 10.15 / iOS 13 / tvOS 13 / watchOS 6 / macCatalyst 13.1. Every public `XPCCompat` declaration carries `@available(macOS 10.15, iOS 13, tvOS 13, watchOS 6, *)`.
 - `Package.swift` `platforms:` stays at `.macOS(.v10_13)` — do **not** raise it. `CodableXPC` keeps its existing floor.
-- `System.FileDescriptor` members are additionally gated `@available(macOS 11, iOS 14, *)`.
+- `System.FileDescriptor` members are additionally gated `@available(macOS 11, iOS 14, *)` **and live in separate targets** (`CodableXPCSystem`, `XPCCompatSystem`). `CodableXPC` and `XPCCompat` must never `import System`: the resulting `LC_LOAD_DYLIB` on `libswiftSystem.dylib` is not availability-gated and kills a 10.15 consumer at load time.
+- Never declare unqualified `Array` / `Dictionary` construction anywhere lexically inside `enum XPCCompat` or any `extension XPCCompat`; spell them `Swift.Array` / `XPCCompat.Array`. Enforced by `Tests/XPCCompatTests/ShadowingLintTests.swift`.
 - The module must **not** `@_exported import XPC`. `import XPC` and `import XPCCompat` must coexist in one file.
 - Never declare members inside the `enum XPCCompat { }` body beyond stored properties and initializers. Everything else goes in a file-scope `extension XPCCompat.X`. Inside the enum body, bare `Array` resolves to `XPCCompat.Array` and compiles silently wrong.
 - Reference semantics. Do not add copy-on-write, `isKnownUniquelyReferenced`, or defensive `xpc_copy` in any accessor.
-- Subscript setters are plain `set` (mutating), matching Apple's interface — not `nonmutating set`.
+- Subscript setters are plain `set` (mutating), matching Apple's interface — not `nonmutating set`. This applies to subscripts only: `removeValue(forKey:)` is non-mutating, as Apple declares it.
 - No SPI. Only functions declared in public `xpc/*.h` headers.
-- Target name `XPCCompat`, product `XPCCompat`, depends on target `CodableXPC`.
+- Target name `XPCCompat`, product `XPCCompat`, depends on target `CodableXPC`. Plus `XPCCompatSystem` (depends on `XPCCompat`) and `CodableXPCSystem` (depends on `CodableXPC`) for the `System.FileDescriptor` surface, both `@available(macOS 11, iOS 14, tvOS 14, watchOS 7, *)` throughout.
 
 ---
 
@@ -1595,8 +1596,9 @@ git commit -m "feat(xpccompat): add uuid_t and FileDescriptor subscripts"
 **Interfaces:**
 - Consumes: Task 2 storage, Task 3 conformances.
 - Produces:
-  - `XPCCompat.Endpoint`: `init(_ endpoint: xpc_object_t)` (traps unless `XPC_TYPE_ENDPOINT`), `var underlyingEndpoint: xpc_object_t`, `Equatable`, `Hashable`, `CustomDebugStringConvertible`.
-  - `XPCCompat.SharedMemory`: `init(_ value: xpc_object_t)` (traps unless `XPC_TYPE_SHMEM`), `init(byteCount:)?`, `var underlyingShmem: xpc_object_t`.
+  - `XPCCompat.Endpoint`: `init(_ endpoint: xpc_object_t)` (traps unless `XPC_TYPE_ENDPOINT`), `public var underlying: xpc_object_t`, `Equatable`, `Hashable`, `CustomDebugStringConvertible`.
+  - `XPCCompat.SharedMemory`: `init(_ value: xpc_object_t)` (traps unless `XPC_TYPE_SHMEM`), `init(byteCount:)?`, `public var underlying: xpc_object_t`, `public func withUnsafeMutableBytes<R>(_:) rethrows -> R?`, `Equatable`, `Hashable`, `CustomDebugStringConvertible`.
+  - **Correction (2026-08-05).** An earlier revision of this contract named `underlyingEndpoint` and `underlyingShmem` as the public accessors. They are not: both are `internal` stored properties, and the public accessor on each type is `underlying`. Phase 2 must be written against `underlying`.
   - Subscripts on both containers for `XPCCompat.Dictionary`, `XPCCompat.Array`, `XPCCompat.Endpoint`, `XPCCompat.SharedMemory`, and raw `xpc_object_t` including lookup by `xpc_type_t`.
 
 - [ ] **Step 1: Write the failing test**

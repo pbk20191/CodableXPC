@@ -207,16 +207,30 @@ out — `struct XPCArray` has two inits and one method, with fifteen separate ex
 
 ```
 Sources/
-  CodableXPC/     XPCEncoder  XPCDecoder  XPCTransform  XPCCodingKey  XPCFileDescriptorProtocol
-  XPCCompat/      Namespace  Dictionary  Array  LiteralValue  Endpoint
-                  SharedMemory  Activity  FileDescriptor  RichError
-                  Session  Listener  ReceivedMessage  PeerRequirement  PeerHandler  Bridge
-                  Coder/  GraphEncoder  GraphDecoder  Envelope  OutOfLineTable  WireTag
+  CodableXPC/       XPCEncoder  XPCDecoder  XPCTransform  XPCCodingKey  XPCFileDescriptorProtocol
+  CodableXPCSystem/ FileDescriptor: XPCFileDescriptorProtocol
+  XPCCompat/        Namespace  Dictionary  Array  LiteralValue  Endpoint
+                    SharedMemory  Activity  RichError
+                    Session  Listener  ReceivedMessage  PeerRequirement  PeerHandler  Bridge
+                    Coder/  GraphEncoder  GraphDecoder  Envelope  OutOfLineTable  WireTag
+  XPCCompatSystem/  System.FileDescriptor container subscripts
 Tools/
-  WireProbe/      main.swift        # measures Apple's real output; oracle for test 4
+  WireProbe/        main.swift        # measures Apple's real output; oracle for test 4
 
-products: [.library("CodableXPC"), .library("XPCCompat")]
+products: [.library("CodableXPC"), .library("CodableXPCSystem"),
+           .library("XPCCompat"),   .library("XPCCompatSystem")]
 ```
+
+**The `System` surface is split into its own targets.** `@available` was not enough: `import System` puts a
+hard `LC_LOAD_DYLIB` on `/usr/lib/swift/libswiftSystem.dylib` into the consumer's binary, that dylib is
+macOS 11+ and is in no Swift back-deployment set (verified — `swift-5.0/macosx` in the toolchain ships
+`libswiftCore`, `libswiftDarwin`, `libswiftFoundation` and `libswiftXPC`, but no `libswiftSystem`), and the
+load command is not availability-gated. A consumer of `CodableXPC` or `XPCCompat` was therefore killed by
+dyld on macOS 10.15 before any code ran, which made the whole 10.15 floor fictional. Neither core target
+imports `System` any more. `XPCCompatSystem` reaches the wrapped object through the public
+`withUnsafeUnderlyingDictionary` / `withUnsafeUnderlyingArray` accessors, the stored property being
+internal. The invariant is checked by building a consumer package and asserting `libswiftSystem.dylib`
+is absent from `otool -l`.
 
 ### 7. Availability floor
 
@@ -224,7 +238,9 @@ Supported floor macOS 10.15 / iOS 13 / tvOS 13 / watchOS 6 / macCatalyst 13.1. `
 `Package.swift` is package-wide, so it stays at `.macOS(.v10_13)` rather than being raised — raising it
 would force existing `CodableXPC` adopters up for a target they may not use. Every public `XPCCompat`
 declaration instead carries `@available(macOS 10.15, iOS 13, tvOS 13, watchOS 6, *)`.
-`System.FileDescriptor` subscripts are gated to macOS 11 / iOS 14, matching swift-system.
+`System.FileDescriptor` subscripts are gated to macOS 11 / iOS 14, matching swift-system — and, per decision
+6, they live in the separate `XPCCompatSystem` / `CodableXPCSystem` targets, because the `@available` gate
+alone does not stop the consumer from linking `libswiftSystem.dylib` and dying at load time on 10.15.
 
 ## Architecture
 
@@ -233,9 +249,18 @@ declaration instead carries `@available(macOS 10.15, iOS 13, tvOS 13, watchOS 6,
 Structs wrapping one retained `xpc_object_t`: `Dictionary`, `Array`, `LiteralValue`, `Endpoint`,
 `SharedMemory`, `Activity`, `FileDescriptor`. Full typed-subscript matrix from the overlay (`Bool`,
 `BinaryInteger`, `SignedInteger`, `UnsignedInteger`, `BinaryFloatingPoint`, `String`, `uuid_t`,
-`FileDescriptor`, nested containers, `Endpoint`, raw `xpc_object_t`, lookup by `xpc_type_t`), each in its
-`as type:`, plain, and `default:` forms. Plus `copy(into:)`, `isEmpty`, `count`, both `forEach` shapes,
-`map`, and on `Dictionary` also `removeValue(forKey:)`, `keys`, `values`, `reply(_:)`.
+`FileDescriptor`, nested containers, `Endpoint`, raw `xpc_object_t`, lookup by `xpc_type_t`). Each has an
+`as type:` and a plain form; the `default:` form exists only where Apple has one — **corrected 2026-08-05**,
+an earlier revision of this document claimed all three forms for everything, which is wrong. Apple ships no
+`default:` overload for `String`, `XPCDictionary`, or the raw-object subscripts, and neither do we; the code
+is right and this sentence was not. Plus `copy(into:)`, `isEmpty`, `count`, both `forEach` shapes, `map`,
+and on `Dictionary` also `removeValue(forKey:)` (non-mutating, as Apple declares it), `keys`, `values`,
+`reply(_:)`.
+
+**Deliberate superset: the integer `default:` subscripts.** Apple has no `default:` overload for integers
+either, but we ship one, on both containers. It is consistent with the `Bool` and `BinaryFloatingPoint`
+`default:` overloads Apple *does* have, and it costs nothing to a caller who does not use it. Recorded here
+so that a later parity pass does not "fix" it by deleting API. Do not remove it.
 
 `SharedMemory` and `Activity` are typed values only — they round-trip through containers, Codable and
 `debugDescription`, but callers drive `xpc_shmem_map` / `xpc_activity_register` themselves.
@@ -352,15 +377,26 @@ code. Note the asymmetry — the `XPCEndpoint` bridge above needs no SPI, so it 
 10. **Endpoint bridge** — gated macOS 15+, `XPCCompat.Listener` accepting a connection from Apple's
     `XPCSession(endpoint:)` and vice versa.
 11. **Shadowing lint** — no unqualified `Array(` / `Dictionary(` inside `Sources/XPCCompat`.
+    *Status 2026-08-05:* Phase 1 first implemented this too narrowly — it only checked files containing
+    `public enum XPCCompat` for an empty enum body, and used a non-recursive directory listing. That missed
+    the `extension XPCCompat { … }` scope, where every type in the module is actually declared and where
+    the shadowing hazard is identical, and it would have skipped a future `Coder/` subdirectory entirely.
+    Corrected to the rule as written above: a recursive scan of `Sources/XPCCompat` rejecting any
+    unqualified `Array(` / `Dictionary(` construction, with `Swift.`- and `XPCCompat.`-qualified forms and
+    comments allowed. The empty-enum-body check is retained as an additional assertion.
 
 ## Delivery order
 
 1. **Values** — namespace, containers, subscript matrix, conformances. Tests 1, 2, 3, 11.
+   Also, pulled forward from phase 4: **`SharedMemory` and the `uuid_t` / `FileDescriptor` subscripts**.
+   They are pure value types with no transport dependency, so there was nothing to wait for. Phase 4 keeps
+   the live descriptor- and memory-passing tests (7 and 8), which do need a session.
 2. **Envelope coder** — the node-graph encoder and decoder, out-of-line tables, envelope assembly, and
    test 4 against the real overlay. Deliberately placed second and verified in isolation, before any
    transport code exists to confuse a failure: the oracle needs only two byte strings, not a live session.
 3. **Transport** — `RichError`, `Session`, `Listener`, `ReceivedMessage`, `XPCPeerHandler`. Tests 5, 6, 9.
-4. **Descriptor and memory passing** — `SharedMemory`, `Activity`, FD/shmem subscripts. Tests 7, 8.
+4. **Descriptor and memory passing** — `Activity`, and the live transfer tests 7 and 8. `SharedMemory` and
+   the FD/shmem subscripts were delivered in phase 1 (see above) and are no longer part of this phase.
 5. **Bridge** — endpoint interop, including typed payloads across the boundary. Test 10.
 6. **Peer requirements** — the spike below, then `PeerRequirement` or its `.unsupported` fallback.
 
