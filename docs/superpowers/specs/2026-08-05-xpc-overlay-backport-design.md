@@ -429,6 +429,22 @@ Phase 1 gates everything. Phases 2 and 4 are independent of each other. Phase 3 
    available OS and fails if `_CodableCoderVersion` is no longer `1`, so a format change is caught by us
    rather than by a user's broken IPC.
 
+7. **`CodableXPC` fd-passing regression for existing adopters.** Splitting `System.FileDescriptor` out of
+   the core targets was required to make the deployment floor real, but it created a silent behaviour
+   change: a consumer with `struct M: Codable { var fd: FileDescriptor }` still compiles and runs against
+   `CodableXPC` alone, and now encodes the descriptor as an `int64` instead of an `XPC_TYPE_FD`, because
+   the `FileDescriptor: XPCFileDescriptorProtocol` conformance moved to `CodableXPCSystem`. Both outcomes
+   were demonstrated during review. No compiler error, no runtime error — the peer just receives a
+   meaningless integer. Needs a migration note in `README.md` telling upgrading users to add the
+   `CodableXPCSystem` product if they pass file descriptors.
+8. **Shadowing-lint false positive on string literals.** The lint's comment stripper tracks string literals
+   so that `//` inside a string is not treated as a comment, but it still emits the string's contents — so
+   `let s = "Array( …"` would be reported as a violation. No current source trips it. Tighten only if it
+   ever fires.
+9. **`default:` coverage is asymmetric with Apple in both directions.** We ship an integer `default:`
+   overload Apple does not have (deliberate — see above), and we do **not** ship the `XPCArray` and
+   `XPCEndpoint` `default:` overloads Apple does have. Decide whether to close the second gap.
+
 ## Explicitly out of scope
 
 - The macOS 15-era `EncodingBuffer` TLV format. We implement coder version 1 (macOS 26/27) only. A peer on
