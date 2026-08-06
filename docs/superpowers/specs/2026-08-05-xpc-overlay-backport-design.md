@@ -345,11 +345,32 @@ plus three more taking the same `incomingMessageHandler` shapes as the public `x
 families (`XPCDictionary`, `XPCReceivedMessage`, and a generic `Message: Decodable`), each in allocating
 (`fC`) and initializing (`fc`) form.
 
-This was verified end to end, not just by symbol lookup. Declaring the mangled name with `@_silgen_name`
-and passing the metatype as a trailing parameter links and runs: it produced
-`Session<(anonymous)>(Active)` from a plain `xpc_connection_create_from_endpoint` handle, auto-activated on
-empty options, and successfully sent a `Codable` payload that arrived at a raw C listener carrying the full
-coder-version-1 envelope.
+This was verified end to end, not just by symbol lookup. Declared with `@_silgen_name` as a `static func`
+on `XPCSession`, it produces a live `Session<(anonymous)>(Active)`, auto-activates on empty options, and
+sends a `Codable` payload that arrives at a raw C listener with the full coder-version-1 envelope.
+
+**Ownership is the whole difficulty, and it is now settled.** The initializer *consumes* every
+reference-typed parameter — connection, target queue, and both handlers. The evidence is in the decompiled
+body: an "outlined consume of (`@escaping @callee_guaranteed @Sendable …`)" runs on the handler parameters
+along every exit path, and `swift_unknownObjectRelease` on the connection. A callee only destroys what it
+owns. So each is `@owned`, and the declaration must say `__owned`; `options` stays `@in_guaranteed`, being
+an `OptionSet` value type.
+
+Declaring them borrowed — the Swift default — over-releases, and the symptom depends only on what occupied
+the freed memory. A handler with a weak capture crashes deterministically in `swift_weakLoadStrong`, since
+the weak load dereferences side-table metadata. A strong capture passes whenever the captured object is
+retained elsewhere and fails otherwise. A real `targetQueue` crashes during teardown, long after `sendSync`
+succeeded. The connection crashes when the caller releases its own reference.
+
+With `__owned` all of that disappears, verified 10/10 across all four overloads with a real target queue and
+weak captures in both handler kinds — including releasing the session itself, which previously always
+trapped. Earlier revisions of this document prescribed a manual `Unmanaged.passRetained` donation, banned
+weak captures in handlers, and kept sessions alive for the process lifetime; all three were symptoms of the
+declaration lying about ownership and are retracted.
+
+The one rule that survives is not ours: cancel a session before dropping its last reference, or
+`-[OS_xpc_session _xref_dispose]` traps in `_xpc_api_misuse`. That is libxpc's contract for every
+`XPCSession` — a session built entirely with the public `XPCSession(endpoint:)` traps identically.
 
 What this is good for, and what it is not:
 
@@ -357,11 +378,11 @@ What this is good for, and what it is not:
   exists where a caller could already use Apple's overlay directly.
 - It is the strongest **interop** route available, and strictly better than the `_4SWIFT` C pair for that
   purpose, because it yields a real Swift `XPCSession` rather than a C handle. Combined with
-  `-[NSXPCConnection _xpcConnection]` above, it completes a path from legacy `NSXPCConnection` all the way
-  to Apple's modern typed session.
-- It is doubly unsafe to ship: undeclared SPI *and* dependent on `__allocating_init`'s calling convention
-  lining up with a global function declaration. Nothing guarantees that across toolchain or OS updates, and
-  a mismatch would corrupt registers rather than fail cleanly.
+  `-[NSXPCConnection _xpcConnection]` above, it lets both ends of an ExtensionKit-brokered channel speak
+  plain XPC instead of NSXPC.
+- It remains undeclared SPI, verified on exactly one toolchain and OS. If the symbols or their conventions
+  change it corrupts registers rather than failing cleanly, so the probes in `Tools/WireProbe` are the gate
+  before trusting a new release.
 
 Recorded as evidence for the Phase 5 ship-private-API decision, not as committed scope. The public
 `XPCEndpoint` bridge remains the only bridge in scope.
