@@ -33,8 +33,18 @@ public final class Transport: @unchecked Sendable {
     private var helloWaiter: CheckedContinuation<Result<ProtocolVersion, SetupError>, Never>?
     private var cancelled = false
 
-    public var inboundRequestHandler: RequestHandler?
-    public var inboundNotificationHandler: NotificationHandler?
+    private var _inboundRequestHandler: RequestHandler?
+    private var _inboundNotificationHandler: NotificationHandler?
+
+    public var inboundRequestHandler: RequestHandler? {
+        get { lock.withLock { _inboundRequestHandler } }
+        set { lock.withLock { _inboundRequestHandler = newValue } }
+    }
+
+    public var inboundNotificationHandler: NotificationHandler? {
+        get { lock.withLock { _inboundNotificationHandler } }
+        set { lock.withLock { _inboundNotificationHandler = newValue } }
+    }
 
     public var negotiatedVersion: ProtocolVersion? {
         lock.withLock { _negotiatedVersion }
@@ -79,10 +89,10 @@ public final class Transport: @unchecked Sendable {
                 resumeHelloWaiter(with: .failure(SetupError("could not send hello: \(error)")))
             }
         }
-        switch result {
-        case .success(let version):
-            lock.withLock { _negotiatedVersion = version }
-        case .failure(let error):
+        // `_negotiatedVersion` is written in `handleHelloAck`, before the waiter is
+        // resumed -- not here. That is what keeps the write ordered before any
+        // packet the peer sends immediately after its `helloAck`.
+        if case .failure(let error) = result {
             throw error
         }
     }
@@ -98,6 +108,9 @@ public final class Transport: @unchecked Sendable {
             // Typed throws: `error` is a RawTransportError here.
             return .failed(.transportCancelled(message: "\(error)"))
         }
+        // Bound to an explicitly typed local rather than passed as a literal: on Swift 6.4
+        // a throwing closure literal cannot be converted to a `throws(RawTransportError)`
+        // parameter. Do not inline this.
         let send: () throws(RawTransportError) -> Void = { try self.rawTransport.send(packet: packet) }
         return await requests.waitForReply(seq: seq, sending: send)
     }
@@ -158,9 +171,15 @@ public final class Transport: @unchecked Sendable {
 
     private func handleHello(_ packet: Packet) {
         guard role == .responder else { return }
-        guard let body = try? packet.payload.decode(as: HelloBody.self),
-              let version = ProtocolVersion.negotiate(peerMin: body.min, peerMax: body.max)
-        else {
+
+        let negotiated: ProtocolVersion? = (try? packet.payload.decode(as: HelloBody.self))
+            .flatMap { ProtocolVersion.negotiate(peerMin: $0.min, peerMax: $0.max) }
+
+        guard let version = negotiated else {
+            // Tell the peer before dying. A responder that merely cancels leaves the
+            // initiator's activate() suspended forever: this protocol has no timeout,
+            // so an absent reply is indistinguishable from a slow one.
+            sendHelloRejection()
             cancel(reason: "no common protocol version")
             return
         }
@@ -168,11 +187,23 @@ public final class Transport: @unchecked Sendable {
             kind: .helloAck, seq: nil,
             payload: Packet.Payload(encoding: HelloAckBody(version: version.rawValue))
         ) else {
+            sendHelloRejection()
             cancel(reason: "could not encode helloAck")
             return
         }
+        // Store before sending, so a packet the peer sends immediately on receiving
+        // this ack cannot arrive before our own version gate knows the answer.
         lock.withLock { _negotiatedVersion = version }
         try? rawTransport.send(packet: ack)
+    }
+
+    /// A `helloAck` carrying the reserved sentinel, meaning "no version in common".
+    private func sendHelloRejection() {
+        guard let rejection = try? makePacket(
+            kind: .helloAck, seq: nil,
+            payload: Packet.Payload(encoding: HelloAckBody(version: ProtocolVersion.unnegotiated.rawValue))
+        ) else { return }
+        try? rawTransport.send(packet: rejection)
     }
 
     private func handleHelloAck(_ packet: Packet) {
@@ -182,6 +213,12 @@ public final class Transport: @unchecked Sendable {
             return
         }
         let version = ProtocolVersion(rawValue: body.version)
+        guard version != .unnegotiated else {
+            resumeHelloWaiter(
+                with: .failure(SetupError("peer rejected the connection: no common protocol version"))
+            )
+            return
+        }
         guard version >= ProtocolVersion.minimumSupported,
               version <= ProtocolVersion.current
         else {
@@ -190,6 +227,7 @@ public final class Transport: @unchecked Sendable {
             )
             return
         }
+        lock.withLock { _negotiatedVersion = version }
         resumeHelloWaiter(with: .success(version))
     }
 

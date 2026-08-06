@@ -107,4 +107,29 @@ final class TransportTests: XCTestCase {
         server.handleReceived(packet: forged)
         try await Task.sleep(nanoseconds: 50_000_000)
     }
+
+    func testNegotiationFailureSurfacesAsAnErrorRatherThanHanging() async throws {
+        // A responder with nothing in common must say so. If it only cancels itself,
+        // activate() has no timeout to fall back on and suspends forever.
+        let (rawA, rawB) = InProcessRawTransport.makePair(debugName: "mismatch")
+        let client = Transport(debugName: "client", role: .initiator, rawTransport: rawA)
+        let server = Transport(debugName: "server", role: .responder, rawTransport: rawB)
+        try await server.activate()
+
+        // Drive the responder with a hello it cannot satisfy, bypassing the client's
+        // own well-formed hello.
+        let header = try XCTUnwrap(PacketHeader(version: .unnegotiated, kind: .hello, seq: nil))
+        let impossible = Packet(
+            header: header,
+            payload: try Packet.Payload(encoding: HelloBody(min: 5, max: 2))
+        )
+        server.handleReceived(packet: impossible)
+
+        do {
+            try await client.activate()
+            XCTFail("activate() should have thrown, not agreed a version")
+        } catch {
+            XCTAssertNil(client.negotiatedVersion)
+        }
+    }
 }
