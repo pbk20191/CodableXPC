@@ -37,6 +37,9 @@ let package = Package(
         .library(
             name: "XPCActors",
             targets: ["XPCActors"]),
+        .library(
+            name: "XPCCodable",
+            targets: ["XPCCodable"]),
     ],
     dependencies: [
     ],
@@ -63,6 +66,12 @@ let package = Package(
         .target(
             name: "XPCActors",
             dependencies: ["CodableXPC"]),
+        // Carrying Codable values over NSXPC, which can only move NSSecureCoding
+        // objects. Foundation only -- no dependency on CodableXPC, and no platform
+        // floor above the package's own, so a 10.13 consumer can use it.
+        .target(
+            name: "XPCCodable",
+            dependencies: []),
         .testTarget(
             name: "CodableXPCTests",
             dependencies: ["CodableXPC"]),
@@ -75,5 +84,8 @@ let package = Package(
         .testTarget(
             name: "XPCActorsTests",
             dependencies: ["XPCActors"]),
+        .testTarget(
+            name: "XPCCodableTests",
+            dependencies: ["XPCCodable"]),
     ]
 )
