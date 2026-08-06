@@ -57,6 +57,52 @@ final class InProcessRawTransportTests: XCTestCase {
         wait(for: [done], timeout: 2)
     }
 
+    func testDeliveryDoesNotRunInlineOnSend() throws {
+        // The decisive check: a correct implementation returns from send() with the
+        // packet merely enqueued, so the handler can observe that send() already
+        // finished. An implementation that delivers inline runs this handler while
+        // send() is still on the stack, so the signal never arrives and the wait
+        // times out. Deliberately a timed wait rather than an unbounded one -- a
+        // regression here should fail the suite, not hang it.
+        let (a, b) = InProcessRawTransport.makePair(debugName: "test")
+        let sendReturned = DispatchSemaphore(value: 0)
+        let delivered = expectation(description: "handler ran")
+        let outbound = try notification(1)
+
+        b.setPacketHandler { _ in
+            XCTAssertEqual(
+                sendReturned.wait(timeout: .now() + 2), .success,
+                "handler ran before send() returned -- delivery was inline"
+            )
+            delivered.fulfill()
+        }
+        try a.activate()
+        try b.activate()
+
+        try a.send(packet: outbound)
+        sendReturned.signal()
+        wait(for: [delivered], timeout: 5)
+    }
+
+    func testActivateAfterCancelThrows() throws {
+        let (a, _) = InProcessRawTransport.makePair(debugName: "test")
+        a.cancel(reason: "gone")
+        XCTAssertThrowsError(try a.activate()) { error in
+            XCTAssertEqual(error as? RawTransportError, .rawTransportCancelled(message: "gone"))
+        }
+    }
+
+    func testSecondCancelKeepsTheFirstReason() throws {
+        // The reason is the diagnostic a caller sees; a late second cancel must not
+        // overwrite the one that actually explains why the pipe died.
+        let (a, _) = InProcessRawTransport.makePair(debugName: "test")
+        a.cancel(reason: "first")
+        a.cancel(reason: "second")
+        XCTAssertThrowsError(try a.send(packet: notification(1))) { error in
+            XCTAssertEqual(error as? RawTransportError, .rawTransportCancelled(message: "first"))
+        }
+    }
+
     func testSendAfterCancelThrows() throws {
         let (a, b) = InProcessRawTransport.makePair(debugName: "test")
         try a.activate()
