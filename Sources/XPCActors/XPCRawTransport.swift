@@ -159,8 +159,17 @@ extension XPCRawTransport {
             }
         )
         let transport = XPCRawTransport(session: session, isAlreadyActive: true)
-        box.transport = transport
+        // Order matters, and this session is the reason. `accept` returns it already
+        // live, so `box.transport = transport` is the moment the transport becomes
+        // reachable from both handler closures -- a peer can die on the very next
+        // instruction. `handleSessionCancellation` reads and clears `self.box`
+        // unsynchronized, so if that publish came first it would race this assignment:
+        // the handler would see a nil box, skip the clear, and this line would then
+        // reinstate the transport -> session -> closure -> box -> transport cycle the
+        // clear exists to cut. Give the transport its box *before* anything can call
+        // into it.
         transport.box = box
+        box.transport = transport
         return (decision, transport)
     }
 }
@@ -196,8 +205,11 @@ extension XPCRawTransport {
             }
         )
         let transport = XPCRawTransport(session: session, isAlreadyActive: false)
-        box.transport = transport
+        // Not exposed here -- this session is created `.inactive`, so nothing can call
+        // back before `activate()`. Ordered the same way as `accepting` regardless, so
+        // the safe shape is the one this file consistently shows.
         transport.box = box
+        box.transport = transport
         return transport
     }
 }

@@ -287,7 +287,13 @@ final class TransportTests: XCTestCase {
         // handleReceived is synchronous on this white-box path, so there is nothing to
         // wait for; a sleep here would only pretend there were.
         server.handleReceived(packet: forged)
-        XCTAssertTrue(server.isCancelled, "a version mismatch must cancel, not drop")
+        // Bounded, and it returns early. A bare assertion would go red here but the
+        // process would still hang on the unbounded sendRequest below: a session that
+        // wrongly survives has no inboundRequestHandler installed, so handleNegotiated
+        // drops the follow-on request and nothing ever resolves it.
+        guard await waitUntil({ server.isCancelled }) else {
+            return XCTFail("a version mismatch must cancel the session, not drop the packet")
+        }
         // The far end learns too: the raw pipe is unlinked synchronously by the
         // responder's cancel, so the client's next send fails rather than hanging.
         let outcome = await client.sendRequest(
