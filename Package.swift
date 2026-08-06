@@ -34,6 +34,9 @@ let package = Package(
         .library(
             name: "XPCCompatSystem",
             targets: ["XPCCompatSystem"]),
+        .library(
+            name: "XPCActors",
+            targets: ["XPCActors"]),
     ],
     dependencies: [
     ],
@@ -52,6 +55,14 @@ let package = Package(
         .target(
             name: "XPCCompatSystem",
             dependencies: ["XPCCompat"]),
+        // macOS 14+ only: a DistributedActorSystem over XPC. Split out because
+        // `import Distributed` puts an LC_LOAD_DYLIB on libswiftDistributed.dylib,
+        // which is macOS 13+ and in no back-deployment set -- the same trap
+        // `import System` set for CodableXPC. A 10.15 consumer links CodableXPC
+        // and never loads it.
+        .target(
+            name: "XPCActors",
+            dependencies: ["CodableXPC"]),
         .testTarget(
             name: "CodableXPCTests",
             dependencies: ["CodableXPC"]),
@@ -61,5 +72,8 @@ let package = Package(
         .testTarget(
             name: "XPCCompatSystemTests",
             dependencies: ["XPCCompatSystem"]),
+        .testTarget(
+            name: "XPCActorsTests",
+            dependencies: ["XPCActors"]),
     ]
 )
