@@ -431,15 +431,19 @@ import XPC
 /// `xpc_copy_description` is not usable for this: its output includes pointer
 /// values and its dictionary ordering is unspecified.
 @available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
-func normalizedDescription(_ object: xpc_object_t) -> String {
+func normalizedDescription(_ object: xpc_object_t, topLevel: Bool = true) -> String {
     switch xpc_get_type(object) {
     case XPC_TYPE_DICTIONARY:
         var pairs: [String] = []
         xpc_dictionary_apply(object) { key, value in
-            pairs.append("\(String(cString: key))=\(normalizedDescription(value))")
+            pairs.append("\(String(cString: key))=\(normalizedDescription(value, topLevel: false))")
             return true
         }
-        return "dict{" + pairs.sorted().joined(separator: ",") + "}"
+        // The outermost object is always the thing under test, so it needs no type
+        // tag; nested values do, to keep a dictionary distinguishable from an array
+        // at a glance. Do not invert this: the golden fixtures are written to it.
+        let prefix = topLevel ? "" : "dict"
+        return prefix + "{" + pairs.sorted().joined(separator: ",") + "}"
     case XPC_TYPE_ARRAY:
         var items: [String] = []
         xpc_array_apply(object) { _, value in
@@ -661,7 +665,8 @@ final class PayloadTests: XCTestCase {
         }
 
         let payload = try Packet.Payload(encoding: Probe(key: key), userInfo: [key: "present"])
-        XCTAssertEqual(normalizedDescription(payload.object), "dict{seen=string(present)}")
+        // Unprefixed: this is a top-level call on the payload dictionary itself.
+        XCTAssertEqual(normalizedDescription(payload.object), "{seen=string(present)}")
     }
 
     func testUserInfoReachesTheDecoder() throws {
