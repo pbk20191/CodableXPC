@@ -149,7 +149,7 @@ public struct PublicPayload: Codable, Sendable { public init() {} }
 /// too, or they cannot satisfy a public shim requirement.
 @XPCService
 public protocol PublicService {
-    func work(_ value: PublicPayload) async throws -> PublicPayload
+    func work(_ value: XPCCodableMarker<PublicPayload>) async throws -> PublicPayload
 }
 
 /// Inherited protocols must not confuse the generator.

@@ -120,3 +120,36 @@ public final class CodableBox: NSObject, NSSecureCoding {
         "CodableBox(\(payload.count) bytes)"
     }
 }
+
+@propertyWrapper
+public struct XPCCodableMarker<T:Codable>: Codable {
+    
+    public var wrappedValue: T
+    
+    public init(wrappedValue: T) {
+        self.wrappedValue = wrappedValue
+    }
+    
+    public init(from decoder: any Decoder) throws {
+        self.wrappedValue = try decoder.singleValueContainer().decode(T.self)
+    }
+    
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(wrappedValue)
+    }
+    
+}
+
+extension KeyedEncodingContainer {
+    
+    public mutating func encode<T>(_ value: XPCCodableMarker<T>, forKey key: K) throws {
+        try self.encode(value.wrappedValue, forKey: key)
+    }
+    
+}
+
+extension XPCCodableMarker: Hashable where T:Hashable {}
+extension XPCCodableMarker: Equatable where T:Equatable {}
+extension XPCCodableMarker: Sendable where T: Sendable {}
+extension XPCCodableMarker: BitwiseCopyable where T: BitwiseCopyable {}

@@ -1,4 +1,9 @@
-import Foundation
+// Re-exported on purpose. Everything `@XPCService` generates names Foundation
+// types -- `@objc`, `NSObject`, `NSXPCConnection`, `NSXPCInterface` -- so a file
+// that uses the macro without importing Foundation fails with "@objc attribute
+// used without importing module 'Foundation'" pointing into generated code the
+// author never wrote. A macro cannot introduce an import, so the module carries it.
+@_exported import Foundation
 
 /// Generates the NSXPC plumbing for a protocol written in ordinary Swift types.
 ///
