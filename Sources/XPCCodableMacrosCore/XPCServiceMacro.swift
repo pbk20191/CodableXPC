@@ -9,6 +9,7 @@ enum XPCServiceDiagnostic: String, DiagnosticMessage {
     case unsupportedShape
     case duplicateSelector
     case associatedTypes
+    case unsupportedRequirement
 
     var severity: DiagnosticSeverity { .error }
     var diagnosticID: MessageID { MessageID(domain: "XPCCodableMacros", id: rawValue) }
@@ -30,6 +31,11 @@ enum XPCServiceDiagnostic: String, DiagnosticMessage {
                 """
         case .associatedTypes:
             return "@XPCService does not support protocols with associated types"
+        case .unsupportedRequirement:
+            return """
+                @XPCService supports method requirements only. NSXPC has no way to express \
+                a property, initializer, subscript, or static member across a connection.
+                """
         }
     }
 }
@@ -110,8 +116,10 @@ public struct XPCServiceMacro: PeerMacro {
             return []
         }
 
-        let methods = try parse(proto, node: node, in: context)
-        guard !methods.isEmpty else { return [] }
+        // nil means a requirement was rejected and a diagnostic already emitted;
+        // an empty array means the protocol simply has no methods, which is legal
+        // and yields an empty shim.
+        guard let methods = parse(proto, in: context) else { return [] }
 
         var seen = Set<String>()
         for method in methods where !seen.insert(method.selectorKey).inserted {
@@ -138,12 +146,18 @@ public struct XPCServiceMacro: PeerMacro {
 
     private static func parse(
         _ proto: ProtocolDeclSyntax,
-        node: AttributeSyntax,
         in context: some MacroExpansionContext
-    ) throws -> [Method] {
+    ) -> [Method]? {
         var methods: [Method] = []
         for member in proto.memberBlock.members {
-            guard let fn = member.decl.as(FunctionDeclSyntax.self) else { continue }
+            guard let fn = member.decl.as(FunctionDeclSyntax.self) else {
+                // Anything that is not a method cannot cross an NSXPC connection.
+                // Skipping it silently would leave the caller with a "cannot find
+                // GreeterXPC in scope" error pointing nowhere near the cause.
+                context.diagnose(Diagnostic(node: member.decl,
+                                            message: XPCServiceDiagnostic.unsupportedRequirement))
+                return nil
+            }
 
             let effects = fn.signature.effectSpecifiers
             let isAsync = effects?.asyncSpecifier != nil
@@ -161,7 +175,7 @@ public struct XPCServiceMacro: PeerMacro {
                 shape = .oneWay
             default:
                 context.diagnose(Diagnostic(node: fn, message: XPCServiceDiagnostic.unsupportedShape))
-                return []
+                return nil
             }
 
             let params = fn.signature.parameterClause.parameters
@@ -306,7 +320,7 @@ public struct XPCServiceMacro: PeerMacro {
             switch method.shape {
             case .twoWayValue:
                 return """
-                    func \(method.name)(\((boxed + ["reply: @escaping (CodableBox?, (any Error)?) -> Void"]).joined(separator: ", "))) {
+                    \(access)func \(method.name)(\((boxed + ["reply: @escaping (CodableBox?, (any Error)?) -> Void"]).joined(separator: ", "))) {
                         let implementation = self.implementation
                         Task {
                             do { reply(try CodableBox(try await implementation.\(method.name)(\(decoded))), nil) }
@@ -316,7 +330,7 @@ public struct XPCServiceMacro: PeerMacro {
                 """
             case .twoWayVoid:
                 return """
-                    func \(method.name)(\((boxed + ["reply: @escaping ((any Error)?) -> Void"]).joined(separator: ", "))) {
+                    \(access)func \(method.name)(\((boxed + ["reply: @escaping ((any Error)?) -> Void"]).joined(separator: ", "))) {
                         let implementation = self.implementation
                         Task {
                             do { try await implementation.\(method.name)(\(decoded)); reply(nil) }
@@ -326,7 +340,7 @@ public struct XPCServiceMacro: PeerMacro {
                 """
             case .oneWay:
                 return """
-                    func \(method.name)(\(boxed.joined(separator: ", "))) {
+                    \(access)func \(method.name)(\(boxed.joined(separator: ", "))) {
                         // One-way: there is no reply block, so a decode failure has nowhere
                         // to go. Dropping it matches NSXPC's own behaviour for such calls.
                         try? implementation.\(method.name)(\(decoded))

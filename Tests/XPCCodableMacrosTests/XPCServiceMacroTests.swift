@@ -98,6 +98,33 @@ final class XPCServiceMacroDiagnosticTests: XCTestCase {
             macros: macros)
     }
 
+    func testRejectsAPropertyRequirement() {
+        // NSXPC cannot carry a property. Before this diagnostic the macro generated
+        // nothing at all, and the caller got "cannot find SXPC in scope" pointing
+        // nowhere near the cause.
+        assertMacroExpansion(
+            """
+            @XPCService
+            protocol S {
+                var name: String { get }
+            }
+            """,
+            expandedSource: """
+            protocol S {
+                var name: String { get }
+            }
+            """,
+            diagnostics: [
+                DiagnosticSpec(
+                    message: """
+                        @XPCService supports method requirements only. NSXPC has no way to express \
+                        a property, initializer, subscript, or static member across a connection.
+                        """,
+                    line: 3, column: 5)
+            ],
+            macros: macros)
+    }
+
     func testRejectsSelectorCollision() {
         // Two Swift overloads, one Objective-C selector `f:`.
         assertMacroExpansion(

@@ -138,3 +138,31 @@ final class XPCServiceMacroBehaviourTests: XCTestCase {
     }
 }
 #endif
+
+#if canImport(Darwin)
+// Compile-time regressions. These are never called; that they build at all is the
+// assertion, and each one broke at some point during development.
+
+public struct PublicPayload: Codable, Sendable { public init() {} }
+
+/// A public protocol: the generated adapter's methods must carry the access level
+/// too, or they cannot satisfy a public shim requirement.
+@XPCService
+public protocol PublicService {
+    func work(_ value: PublicPayload) async throws -> PublicPayload
+}
+
+/// Inherited protocols must not confuse the generator.
+@XPCService
+protocol InheritingService: Sendable {
+    func work(_ value: PublicPayload) async throws -> PublicPayload
+}
+
+/// Argument labels have to survive into the Objective-C selector, and several
+/// parameters have to be boxed independently.
+@XPCService
+protocol LabelledService {
+    func move(to destination: PublicPayload) async throws -> PublicPayload
+    func pair(_ first: PublicPayload, with second: PublicPayload) async throws -> PublicPayload
+}
+#endif
