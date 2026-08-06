@@ -97,10 +97,3 @@ public struct Packet: @unchecked Sendable {
     }
 }
 
-@available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
-extension Packet {
-    public struct Payload: @unchecked Sendable {
-        let object: xpc_object_t
-        init(unchecked object: xpc_object_t) { self.object = object }
-    }
-}

@@ -14,6 +14,9 @@ func normalizedDescription(_ object: xpc_object_t, topLevel: Bool = true) -> Str
             pairs.append("\(String(cString: key))=\(normalizedDescription(value, topLevel: false))")
             return true
         }
+        // The outermost object is always the thing under test, so it needs no type
+        // tag; nested values do, to keep a dictionary distinguishable from an array
+        // at a glance. Do not invert this: the golden fixtures are written to it.
         let prefix = topLevel ? "" : "dict"
         return prefix + "{" + pairs.sorted().joined(separator: ",") + "}"
     case XPC_TYPE_ARRAY:
