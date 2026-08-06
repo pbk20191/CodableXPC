@@ -48,16 +48,84 @@ final class PacketEnvelopeTests: XCTestCase {
         XCTAssertNil(decoded.header.seq)
     }
 
-    // MARK: golden fixture — pins the wire format
+    // MARK: golden fixtures — pin the wire format
+    //
+    // The spec promises to pin "the envelope and every body type". If any assertion
+    // below fails, the wire format changed. That is allowed, but it must be
+    // deliberate: bump ProtocolVersion.current in the same commit.
 
-    func testEnvelopeGoldenFixture() throws {
+    func testRequestEnvelopeGoldenFixture() throws {
         let header = try XCTUnwrap(PacketHeader(version: .v1, kind: .request, seq: 42))
         let packet = Packet(header: header, payload: emptyBody())
-        // If this assertion fails, the wire format changed. That is allowed, but it
-        // must be deliberate: bump ProtocolVersion.current in the same commit.
         XCTAssertEqual(
             normalizedDescription(packet.rawValue),
             "{body=dict{},kind=uint64(0),seq=uint64(42),version=uint64(1)}"
+        )
+    }
+
+    func testReplyEnvelopeGoldenFixture() throws {
+        let header = try XCTUnwrap(PacketHeader(version: .v1, kind: .reply, seq: 42))
+        let packet = Packet(header: header, payload: emptyBody())
+        XCTAssertEqual(
+            normalizedDescription(packet.rawValue),
+            "{body=dict{},kind=uint64(1),seq=uint64(42),version=uint64(1)}"
+        )
+    }
+
+    func testNotificationEnvelopeGoldenFixture() throws {
+        let header = try XCTUnwrap(PacketHeader(version: .v1, kind: .notification, seq: nil))
+        let packet = Packet(header: header, payload: emptyBody())
+        XCTAssertEqual(
+            normalizedDescription(packet.rawValue),
+            "{body=dict{},kind=uint64(2),version=uint64(1)}"
+        )
+    }
+
+    func testHelloEnvelopeGoldenFixture() throws {
+        // The shape whose rules are easiest to break: version 0 ("not yet negotiated")
+        // and no seq at all. A `seq` appearing here would make it a request; a real
+        // version here would mean the sender had already negotiated one.
+        let header = try XCTUnwrap(PacketHeader(version: .unnegotiated, kind: .hello, seq: nil))
+        let packet = Packet(header: header, payload: emptyBody())
+        XCTAssertEqual(
+            normalizedDescription(packet.rawValue),
+            "{body=dict{},kind=uint64(3),version=uint64(0)}"
+        )
+    }
+
+    func testHelloAckEnvelopeGoldenFixture() throws {
+        let header = try XCTUnwrap(PacketHeader(version: .unnegotiated, kind: .helloAck, seq: nil))
+        let packet = Packet(header: header, payload: emptyBody())
+        XCTAssertEqual(
+            normalizedDescription(packet.rawValue),
+            "{body=dict{},kind=uint64(4),version=uint64(0)}"
+        )
+    }
+
+    func testHelloBodyGoldenFixture() throws {
+        let payload = try Packet.Payload(encoding: HelloBody(min: 1, max: 1))
+        XCTAssertEqual(
+            normalizedDescription(payload.object),
+            "{max=uint64(1),min=uint64(1)}"
+        )
+        // The value actually shipped today, so a change to the supported range shows up
+        // here rather than only in a live handshake.
+        XCTAssertEqual(
+            normalizedDescription(try Packet.Payload(encoding: HelloBody.current).object),
+            "{max=uint64(1),min=uint64(1)}"
+        )
+    }
+
+    func testHelloAckBodyGoldenFixture() throws {
+        XCTAssertEqual(
+            normalizedDescription(try Packet.Payload(encoding: HelloAckBody(version: 1)).object),
+            "{version=uint64(1)}"
+        )
+        // version 0 in the *body* is the rejection sentinel -- distinct from the
+        // envelope's version 0, which only means "not yet negotiated".
+        XCTAssertEqual(
+            normalizedDescription(try Packet.Payload(encoding: HelloAckBody(version: 0)).object),
+            "{version=uint64(0)}"
         )
     }
 

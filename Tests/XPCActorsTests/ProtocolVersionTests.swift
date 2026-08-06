@@ -20,6 +20,11 @@ final class ProtocolVersionTests: XCTestCase {
     func testNegotiatePicksHighestCommonVersion() {
         XCTAssertEqual(ProtocolVersion.negotiate(peerMin: 1, peerMax: 1), .v1)
         XCTAssertEqual(ProtocolVersion.negotiate(peerMin: 1, peerMax: 99), .current)
+        // A peer advertising the reserved sentinel as its floor still negotiates v1,
+        // never 0. This pins the normative rule that 0 is never a negotiated result;
+        // today it holds only because of the `Swift.max` against minimumSupported,
+        // which a refactor could quietly drop.
+        XCTAssertEqual(ProtocolVersion.negotiate(peerMin: 0, peerMax: 5), .v1)
     }
 
     func testNegotiateFailsWhenRangesDoNotOverlap() {

@@ -1,7 +1,12 @@
 import Foundation
 import XPC
 
-/// The four envelope keys. Exhaustive: a packet dictionary carries nothing else.
+/// The four envelope keys this version defines.
+///
+/// Not exhaustive on the receiving side: `Packet.init?(rawValue:)` validates these
+/// four and ignores any other key it finds. That leniency is deliberate, so a future
+/// version can add an envelope key without every older peer dropping the packet
+/// outright. We never write anything beyond these four.
 @available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
 public enum EnvelopeKey {
     public static let version = "version"

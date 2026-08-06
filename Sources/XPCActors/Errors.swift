@@ -29,12 +29,14 @@ public struct SetupError: Error, Equatable, Sendable, CustomStringConvertible {
     public var description: String { "SetupError(\(message))" }
 }
 
-/// A packet or body that does not satisfy the wire contract.
+/// A body that does not satisfy the wire contract.
+///
+/// Envelope violations are deliberately not represented here: `Packet.init?(rawValue:)`
+/// returns `nil` rather than throwing, because a malformed envelope is dropped, never
+/// surfaced to a caller.
 @available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
 public enum PacketCodingError: Error, Equatable, Sendable {
     /// A body encoded to something other than an xpc dictionary. Every body type
     /// in this protocol is a struct, so this means a programming error.
     case bodyIsNotADictionary
-    /// The envelope was absent, mistyped, or violated the presence rules for its kind.
-    case malformedEnvelope
 }

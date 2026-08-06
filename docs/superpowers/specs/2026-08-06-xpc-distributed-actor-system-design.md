@@ -117,12 +117,15 @@ Four layers, mirroring Apple's, with the seams in the same places.
 XPCActorSystem       DistributedActorSystem conformance; local actor registry
   └ Session          per-peer state; shared actors; in-flight invocations
       └ Transport    Packet framing; request correlation; backpressure
-          └ RawTransport   protocol: send(Packet) throws(RawTransportError)
+          └ RawTransportProtocol   send(Packet) throws(RawTransportError)
              ├ XPCRawTransport         XPCSession / XPCListener
              └ InProcessRawTransport   loopback
 ```
 
-The `RawTransport` seam is the load-bearing design decision. It makes every layer above it
+The protocol is named `RawTransportProtocol`, not `RawTransport`, mirroring Apple's own
+`XPCSystem.Transport.RawTransportProtocol` in the framework dump this design came from.
+
+The `RawTransportProtocol` seam is the load-bearing design decision. It makes every layer above it
 testable with no XPC, no second process, and no installed service, and it leaves room for an
 `xpc_connection_t`-backed transport later (which would lower the floor to macOS 13) without
 touching anything above.
@@ -142,9 +145,13 @@ Sources/XPCActors/
   Session.swift               session state machine
   SessionInterfaces.swift     LocalInterface / RemoteInterface / ActivationToken
   SessionOptions.swift
-  Packet.swift                Packet / Payload / envelope
-  Transport.swift             correlation, in-flight tables
-  RawTransport.swift          protocol and errors
+  ProtocolVersion.swift       version type and negotiation
+  Packet.swift                envelope: PacketHeader / PacketKind / Packet
+  Payload.swift               Packet.Payload -- XPCEncoder/XPCDecoder bridge
+  HandshakeBodies.swift       HelloBody / HelloAckBody
+  Transport.swift             correlation, negotiation, in-flight tables
+  RequestTable.swift          seq -> continuation
+  RawTransport.swift          the RawTransportProtocol seam
   XPCRawTransport.swift       XPCSession / XPCListener binding
   InProcessRawTransport.swift
   Service.swift               Service / EphemeralService
@@ -205,8 +212,18 @@ hello    body: { min: uint64, max: uint64 }
 helloAck body: { version: uint64 }
 ```
 
-The receiver picks the highest version in the intersection, or rejects by cancelling the session
-with a diagnostic. Cost is one round trip per session, incurred on first use.
+The receiver picks the highest version in the intersection, or rejects. Cost is one round trip
+per session, incurred on first use.
+
+**Rejection is a `helloAck` whose *body* `version` is `0`, sent immediately before the responder
+cancels.** Version 0 in the body is reserved for exactly this and is never a version a responder
+can choose. This is distinct from the *envelope* `version: 0` that every `hello` and `helloAck`
+carries, which only means "not yet negotiated" — the two zeros sit at different levels and mean
+different things.
+
+The rejection is sent rather than merely cancelling because this protocol has no timeout: a
+responder that dies silently leaves the initiator's `activate()` suspended forever, since an
+absent reply is indistinguishable from a slow one.
 
 ### Request body
 
@@ -359,6 +376,14 @@ cancels the corresponding execution `Task`.
 **There is no timeout, by decision.** `Task` cancellation is already the correct Swift idiom, and
 a caller wrapping a call in a timeout gets cancellation propagated to the peer for free. A
 library-level timeout would create a second, competing cancellation path. Apple also has none.
+
+**Having no timeout makes a death channel mandatory.** `RawTransportProtocol.setCancellationHandler`
+reports a pipe that died for a reason that did not originate on this side — the peer crashed,
+exited, or cancelled. Without it, a request whose peer is gone is indistinguishable from one whose
+peer is merely slow, and there is nothing behind it to break the wait. `Transport` installs a
+handler that resumes any outstanding `helloWaiter` with a failure and calls
+`RequestTable.failAll(with: .transportCancelled)`. It shares a one-shot `cancelled` flag with
+`Transport.cancel`, so a local cancel and a remote death cannot both run teardown.
 
 ## Invocation coding
 

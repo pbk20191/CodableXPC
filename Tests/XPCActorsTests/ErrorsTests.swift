@@ -23,8 +23,4 @@ final class ErrorsTests: XCTestCase {
         let error = SetupError("version 9 unsupported")
         XCTAssertTrue(error.description.contains("version 9 unsupported"))
     }
-
-    func testPacketCodingErrorCasesAreDistinct() {
-        XCTAssertNotEqual(PacketCodingError.bodyIsNotADictionary, .malformedEnvelope)
-    }
 }
