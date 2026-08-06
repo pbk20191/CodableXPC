@@ -73,9 +73,19 @@ back-deploying consumer simply does not link.
 
 - Package-wide `platforms:` stays at macOS 10.13 / Mac Catalyst 13.1. It is package-wide in
   SwiftPM and cannot be set per target.
-- Every declaration in `XPCActors` carries `@available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)`.
+- Most declarations in `XPCActors` carry `@available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)`.
   macOS 14 is the floor because `XPCSession` / `XPCListener` are macOS 14, which is above
   `Distributed`'s macOS 13.
+- **Endpoints are narrower, and this is not a blanket floor.** Measured against the shipping
+  overlay's `.swiftinterface` during Phase A: `XPCEndpoint`, `XPCSession.init(endpoint:…)`, and
+  `XPCListener.endpoint` are all `@available(macOS 15.0, macCatalyst 18.0, *)` and explicitly
+  `unavailable` on iOS, tvOS, and watchOS. Anything endpoint-based is therefore macOS 15 /
+  Mac Catalyst 18 and cannot exist on iOS at all. Two consequences:
+  - Phase A's `XPCRawTransport.connecting(to:)` and its real-XPC test carry the narrower
+    annotation; the rest of the type stays at macOS 14.
+  - **Phase C's `EphemeralService` is macOS 15 / Mac Catalyst 18 only.** It is built entirely on
+    an anonymous listener plus its endpoint, so there is no iOS implementation to write. The
+    plan for Phase C must scope it accordingly rather than assuming the macOS 14 floor.
 - Dependencies: `CodableXPC` only, plus Apple's `XPC` overlay via `import XPC`.
   **Not** `XPCCompat` — above macOS 14 the real overlay exists, and `XPCCompat.XPCDictionary`
   would collide with `XPC.XPCDictionary`.
@@ -85,6 +95,19 @@ back-deploying consumer simply does not link.
 
 `CodableXPC` already provides `XPCEncoder` and `XPCDecoder` with `userInfo` support on both
 sides. That is the whole coding foundation this design needs; no work is required in `XPCCompat`.
+
+### Two libxpc rules that trap rather than throw
+
+Both were established empirically in Phase A, by removing a guard and reading the resulting
+crash, because neither is expressed in the overlay's types or documentation. Later phases must
+respect them:
+
+- A session obtained from `IncomingSessionRequest.accept` is **already live**. Calling
+  `activate()` on it is not a catchable error — libxpc traps and the process dies. `XPCRawTransport`
+  carries an `isAlreadyActive` flag for exactly this, and it is load-bearing, not defensive.
+- An `XPCListener` created with `options: .none` is likewise already active, so a following
+  explicit `activate()` traps. Create listeners with `.inactive` when you intend to activate them
+  yourself.
 
 ## Architecture
 
