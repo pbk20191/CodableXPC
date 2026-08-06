@@ -65,6 +65,11 @@ final class XPCRawTransportTests: XCTestCase {
         XCTAssertEqual(try payload.decode(as: Ping.self), Ping(value: 42))
 
         client.cancel(reason: "test over")
+        // Also cancel the server-side transport, reached through the box the listener
+        // callback populated. This exercises the box-clearing added to
+        // XPCRawTransport.cancel(reason:) to break the transport -> session ->
+        // closure -> box -> transport retain cycle, on both ends of the pipe.
+        box.transport?.cancel(reason: "test over")
         listener.cancel()
     }
 }

@@ -15,6 +15,11 @@ public final class XPCRawTransport: RawTransportProtocol, @unchecked Sendable {
     private let lock = NSLock()
     private var handler: (@Sendable (Packet) -> Void)?
     private var cancellationReason: String?
+    /// The box whose closure keeps this transport reachable from the session's
+    /// incoming-message handler. Held so `cancel(reason:)` can break the resulting
+    /// retain cycle (transport -> session -> closure -> box -> transport); see
+    /// `cancel(reason:)`.
+    private var box: Box?
 
     /// - Parameter isAlreadyActive: `true` for a session handed to us by
     ///   `IncomingSessionRequest.accept`, which is live on return. Calling
@@ -63,6 +68,14 @@ public final class XPCRawTransport: RawTransportProtocol, @unchecked Sendable {
         }
         guard shouldCancel else { return }
         session.cancel(reason: reason)
+        // Break the retain cycle the message handler closes over. The transport holds
+        // the session, the session holds the closure, and the closure holds the box --
+        // so the box is where the loop has to be cut. This is the same cancel-before-
+        // release shape InProcessRawTransport uses when it unlinks remoteEnd. Clearing
+        // box.transport also means a packet delivered after cancellation finds nothing
+        // to dispatch to, a second layer beyond the `handler` check above.
+        box?.transport = nil
+        box = nil
     }
 
     /// Feed an inbound `XPCDictionary` in. Wire this to the session's or the
@@ -85,10 +98,17 @@ public final class XPCRawTransport: RawTransportProtocol, @unchecked Sendable {
 @available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
 extension XPCRawTransport {
 
-    /// Holds the transport so an incoming-message handler can reach it before the
-    /// transport itself exists.
+    /// Breaks the chicken-and-egg between a session's message handler and the
+    /// transport that handler dispatches to. Lock-guarded because `accepting`
+    /// returns a session that is already live: a peer's first message can reach
+    /// the handler before the assignment on the next line completes.
     final class Box: @unchecked Sendable {
-        var transport: XPCRawTransport?
+        private let lock = NSLock()
+        private var _transport: XPCRawTransport?
+        var transport: XPCRawTransport? {
+            get { lock.withLock { _transport } }
+            set { lock.withLock { _transport = newValue } }
+        }
     }
 
     /// Accept an inbound peer. The returned session is already live, so the
@@ -105,6 +125,7 @@ extension XPCRawTransport {
         )
         let transport = XPCRawTransport(session: session, isAlreadyActive: true)
         box.transport = transport
+        transport.box = box
         return (decision, transport)
     }
 }
@@ -138,6 +159,7 @@ extension XPCRawTransport {
         )
         let transport = XPCRawTransport(session: session, isAlreadyActive: false)
         box.transport = transport
+        transport.box = box
         return transport
     }
 }
