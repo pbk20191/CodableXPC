@@ -14,6 +14,7 @@ public final class XPCRawTransport: RawTransportProtocol, @unchecked Sendable {
     private let isAlreadyActive: Bool
     private let lock = NSLock()
     private var handler: (@Sendable (Packet) -> Void)?
+    private var cancellationHandler: (@Sendable (String) -> Void)?
     private var cancellationReason: String?
     /// The box whose closure keeps this transport reachable from the session's
     /// incoming-message handler. Held so `cancel(reason:)` can break the resulting
@@ -35,6 +36,10 @@ public final class XPCRawTransport: RawTransportProtocol, @unchecked Sendable {
 
     public func setPacketHandler(_ handler: @escaping @Sendable (Packet) -> Void) {
         lock.withLock { self.handler = handler }
+    }
+
+    public func setCancellationHandler(_ handler: @escaping @Sendable (String) -> Void) {
+        lock.withLock { self.cancellationHandler = handler }
     }
 
     public func activate() throws(RawTransportError) {
@@ -93,6 +98,31 @@ public final class XPCRawTransport: RawTransportProtocol, @unchecked Sendable {
             handler(packet)
         }
     }
+
+    /// The overlay told us the session died. Wire this to the `cancellationHandler:`
+    /// the session was built with.
+    ///
+    /// Deaths that originate here go through `cancel(reason:)` instead, which sets
+    /// `cancellationReason` *before* calling `session.cancel`. The overlay then calls
+    /// this method back for our own cancellation too, and the guard below is what
+    /// stops that echo from being reported to the layer above as a peer death.
+    func handleSessionCancellation(_ error: XPCRichError) {
+        let message = "XPCSession cancelled: \(error)"
+        let handler: (@Sendable (String) -> Void)? = lock.withLock {
+            guard cancellationReason == nil else { return nil }
+            cancellationReason = message
+            self.handler = nil
+            defer { cancellationHandler = nil }
+            return cancellationHandler
+        }
+        guard let handler else { return }
+        // The session is already gone, so the retain cycle that kept it reachable has
+        // nothing left to serve. Cut it here as well as in `cancel(reason:)`, otherwise
+        // a peer that dies first leaks the transport until someone cancels a dead pipe.
+        box?.transport = nil
+        box = nil
+        handler(message)
+    }
 }
 
 @available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
@@ -121,6 +151,11 @@ extension XPCRawTransport {
             incomingMessageHandler: { (message: XPCDictionary) -> XPCDictionary? in
                 box.transport?.handleIncoming(message)
                 return nil
+            },
+            // The overlay's death channel. Routed through the same box as the message
+            // handler, for the same reason: the transport does not exist yet here.
+            cancellationHandler: { (error: XPCRichError) in
+                box.transport?.handleSessionCancellation(error)
             }
         )
         let transport = XPCRawTransport(session: session, isAlreadyActive: true)
@@ -155,6 +190,9 @@ extension XPCRawTransport {
             incomingMessageHandler: { (message: XPCDictionary) -> XPCDictionary? in
                 box.transport?.handleIncoming(message)
                 return nil   // never use XPC's reply channel
+            },
+            cancellationHandler: { (error: XPCRichError) in
+                box.transport?.handleSessionCancellation(error)
             }
         )
         let transport = XPCRawTransport(session: session, isAlreadyActive: false)

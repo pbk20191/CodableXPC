@@ -5,6 +5,11 @@ import XPC
 @available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
 final class RequestTableTests: XCTestCase {
 
+    /// Lets a detached task publish its result without the test awaiting it.
+    final class OutcomeBox: @unchecked Sendable {
+        var outcome: RequestTable.Outcome?
+    }
+
     private func payload(_ marker: UInt64) -> Packet.Payload {
         let body = xpc_dictionary_create(nil, nil, 0)
         xpc_dictionary_set_uint64(body, "marker", marker)
@@ -39,6 +44,43 @@ final class RequestTableTests: XCTestCase {
         await table.complete(seq: 4, with: .reply(payload(2)))
         let count = await table.pendingCount
         XCTAssertEqual(count, 0)
+    }
+
+    func testDuplicateSeqFailsTheNewCallerAndLeavesTheExistingWaiter() async throws {
+        // Callers supply the seq, so a duplicate is reachable. Overwriting waiters[seq]
+        // would strand the displaced continuation: nothing would ever resume it, and
+        // with no timeout in this protocol its caller would hang forever.
+        let table = RequestTable()
+        // A `Task`, not an `async let`: an async-let child is implicitly cancelled and
+        // *awaited* at scope exit, so an early XCTFail return would hang here on a
+        // regression -- the displaced waiter is exactly the one nothing can resume.
+        let first = Task { await table.waitForReply(seq: 3, sending: {}) }
+        while await table.pendingCount == 0 { await Task.yield() }
+
+        // Run the duplicate in its own task and watch for it to *finish*, rather than
+        // awaiting it. A regressed implementation parks the duplicate instead of
+        // failing it, and a direct await would hang the suite instead of reddening it.
+        let box = OutcomeBox()
+        let duplicateTask = Task { box.outcome = await table.waitForReply(seq: 3, sending: {}) }
+        guard await waitUntil({ box.outcome != nil }) else {
+            duplicateTask.cancel()
+            return XCTFail("the duplicate parked instead of failing -- waiters[3] was overwritten")
+        }
+        guard case .failed(.transportCancelled(let message)) = box.outcome else {
+            return XCTFail("expected the second caller to fail, got \(String(describing: box.outcome))")
+        }
+        XCTAssertTrue(message.contains("duplicate request seq 3"), message)
+
+        let count = await table.pendingCount
+        XCTAssertEqual(count, 1, "the existing waiter must still be registered")
+        await table.complete(seq: 3, with: .reply(payload(5)))
+        guard await waitUntil({ await table.pendingCount == 0 }) else {
+            return XCTFail("the original waiter was stranded -- nothing can resume it")
+        }
+        guard case .reply(let got) = await first.value else {
+            return XCTFail("the original waiter must still be resolvable")
+        }
+        XCTAssertEqual(Packet.uint64(got.object, "marker"), 5)
     }
 
     func testSendFailureCompletesImmediately() async {

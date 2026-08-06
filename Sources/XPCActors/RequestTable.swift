@@ -28,11 +28,25 @@ public actor RequestTable {
     /// that lands on another task cannot slip in before the waiter is registered.
     /// Named `waitForReply` rather than `await` because `await` as a method name
     /// collides with the keyword at every call site.
+    ///
+    /// A `seq` that is already in flight fails the *new* caller and leaves the
+    /// existing waiter untouched. Overwriting would strand the displaced continuation:
+    /// nothing would ever resume it, and with no timeout in this protocol its caller
+    /// would hang forever. Callers reach this only by reusing an id from
+    /// `Transport.allocateSeq()`, which is a programming error, so it is reported as
+    /// one rather than papered over.
     public func waitForReply(
         seq: UInt64,
         sending send: () throws(RawTransportError) -> Void
     ) async -> Outcome {
-        await withTaskCancellationHandler {
+        // Checked before installing the cancellation handler, so the early return
+        // cannot let `onCancel` complete the *other* caller's waiter.
+        guard waiters[seq] == nil else {
+            return .failed(.transportCancelled(
+                message: "duplicate request seq \(seq): already in flight"
+            ))
+        }
+        return await withTaskCancellationHandler {
             await withCheckedContinuation { (continuation: CheckedContinuation<Outcome, Never>) in
                 if Task.isCancelled {
                     continuation.resume(returning: .failed(.taskCancelled))

@@ -11,9 +11,31 @@ public protocol RawTransportProtocol: AnyObject, Sendable {
     /// that arrive with no handler installed are dropped.
     func setPacketHandler(_ handler: @escaping @Sendable (Packet) -> Void)
 
+    /// Called when the pipe dies for a reason that did not originate on this side --
+    /// the peer crashed, exited, or cancelled. Install before `activate()`.
+    ///
+    /// This exists because the protocol has no timeout: without it, a request whose
+    /// peer died is indistinguishable from one whose peer is merely slow, and waits
+    /// forever.
+    func setCancellationHandler(_ handler: @escaping @Sendable (String) -> Void)
+
     func activate() throws(RawTransportError)
 
     func send(packet: Packet) throws(RawTransportError)
 
+    /// Tear the pipe down and release what it holds.
+    ///
+    /// **This call is mandatory, not merely tidy.** Every conformer holds a reference
+    /// cycle that only `cancel` breaks, because a live pipe must stay reachable from
+    /// the callback that feeds it:
+    ///
+    /// - `InProcessRawTransport` — each end strongly holds `remoteEnd`, so the pair
+    ///   keeps itself alive; `cancel` unlinks it.
+    /// - `XPCRawTransport` — transport → session → incoming-message closure → box →
+    ///   transport; `cancel` clears the box.
+    ///
+    /// A transport that is dropped without being cancelled leaks itself and its
+    /// session. `cancel` is idempotent and keeps the first reason, which is the one
+    /// that explains why the pipe died.
     func cancel(reason: String)
 }

@@ -14,6 +14,7 @@ public final class InProcessRawTransport: RawTransportProtocol, @unchecked Senda
     private let queue: DispatchQueue
     private var remoteEnd: InProcessRawTransport?
     private var handler: (@Sendable (Packet) -> Void)?
+    private var cancellationHandler: (@Sendable (String) -> Void)?
     private var activated = false
     private var cancellationReason: String?
 
@@ -33,6 +34,10 @@ public final class InProcessRawTransport: RawTransportProtocol, @unchecked Senda
 
     public func setPacketHandler(_ handler: @escaping @Sendable (Packet) -> Void) {
         lock.withLock { self.handler = handler }
+    }
+
+    public func setCancellationHandler(_ handler: @escaping @Sendable (String) -> Void) {
+        lock.withLock { self.cancellationHandler = handler }
     }
 
     public func activate() throws(RawTransportError) {
@@ -80,11 +85,31 @@ public final class InProcessRawTransport: RawTransportProtocol, @unchecked Senda
             guard cancellationReason == nil else { return nil }
             cancellationReason = reason
             handler = nil
+            // Our own cancellation never calls our own cancellation handler: that
+            // channel reports deaths that did *not* originate on this side.
+            cancellationHandler = nil
             let peer = remoteEnd
             remoteEnd = nil
             return peer
         }
-        // Unlink from the far side so its next send fails rather than vanishing.
-        peer?.lock.withLock { peer?.remoteEnd = nil }
+        guard let peer else { return }
+
+        // Unlink from the far side so its next send fails rather than vanishing, and
+        // pick up its cancellation handler in the same critical section. Our own lock
+        // is already released here: the two ends are locked strictly one at a time, so
+        // a simultaneous cancel from both directions cannot deadlock.
+        let peerHandler: (@Sendable (String) -> Void)? = peer.lock.withLock {
+            peer.remoteEnd = nil
+            guard peer.cancellationReason == nil else { return nil }
+            defer { peer.cancellationHandler = nil }
+            return peer.cancellationHandler
+        }
+        guard let peerHandler else { return }
+
+        // Dispatch with no lock held, and on the peer's own queue -- the same queue its
+        // packets arrive on, so a handler cannot observe a cancellation interleaved with
+        // a delivery it is already running.
+        let message = "peer cancelled: \(reason)"
+        peer.queue.async { peerHandler(message) }
     }
 }

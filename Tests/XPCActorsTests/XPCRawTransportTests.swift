@@ -37,7 +37,7 @@ final class XPCRawTransportTests: XCTestCase {
         let listener = XPCListener(targetQueue: nil, options: .inactive) { request in
             let (decision, raw) = XPCRawTransport.accepting(request)
             let transport = Transport(debugName: "server", role: .responder, rawTransport: raw)
-            transport.inboundRequestHandler = { payload, reply in
+            transport.inboundRequestHandler = { _, payload, reply in
                 guard let ping = try? payload.decode(as: Ping.self),
                       let body = try? Packet.Payload(encoding: Ping(value: ping.value + 1))
                 else { return }
@@ -60,7 +60,9 @@ final class XPCRawTransportTests: XCTestCase {
         await fulfillment(of: [serverReady], timeout: 5)
         XCTAssertEqual(client.negotiatedVersion, .current, "hello must complete over real XPC")
 
-        let outcome = await client.sendRequest(try Packet.Payload(encoding: Ping(value: 41)))
+        let outcome = await client.sendRequest(
+            seq: client.allocateSeq(), try Packet.Payload(encoding: Ping(value: 41))
+        )
         guard case .reply(let payload) = outcome else { return XCTFail("expected a reply") }
         XCTAssertEqual(try payload.decode(as: Ping.self), Ping(value: 42))
 

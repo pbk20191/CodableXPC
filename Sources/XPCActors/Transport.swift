@@ -18,8 +18,14 @@ public enum TransportRole: Sendable {
 @available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
 public final class Transport: @unchecked Sendable {
 
+    /// Handles one inbound request: `(seq, body, reply)`.
+    ///
+    /// The `seq` is the envelope's correlation id. It is passed in because Phase B's
+    /// cancellation is a notification naming a `requestSeq`: without the id, a
+    /// receiver cannot map an inbound `invocationCancelled` onto the execution it
+    /// started.
     public typealias RequestHandler =
-        @Sendable (Packet.Payload, @escaping @Sendable (Packet.Payload) -> Void) -> Void
+        @Sendable (UInt64, Packet.Payload, @escaping @Sendable (Packet.Payload) -> Void) -> Void
     public typealias NotificationHandler = @Sendable (Packet.Payload) -> Void
 
     private let debugName: String
@@ -50,6 +56,16 @@ public final class Transport: @unchecked Sendable {
         lock.withLock { _negotiatedVersion }
     }
 
+    /// Internal for tests: teardown has run, from either our own `cancel` or the
+    /// raw transport's death channel.
+    var isCancelled: Bool { lock.withLock { cancelled } }
+
+    /// Internal for tests: an `activate()` is parked awaiting `helloAck`.
+    var hasOutstandingHelloWaiter: Bool { lock.withLock { helloWaiter != nil } }
+
+    /// Internal for tests: requests registered and not yet resolved.
+    var pendingRequestCount: Int { get async { await requests.pendingCount } }
+
     public init(debugName: String, role: TransportRole, rawTransport: RawTransportProtocol) {
         self.debugName = debugName
         self.role = role
@@ -57,6 +73,35 @@ public final class Transport: @unchecked Sendable {
         rawTransport.setPacketHandler { [weak self] packet in
             self?.handleReceived(packet: packet)
         }
+        // The death channel. Without it a request whose peer crashed is
+        // indistinguishable from one whose peer is slow, and this protocol has no
+        // timeout to fall back on -- it would wait forever.
+        rawTransport.setCancellationHandler { [weak self] reason in
+            self?.handleRawTransportCancellation(reason: reason)
+        }
+    }
+
+    /// The pipe died from the far side. Fail everything, but do *not* call
+    /// `rawTransport.cancel` -- the raw transport is the thing telling us it is
+    /// already gone, and re-entering it would just echo.
+    private func handleRawTransportCancellation(reason: String) {
+        guard beginCancelling() else { return }
+        failEverything(reason: reason)
+    }
+
+    /// Claim the one-shot teardown. Returns `false` if teardown already ran, so our
+    /// own `cancel` and a remote death cannot double-fire.
+    private func beginCancelling() -> Bool {
+        lock.withLock {
+            guard !cancelled else { return false }
+            cancelled = true
+            return true
+        }
+    }
+
+    private func failEverything(reason: String) {
+        resumeHelloWaiter(with: .failure(SetupError("transport cancelled: \(reason)")))
+        Task { await requests.failAll(with: .transportCancelled(message: reason)) }
     }
 
     // MARK: activation
@@ -82,7 +127,20 @@ public final class Transport: @unchecked Sendable {
 
         let result = await withCheckedContinuation {
             (continuation: CheckedContinuation<Result<ProtocolVersion, SetupError>, Never>) in
-            lock.withLock { helloWaiter = continuation }
+            // One waiter slot, so a concurrent second activate() must not overwrite the
+            // first: the displaced continuation would never be resumed and its caller
+            // would hang forever. Fail the newcomer instead.
+            let occupied: Bool = lock.withLock {
+                guard helloWaiter == nil else { return true }
+                helloWaiter = continuation
+                return false
+            }
+            guard !occupied else {
+                continuation.resume(returning: .failure(
+                    SetupError("activate() is already in progress and awaiting helloAck")
+                ))
+                return
+            }
             do {
                 try rawTransport.send(packet: hello)
             } catch {
@@ -99,8 +157,24 @@ public final class Transport: @unchecked Sendable {
 
     // MARK: sending
 
-    public func sendRequest(_ payload: Packet.Payload) async -> RequestTable.Outcome {
-        let seq = nextSeq()
+    /// Reserve a correlation id. Split from `sendRequest` so a caller can register
+    /// cancellation bookkeeping against the id before the request is in flight.
+    ///
+    /// Ids come from a per-transport monotonic counter and are unique within a
+    /// transport, not globally. Reserving one and never sending it is harmless: no
+    /// state is allocated until `sendRequest` registers a waiter.
+    public func allocateSeq() -> UInt64 {
+        lock.withLock {
+            defer { _nextSeq += 1 }
+            return _nextSeq
+        }
+    }
+
+    /// Send a request under a `seq` obtained from `allocateSeq()` and await its reply.
+    ///
+    /// Reusing a `seq` that is still in flight fails the *new* caller rather than
+    /// displacing the old one; see `RequestTable.waitForReply`.
+    public func sendRequest(seq: UInt64, _ payload: Packet.Payload) async -> RequestTable.Outcome {
         let packet: Packet
         do {
             packet = try makeNegotiatedPacket(kind: .request, seq: seq, payload: payload)
@@ -121,14 +195,9 @@ public final class Transport: @unchecked Sendable {
     }
 
     public func cancel(reason: String) {
-        let alreadyCancelled: Bool = lock.withLock {
-            defer { cancelled = true }
-            return cancelled
-        }
-        guard !alreadyCancelled else { return }
+        guard beginCancelling() else { return }
         rawTransport.cancel(reason: reason)
-        resumeHelloWaiter(with: .failure(SetupError("transport cancelled: \(reason)")))
-        Task { await requests.failAll(with: .transportCancelled(message: reason)) }
+        failEverything(reason: reason)
     }
 
     // MARK: receiving
@@ -141,7 +210,20 @@ public final class Transport: @unchecked Sendable {
         case .helloAck:
             handleHelloAck(packet)
         case .request, .reply, .notification:
-            guard packet.header.version == negotiatedVersion else { return }
+            guard let negotiated = negotiatedVersion,
+                  packet.header.version == negotiated
+            else {
+                // Cancel rather than drop. Dropping is strictly worse: the protocol has
+                // no timeout, so a silently discarded request hangs the sender forever,
+                // and interpreting a body under the wrong version's rules is exactly
+                // what the version field exists to prevent.
+                let expected = negotiatedVersion.map { "\($0.rawValue)" } ?? "none negotiated"
+                cancel(reason: """
+                    protocol version mismatch: peer sent \(packet.header.kind) at version \
+                    \(packet.header.version.rawValue), expected \(expected)
+                    """)
+                return
+            }
             handleNegotiated(packet)
         }
     }
@@ -150,7 +232,7 @@ public final class Transport: @unchecked Sendable {
         switch packet.header.kind {
         case .request:
             guard let seq = packet.header.seq, let handler = inboundRequestHandler else { return }
-            handler(packet.payload) { [weak self] reply in
+            handler(seq, packet.payload) { [weak self] reply in
                 self?.sendReply(seq: seq, payload: reply)
             }
         case .reply:
@@ -171,6 +253,10 @@ public final class Transport: @unchecked Sendable {
 
     private func handleHello(_ packet: Packet) {
         guard role == .responder else { return }
+        // A second hello on a live session is ignored, not honoured. Without this a
+        // buggy or hostile peer could kill an established session mid-flight by
+        // sending an unsatisfiable hello, since the no-overlap path cancels.
+        guard lock.withLock({ _negotiatedVersion }) == nil else { return }
 
         let negotiated: ProtocolVersion? = (try? packet.payload.decode(as: HelloBody.self))
             .flatMap { ProtocolVersion.negotiate(peerMin: $0.min, peerMax: $0.max) }
@@ -241,13 +327,6 @@ public final class Transport: @unchecked Sendable {
     }
 
     // MARK: helpers
-
-    private func nextSeq() -> UInt64 {
-        lock.withLock {
-            defer { _nextSeq += 1 }
-            return _nextSeq
-        }
-    }
 
     private func makePacket(
         kind: PacketKind, seq: UInt64?, payload: Packet.Payload
