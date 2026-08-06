@@ -1,7 +1,11 @@
-// swift-tools-version: 5.7
-// The swift-tools-version declares the minimum version of Swift required to build this package.
+// swift-tools-version: 5.9
+// Raised from 5.7 for macro support: `.macro` targets need 5.9. This changes the
+// minimum *toolchain* that can build the package, not the platforms it can run on
+// -- the deployment floor below is untouched, and a macro is a build-time plugin
+// that never ships in a consumer binary.
 
 import PackageDescription
+import CompilerPluginSupport
 
 // The `System` surface is split into its own targets on purpose.
 //
@@ -42,6 +46,10 @@ let package = Package(
             targets: ["XPCCodable"]),
     ],
     dependencies: [
+        // Only the macro plugin needs this. SwiftPM resolves it for anyone who
+        // depends on the package at all, so it is a real cost imposed on consumers
+        // who only want CodableXPC -- accepted deliberately to keep one repository.
+        .package(url: "https://github.com/swiftlang/swift-syntax.git", "600.0.0"..<"604.0.0"),
     ],
     targets: [
         .target(
@@ -71,7 +79,26 @@ let package = Package(
         // floor above the package's own, so a 10.13 consumer can use it.
         .target(
             name: "XPCCodable",
-            dependencies: []),
+            dependencies: ["XPCCodableMacros"]),
+        // The macro plugin. Runs in the compiler, never in a consumer binary, so it
+        // carries no deployment floor of its own.
+        .macro(
+            name: "XPCCodableMacros",
+            dependencies: [
+                "XPCCodableMacrosCore",
+                .product(name: "SwiftSyntaxMacros", package: "swift-syntax"),
+                .product(name: "SwiftCompilerPlugin", package: "swift-syntax"),
+            ]),
+        // The expansion logic, as a plain library. Split from the plugin host above
+        // so tests can link it with an ordinary import: `@testable import` of a
+        // `.macro` executable fails to link under the swiftbuild build system.
+        .target(
+            name: "XPCCodableMacrosCore",
+            dependencies: [
+                .product(name: "SwiftSyntax", package: "swift-syntax"),
+                .product(name: "SwiftSyntaxMacros", package: "swift-syntax"),
+                .product(name: "SwiftDiagnostics", package: "swift-syntax"),
+            ]),
         .testTarget(
             name: "CodableXPCTests",
             dependencies: ["CodableXPC"]),
@@ -87,5 +114,15 @@ let package = Package(
         .testTarget(
             name: "XPCCodableTests",
             dependencies: ["XPCCodable"]),
+        // Expansion tests run the plugin in-process against source text, so unlike a
+        // consumer they link swift-syntax directly rather than going through the
+        // compiler's plugin host.
+        .testTarget(
+            name: "XPCCodableMacrosTests",
+            dependencies: [
+                "XPCCodableMacrosCore",
+                .product(name: "SwiftSyntaxMacros", package: "swift-syntax"),
+                .product(name: "SwiftSyntaxMacrosTestSupport", package: "swift-syntax"),
+            ]),
     ]
 )
