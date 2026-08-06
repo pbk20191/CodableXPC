@@ -502,6 +502,15 @@ cannot be genuinely verified in CI. The requirement evaluator is injectable so t
 tested, and the documentation states that real signature enforcement is unverified. No test will
 pretend otherwise.
 
+**Known untested after Phase A: the XPC death channel actually firing.** `RawTransportProtocol`
+gained `setCancellationHandler` so that a peer which crashes or exits resolves the caller's
+outstanding requests — without it, a dead peer is indistinguishable from a slow one and the
+caller waits forever, because this protocol has no timeout. `XPCRawTransport` wires it to the
+overlay's `cancellationHandler`, and that wiring is type-checked against the real signature, but
+only the in-process equivalent is exercised by a test. Killing a peer deterministically needs a
+second process, and a flaky tier-3 test is worse than an absent one. Revisit in Phase C, when
+`EphemeralService` provides a real child process to kill.
+
 ## Deliberate omissions
 
 **The `Direct` invocation path.** Apple's shipping build added `DirectInvocationDecoder` and
