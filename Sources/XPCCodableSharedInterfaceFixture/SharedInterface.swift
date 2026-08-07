@@ -26,3 +26,13 @@ public protocol Billing {
     func acknowledge(_ invoice: XPCCodableMarker<Invoice>)
 }
 #endif
+
+#if canImport(Darwin)
+/// The escape hatch from the module-qualified default: two sides that cannot
+/// share a module need a name they both spell the same way. Choosing it is the
+/// author's job -- it is a process-wide Objective-C identifier.
+@XPCService(objcName: "TeamFortyTwoCourier")
+public protocol Courier {
+    func dispatch(_ note: String)
+}
+#endif

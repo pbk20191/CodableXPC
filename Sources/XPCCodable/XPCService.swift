@@ -60,7 +60,8 @@
 /// resolve in an editor before the macro has ever run.
 @attached(peer, names: suffixed(XPCShim), suffixed(XPCClient), suffixed(XPCAdapter), suffixed(XPC))
 @attached(extension, names: arbitrary)
-public macro XPCService() = #externalMacro(module: "XPCCodableMacros", type: "XPCServiceMacro")
+public macro XPCService(objcName: String? = nil) =
+    #externalMacro(module: "XPCCodableMacros", type: "XPCServiceMacro")
 
 /// Failures raised by generated client code, as opposed to by the peer.
 public enum XPCServiceError: Error, Equatable, Sendable {
@@ -94,4 +95,25 @@ public final class XPCOneShot: @unchecked Sendable {
         claimed = true
         return true
     }
+}
+
+
+extension NSXPCConnection {
+    @objc(remoteObjectProxyWithTimeout:errorHandler:)
+    @NSManaged func remoteObjectProxy(with timeout: TimeInterval, errorHandler: @convention(block) @escaping (Error) -> Void) -> NSObjectProtocol
+    
+    @objc(remoteObjectProxyWithUserInfo:errorHandler:)
+    @NSManaged func remoteObjectProxy(with userInfo: NSObjectProtocol?, errorHandler: @convention(block) @escaping (Error) -> Void) -> NSObjectProtocol
+    @NSManaged weak var delegate: NSXPCConnectionDelegate?
+}
+
+
+@objc(NSXPCConnectionDelegate)
+protocol NSXPCConnectionDelegate {
+    @available(*, unavailable)
+    @objc(connection:handleInvocation:isReply:)
+    optional func connection(_ connection: NSXPCConnection, handleInvocation: NSInvocation, isReply: Bool)
+    
+    @objc(replacementObjectForXPCConnection:encoder:object:)
+    optional func replacementObject(for: NSXPCConnection, encoder: NSXPCCoder, object: Any) -> Any?
 }

@@ -76,3 +76,23 @@ final class SharedInterfaceAcrossModulesTests: XCTestCase {
     }
 }
 #endif
+
+#if canImport(Darwin)
+/// `objcName:` overrides the module-qualified default.
+final class ExplicitObjCNameTests: XCTestCase {
+
+    func testTheNameIsTakenVerbatim() {
+        XCTAssertEqual(NSStringFromProtocol(CourierXPC.interface.protocol),
+                       "TeamFortyTwoCourier")
+    }
+
+    func testItStillBehavesLikeAnyOtherShim() {
+        let exported: NSObject = CourierXPC.exported(CourierService())
+        XCTAssertTrue(exported.conforms(to: CourierXPC.interface.protocol))
+    }
+}
+
+private final class CourierService: Courier {
+    func dispatch(_ note: String) {}
+}
+#endif
