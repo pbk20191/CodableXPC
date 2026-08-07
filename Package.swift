@@ -131,9 +131,14 @@ let package = Package(
         .testTarget(
             name: "XPCLegacyOverlayCoderTests",
             dependencies: ["XPCLegacyOverlayCoder"]),
+        // Declares a public @XPCService protocol and nothing else. Its only job is
+        // to be a *different module* from the tests that consume it.
+        .target(
+            name: "XPCCodableSharedInterfaceFixture",
+            dependencies: ["XPCCodable"]),
         .testTarget(
             name: "XPCCodableTests",
-            dependencies: ["XPCCodable"]),
+            dependencies: ["XPCCodable", "XPCCodableSharedInterfaceFixture"]),
         // Expansion tests run the plugin in-process against source text, so unlike a
         // consumer they link swift-syntax directly rather than going through the
         // compiler's plugin host.
