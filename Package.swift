@@ -47,6 +47,9 @@ let package = Package(
         .library(
             name: "XPCOverlayCoder",
             targets: ["XPCOverlayCoder"]),
+        .library(
+            name: "XPCLegacyOverlayCoder",
+            targets: ["XPCLegacyOverlayCoder"]),
     ],
     dependencies: [
         // Only the macro plugin needs this. SwiftPM resolves it for anyone who
@@ -89,6 +92,12 @@ let package = Package(
         .target(
             name: "XPCOverlayCoder",
             dependencies: []),
+        // The pre-graph overlay format, the macOS 15 / iOS 18 generation. A
+        // separate module rather than a mode of XPCOverlayCoder because the two
+        // share no tag values, no framing and no envelope -- only a lineage.
+        .target(
+            name: "XPCLegacyOverlayCoder",
+            dependencies: []),
         // The macro plugin. Runs in the compiler, never in a consumer binary, so it
         // carries no deployment floor of its own.
         .macro(
@@ -124,6 +133,9 @@ let package = Package(
         .testTarget(
             name: "XPCOverlayCoderTests",
             dependencies: ["XPCOverlayCoder"]),
+        .testTarget(
+            name: "XPCLegacyOverlayCoderTests",
+            dependencies: ["XPCLegacyOverlayCoder"]),
         .testTarget(
             name: "XPCCodableTests",
             dependencies: ["XPCCodable"]),
