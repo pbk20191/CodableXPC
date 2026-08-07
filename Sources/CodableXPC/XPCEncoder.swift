@@ -167,13 +167,6 @@ private class _XPCEncoderImp: Encoder, SingleValueEncodingContainer {
         case let data as Data:
             xpc = data.xpcData
             break
-        case let fd as any XPCFileDescriptorProtocol:
-            if let xpcObject = xpc_fd_create(fd.rawValue) {
-                xpc = xpcObject
-            } else {
-                let context = EncodingError.Context(codingPath: codingPath, debugDescription: "XPC doesn't recognize this FileDescriptor")
-                throw EncodingError.invalidValue(fd, context)
-            }
         case let date as Date:
            xpc = date.xpcRepresentation
         case let uid as UUID:
@@ -260,13 +253,6 @@ private struct _XPCKeyedEncodingContainer<Key : CodingKey>: KeyedEncodingContain
         case let data as Data:
             xpc_dictionary_set_value(ref, key.stringValue, data.xpcData)
             break
-        case let fd as any XPCFileDescriptorProtocol:
-            if let xpcObject = xpc_fd_create(fd.rawValue) {
-                xpc_dictionary_set_value(ref, key.stringValue, xpcObject)
-            } else {
-                let context = EncodingError.Context(codingPath: codingPath, debugDescription: "XPC doesn't recognize this FileDescriptor")
-                throw EncodingError.invalidValue(fd, context)
-            }
         case let date as Date:
             xpc_dictionary_set_value(ref, key.stringValue, date.xpcRepresentation)
         case let uid as UUID:
@@ -423,14 +409,6 @@ private struct _XPCUnkeyedEncodingContainer: UnkeyedEncodingContainer {
         case let data as Data:
             xpc_array_append_value(ref, data.xpcData)
             break
-        case let fd as any XPCFileDescriptorProtocol:
-            if let xpcObject = xpc_fd_create(fd.rawValue) {
-                
-                xpc_array_append_value(ref, xpcObject)
-            } else {
-                let context = EncodingError.Context(codingPath: codingPath, debugDescription: "XPC doesn't recognize this FileDescriptor")
-                throw EncodingError.invalidValue(fd, context)
-            }
         case let date as Date:
             xpc_array_append_value(ref, date.xpcRepresentation)
         case let uid as UUID:

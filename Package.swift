@@ -16,8 +16,8 @@ import CompilerPluginSupport
 // linked it would therefore be killed by dyld on macOS 10.15 before any code ran.
 //
 // `CodableXPC` and `XPCCompat` consequently never `import System`. Everything that
-// needs `System.FileDescriptor` lives in `CodableXPCSystem` / `XPCCompatSystem`,
-// which are macOS 11+ throughout and which a 10.15 consumer simply does not link.
+// needs `System.FileDescriptor` lives in `XPCCompatSystem`, which is macOS 11+
+// throughout and which a 10.15 consumer simply does not link.
 let package = Package(
     name: "CodableXPC",
     platforms: [
@@ -29,9 +29,6 @@ let package = Package(
         .library(
             name: "CodableXPC",
             targets: ["CodableXPC"]),
-        .library(
-            name: "CodableXPCSystem",
-            targets: ["CodableXPCSystem"]),
         .library(
             name: "XPCCompat",
             targets: ["XPCCompat"]),
@@ -61,10 +58,6 @@ let package = Package(
         .target(
             name: "CodableXPC",
             dependencies: []),
-        // macOS 11+ only: adds the System.FileDescriptor conformance. Links libswiftSystem.
-        .target(
-            name: "CodableXPCSystem",
-            dependencies: ["CodableXPC"]),
         .target(
             name: "XPCCompat",
             dependencies: ["CodableXPC"]),
