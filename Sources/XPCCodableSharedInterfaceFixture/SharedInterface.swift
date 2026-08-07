@@ -36,3 +36,22 @@ public protocol Courier {
     func dispatch(_ note: String)
 }
 #endif
+
+#if canImport(Darwin)
+/// A service that is handed *to* another service as a live object.
+@XPCService
+public protocol AuditLedger {
+    func note(_ text: String)
+    func total() async throws -> XPCCodableMarker<Int>
+}
+
+/// Takes a `AuditLedger` by proxy and hands one back the same way. Neither crosses as
+/// data: `XPCProxyMarker` makes the macro emit `NSXPCInterface.setInterface`, so
+/// NSXPC vends the object and the far side calls back into it.
+@XPCService
+public protocol Auditor {
+    func attach(_ ledger: XPCProxyMarker<AuditLedger>)
+    func reconcile(_ ledger: XPCProxyMarker<AuditLedger>, label: String) async throws -> XPCCodableMarker<Int>
+    func current() async throws -> XPCProxyMarker<AuditLedger>
+}
+#endif

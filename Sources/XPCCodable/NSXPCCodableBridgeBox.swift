@@ -266,3 +266,38 @@ extension XPCCodableMarker: Hashable where T:Hashable {}
 extension XPCCodableMarker: Equatable where T:Equatable {}
 extension XPCCodableMarker: Sendable where T: Sendable {}
 extension XPCCodableMarker: BitwiseCopyable where T: BitwiseCopyable {}
+
+/// Marks a parameter or return value that should cross as an NSXPC **proxy**
+/// rather than as data.
+///
+/// The service it names must itself be `@XPCService`. `@XPCService` then wires
+/// `NSXPCInterface.setInterface(_:for:argumentIndex:ofReply:)` for that position,
+/// which is what tells NSXPC to vend the object instead of trying to encode it.
+///
+///     @XPCService
+///     public protocol Auditor {
+///         func attach(_ ledger: XPCProxyMarker<Ledger>)
+///     }
+///
+/// ## Why there is no constraint on `Service`
+///
+/// There is no way to write one. `Service: AnyObject` rejects every protocol
+/// existential, including class-bound ones. A marker-protocol bound
+/// (`Service: SomeMarker`) only admits `@objc` protocols, because those are the
+/// only existentials that self-conform — and an `@XPCService` protocol is
+/// deliberately *not* `@objc`; generating the `@objc` face from a Swift-native
+/// one is the entire point of the macro. So the checking lives in the macro,
+/// which reads this annotation syntactically and reports what it cannot use.
+///
+/// ## Lifetime
+///
+/// A proxy is live only while the sender keeps the object alive and the
+/// connection stands. Neither is visible in the type, so a value that outlives
+/// its connection becomes a proxy whose calls fail rather than a dangling
+/// reference — an error at the call site, not a crash.
+public struct XPCProxyMarker<Service> {
+    public var wrappedValue: Service
+    public init(wrappedValue: Service) {
+        self.wrappedValue = wrappedValue
+    }
+}

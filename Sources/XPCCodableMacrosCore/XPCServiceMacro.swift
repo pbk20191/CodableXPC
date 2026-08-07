@@ -12,6 +12,7 @@ enum XPCServiceDiagnostic: String, DiagnosticMessage {
     case associatedTypes
     case unsupportedRequirement
     case objcNameNotALiteral
+    case proxyMarkerArgument
 
     var severity: DiagnosticSeverity { .error }
     var diagnosticID: MessageID { MessageID(domain: "XPCCodableMacros", id: rawValue) }
@@ -33,6 +34,13 @@ enum XPCServiceDiagnostic: String, DiagnosticMessage {
                 """
         case .associatedTypes:
             return "@XPCService does not support protocols with associated types"
+        case .proxyMarkerArgument:
+            return """
+                XPCProxyMarker's argument has to be the plain name of a protocol marked \
+                @XPCService, as in XPCProxyMarker<Ledger>. It cannot be optional, a \
+                collection, a tuple, or a generic type: the macro turns the name into \
+                <Name>XPCShim, and nothing else has one.
+                """
         case .objcNameNotALiteral:
             return """
                 @XPCService(objcName:) needs a plain string literal. The name is baked \
@@ -69,14 +77,25 @@ private struct Parameter {
     let declaredType: TypeSyntax
     /// The payload inside the marker, or `nil` when the parameter passes through.
     let boxedType: TypeSyntax?
+    /// The service named by `XPCProxyMarker<Service>`, or `nil`. This one crosses
+    /// as a live proxy, so it is neither encoded nor passed through.
+    let proxyService: String?
 
     var isBoxed: Bool { boxedType != nil }
+    var isProxy: Bool { proxyService != nil }
 
-    /// What the shim declares: a box when marked, the type verbatim otherwise.
-    var shimType: String { isBoxed ? "NSXPCCodableBridgeBox" : declaredType.trimmedDescription }
+    /// What the shim declares: the peer's `@objc` face for a proxy, a box when
+    /// marked for encoding, the type verbatim otherwise.
+    var shimType: String {
+        if let service = proxyService { return "any \(service)XPCShim" }
+        return isBoxed ? "NSXPCCodableBridgeBox" : declaredType.trimmedDescription
+    }
 
     /// What the convenience overload declares: unwrapped when marked.
-    var bareType: String { (boxedType ?? declaredType).trimmedDescription }
+    var bareType: String {
+        if let service = proxyService { return "any \(service)" }
+        return (boxedType ?? declaredType).trimmedDescription
+    }
 
     func labelled(_ value: String) -> String {
         label.map { "\($0): \(value)" } ?? value
@@ -89,9 +108,21 @@ private struct Method {
     let parameters: [Parameter]
     /// True when the return type was written as `XPCCodableMarker<T>`.
     let returnsMarker: Bool
+    /// The service named by a returned `XPCProxyMarker<Service>`, or `nil`.
+    let returnsProxyService: String?
+
+    /// What the shim's reply block carries. Three cases, and they are exclusive:
+    /// a proxy to the peer's object, a box of encoded bytes, or the value itself.
+    func replyType(_ returnType: TypeSyntax) -> String {
+        if let service = returnsProxyService { return "(any \(service)XPCShim)?" }
+        return returnsMarker ? "NSXPCCodableBridgeBox?" : "\(returnType.trimmedDescription)?"
+    }
 
     var name: String { decl.name.text }
     var hasBoxedParameter: Bool { parameters.contains(where: \.isBoxed) }
+    var hasProxyParameter: Bool { parameters.contains(where: \.isProxy) }
+    /// Whether the caller-facing overload has to unwrap what the marked method returns.
+    var returnIsWrapped: Bool { returnsMarker || returnsProxyService != nil }
 
     /// `submit(_:count:note:reply:)` — the argument-label form `#selector` needs.
     ///
@@ -128,6 +159,12 @@ private struct Method {
     /// `XPCCodableMarker<Person>`.
     var adapterArguments: [String] {
         parameters.enumerated().map { index, parameter in
+            // A proxy arrives as the peer's shim; wrap it so the implementation still
+            // sees the Swift protocol it declared.
+            if let service = parameter.proxyService {
+                return parameter.labelled(
+                    "XPCProxyMarker(wrappedValue: \(service)XPCClient(proxy: a\(index)))")
+            }
             guard let boxed = parameter.boxedType else {
                 return parameter.labelled("a\(index)")
             }
@@ -139,7 +176,13 @@ private struct Method {
     /// What the client passes into the shim.
     var clientArguments: [String] {
         parameters.map { parameter in
-            parameter.labelled(
+            // Vend the caller's own object. NSXPC turns it into a proxy on the far
+            // side; the adapter is only the @objc face it needs to do that.
+            if let service = parameter.proxyService {
+                return parameter.labelled(
+                    "\(service)XPCAdapter(\(parameter.internalName).wrappedValue)")
+            }
+            return parameter.labelled(
                 parameter.isBoxed
                     ? "try NSXPCCodableBridgeBox(\(parameter.internalName).wrappedValue)"
                     : parameter.internalName)
@@ -293,6 +336,27 @@ public struct XPCServiceMacro: PeerMacro {
         return classes.filter { seen.insert($0).inserted }
     }
 
+    /// The `Service` in `XPCProxyMarker<Service>`, or `nil` if this is not one.
+    ///
+    /// `.some(nil)` means it was a proxy marker whose argument cannot be a service
+    /// name; the caller diagnoses and stops.
+    fileprivate static func proxyService(_ type: TypeSyntax) -> String?? {
+        guard let identifier = type.as(IdentifierTypeSyntax.self),
+              identifier.name.text == "XPCProxyMarker",
+              let arguments = identifier.genericArgumentClause?.arguments,
+              arguments.count == 1,
+              let only = arguments.first,
+              let inner = only.argument.as(TypeSyntax.self)
+        else { return .some(nil) }
+
+        // Both `XPCProxyMarker<Ledger>` and `XPCProxyMarker<any Ledger>` name Ledger.
+        let bare = inner.as(SomeOrAnyTypeSyntax.self).map { $0.constraint } ?? inner
+        guard let named = bare.as(IdentifierTypeSyntax.self),
+              named.genericArgumentClause == nil
+        else { return nil }
+        return .some(.some(named.name.text))
+    }
+
     /// The `T` in `XPCCodableMarker<T>`, or `nil` if this is not a marker.
     fileprivate static func markerPayload(_ type: TypeSyntax) -> TypeSyntax? {
         guard let identifier = type.as(IdentifierTypeSyntax.self),
@@ -326,6 +390,19 @@ public struct XPCServiceMacro: PeerMacro {
             let returnsValue = returnType.map { !isVoid($0) } ?? false
             let returnsMarker = returnType.flatMap(markerPayload) != nil
 
+            // From the declared type, before the shape rewrites it to the bare one.
+            let returnsProxyService: String?
+            if let returnType {
+                guard let proxy = proxyService(returnType) else {
+                    context.diagnose(Diagnostic(node: returnType,
+                                                message: XPCServiceDiagnostic.proxyMarkerArgument))
+                    return nil
+                }
+                returnsProxyService = proxy
+            } else {
+                returnsProxyService = nil
+            }
+
             let shape: Shape
             switch (returnsValue, isAsync, isThrowing) {
             case (true, true, true):
@@ -334,7 +411,12 @@ public struct XPCServiceMacro: PeerMacro {
                 // natively. Note the reply block needs an optional, so an unmarked
                 // value type like Int is not representable -- the generated @objc
                 // protocol reports that, which is the honest signal.
-                shape = .twoWayValue(returnType: markerPayload(returnType!) ?? returnType!)
+                // The shape carries what the caller sees, not what was written: the
+                // payload for a marker, the bare existential for a proxy.
+                shape = .twoWayValue(
+                    returnType: markerPayload(returnType!)
+                        ?? returnsProxyService.map { TypeSyntax(stringLiteral: "any \($0)") }
+                        ?? returnType!)
             case (false, true, true):
                 shape = .twoWayVoid
             case (false, false, false):
@@ -352,15 +434,22 @@ public struct XPCServiceMacro: PeerMacro {
                 // representable in Objective-C the generated @objc protocol says so.
                 let declared = syntax.type
                 let boxed = markerPayload(declared)
+                guard let proxy = proxyService(declared) else {
+                    context.diagnose(Diagnostic(node: declared,
+                                                message: XPCServiceDiagnostic.proxyMarkerArgument))
+                    return nil
+                }
                 parameters.append(Parameter(
                     label: syntax.firstName.text == "_" ? nil : syntax.firstName.text,
                     internalName: (syntax.secondName ?? syntax.firstName).text,
                     declaredType: declared,
-                    boxedType: boxed))
+                    boxedType: boxed,
+                    proxyService: proxy))
             }
 
             methods.append(Method(decl: fn, shape: shape,
-                                  parameters: parameters, returnsMarker: returnsMarker))
+                                  parameters: parameters, returnsMarker: returnsMarker,
+                                  returnsProxyService: returnsProxyService))
         }
         return methods
     }
@@ -378,7 +467,7 @@ public struct XPCServiceMacro: PeerMacro {
             let parameters = method.shimParameters
             switch method.shape {
             case .twoWayValue(let returnType):
-                let replyType = method.returnsMarker ? "NSXPCCodableBridgeBox?" : "\(returnType.trimmedDescription)?"
+                let replyType = method.replyType(returnType)
                 return "    func \(method.name)(\((parameters + ["reply: @escaping (\(replyType), (any Error)?) -> Void"]).joined(separator: ", ")))"
             case .twoWayVoid:
                 return "    func \(method.name)(\((parameters + ["reply: @escaping ((any Error)?) -> Void"]).joined(separator: ", ")))"
@@ -407,9 +496,11 @@ public struct XPCServiceMacro: PeerMacro {
                 // has to join as a list element rather than follow a comma.
                 let call = method.name + "(" + (arguments + ["reply: { box, error in"]).joined(separator: ", ")
                 let payload = returnType.trimmedDescription
-                let rewrapped = method.returnsMarker
-                    ? "XPCCodableMarker(wrappedValue: try box.decode(\(payload).self))"
-                    : "box"
+                let rewrapped = method.returnsProxyService
+                    .map { "XPCProxyMarker(wrappedValue: \($0)XPCClient(proxy: box))" }
+                    ?? (method.returnsMarker
+                        ? "XPCCodableMarker(wrappedValue: try box.decode(\(payload).self))"
+                        : "box")
                 return """
                     \(access)func \(method.name)\(signature) {
                         try await withCheckedThrowingContinuation { continuation in
@@ -476,16 +567,35 @@ public struct XPCServiceMacro: PeerMacro {
         return """
         /// Client half generated by `@XPCService`. Obtain one from `\(name)XPC.remote(_:)`.
         \(access)struct \(name)XPCClient: \(name) {
-            private let connection: NSXPCConnection
+            /// Every call below goes through `proxy(resumingOnFailure:)` and none of
+            /// them care where the shim came from, which is what lets a proxy handed
+            /// over as an argument be driven by exactly the same code as a connection.
+            private enum Source {
+                case connection(NSXPCConnection)
+                case proxy(any \(name)XPCShim)
+            }
+            private let source: Source
 
             \(access)init(connection: NSXPCConnection) {
-                self.connection = connection
+                self.source = .connection(connection)
+            }
+
+            /// Wrap a peer's object that arrived as an `XPCProxyMarker` argument.
+            \(access)init(proxy: any \(name)XPCShim) {
+                self.source = .proxy(proxy)
             }
 
             private func proxy(
                 resumingOnFailure onFailure: @escaping @Sendable (any Error) -> Void
             ) -> (any \(name)XPCShim)? {
-                connection.remoteObjectProxyWithErrorHandler(onFailure) as? any \(name)XPCShim
+                switch source {
+                case .connection(let connection):
+                    return connection.remoteObjectProxyWithErrorHandler(onFailure) as? any \(name)XPCShim
+                case .proxy(let shim):
+                    // An error handler belongs to a connection. A proxy that has lost
+                    // its own connection reports through the call's reply block.
+                    return shim
+                }
             }
 
         \(implementations)
@@ -501,10 +611,12 @@ public struct XPCServiceMacro: PeerMacro {
 
             switch method.shape {
             case .twoWayValue(let returnType):
-                let replyType = method.returnsMarker ? "NSXPCCodableBridgeBox?" : "\(returnType.trimmedDescription)?"
-                let produced = method.returnsMarker
-                    ? "try NSXPCCodableBridgeBox(result\(unwrapReturn))"
-                    : "result"
+                let replyType = method.replyType(returnType)
+                // Same three cases as the reply type, in the same order.
+                let produced = method.returnsProxyService.map { "\($0)XPCAdapter(result.wrappedValue)" }
+                    ?? (method.returnsMarker
+                        ? "try NSXPCCodableBridgeBox(result\(unwrapReturn))"
+                        : "result")
                 return """
                     \(access)func \(method.name)(\((parameters + ["reply: @escaping (\(replyType), (any Error)?) -> Void"]).joined(separator: ", "))) {
                         let implementation = self.implementation
@@ -562,15 +674,34 @@ public struct XPCServiceMacro: PeerMacro {
         var registrations: [String] = []
         for method in methods {
             let selector = "#selector(\(name)XPCShim.\(method.selectorLabels))"
-            for (index, parameter) in method.parameters.enumerated() where !parameter.isBoxed {
-                guard let classes = containerClasses(for: parameter.declaredType) else { continue }
+            for (index, parameter) in method.parameters.enumerated() {
+                // A proxy is not encoded, so it needs the peer's interface rather than
+                // a class whitelist. This is what makes NSXPC vend the object.
+                if let service = parameter.proxyService {
+                    registrations.append("""
+                            interface.setInterface(
+                                \(service)XPC.interface,
+                                for: \(selector), argumentIndex: \(index), ofReply: false)
+                    """)
+                    continue
+                }
+                guard !parameter.isBoxed,
+                      let classes = containerClasses(for: parameter.declaredType) else { continue }
                 registrations.append("""
                         interface.setClasses(
                             NSSet(array: [\(classes.map { "\($0).self" }.joined(separator: ", "))]) as! Set<AnyHashable>,
                             for: \(selector), argumentIndex: \(index), ofReply: false)
                 """)
             }
-            if case .twoWayValue(let returnType) = method.shape, !method.returnsMarker,
+            if case .twoWayValue = method.shape, let service = method.returnsProxyService {
+                registrations.append("""
+                        interface.setInterface(
+                            \(service)XPC.interface,
+                            for: \(selector), argumentIndex: 0, ofReply: true)
+                """)
+            }
+            if case .twoWayValue(let returnType) = method.shape,
+               !method.returnsMarker, method.returnsProxyService == nil,
                let classes = containerClasses(for: returnType) {
                 registrations.append("""
                         interface.setClasses(
@@ -640,13 +771,18 @@ extension XPCServiceMacro: ExtensionMacro {
 
         let access = accessModifier(of: proto)
 
-        let overloads = methods.filter(\.hasBoxedParameter).map { method -> String in
+        let overloads = methods.filter { $0.hasBoxedParameter || $0.hasProxyParameter }
+            .map { method -> String in
             let declared = method.parameters.map {
                 "\($0.label ?? "_") \($0.internalName): \($0.bareType)"
             }.joined(separator: ", ")
 
             let forwarded = method.parameters.map { parameter in
-                parameter.labelled(
+                if parameter.isProxy {
+                    return parameter.labelled(
+                        "XPCProxyMarker(wrappedValue: \(parameter.internalName))")
+                }
+                return parameter.labelled(
                     parameter.isBoxed
                         ? "XPCCodableMarker(wrappedValue: \(parameter.internalName))"
                         : parameter.internalName)
@@ -656,7 +792,7 @@ extension XPCServiceMacro: ExtensionMacro {
             case .twoWayValue(let returnType):
                 return """
                     \(access)func \(method.name)(\(declared)) async throws -> \(returnType.trimmedDescription) {
-                        try await \(method.name)(\(forwarded))\(method.returnsMarker ? ".wrappedValue" : "")
+                        try await \(method.name)(\(forwarded))\(method.returnIsWrapped ? ".wrappedValue" : "")
                     }
                 """
             case .twoWayVoid:
