@@ -158,21 +158,6 @@ extension _XPCDecoderImp: SingleValueDecodingContainer {
     func decode<T>(_ type: T.Type) throws -> T where T : Decodable {
         let xpcType = xpc_get_type(ref)
         switch type {
-        case is any XPCFileDescriptorProtocol.Type:
-            guard xpcType == XPC_TYPE_FD else {
-                let context = DecodingError.Context(codingPath: codingPath, debugDescription: "expected FileDescriptor but found \(xpcTypeName(xpcType)) instead")
-                throw DecodingError.typeMismatch(type, context)
-            }
-            let rawFd = xpc_fd_dup(ref)
-            guard rawFd != -1 else {
-                let context = DecodingError.Context(codingPath: codingPath, debugDescription: "can't retreive FileDescriptor from xpc framework")
-                throw DecodingError.dataCorrupted(context)
-            }
-            guard let actualFd = (type as! any XPCFileDescriptorProtocol.Type).init(rawValue: rawFd) else {
-                let context = DecodingError.Context(codingPath: codingPath, debugDescription: "can't create \(type) from valid fileDescriptor \(rawFd)")
-                throw DecodingError.dataCorrupted(context)
-            }
-            return actualFd as! T
         case is UUID.Type:
             guard xpcType == XPC_TYPE_UUID else {
                 let context = DecodingError.Context(
@@ -354,26 +339,6 @@ private struct _XPCUnKeyedDecodingContainer: UnkeyedDecodingContainer {
         let xpcType = xpc_get_type(object)
         let value:T
         switch type {
-        case is any XPCFileDescriptorProtocol.Type:
-            guard xpcType == XPC_TYPE_FD else {
-                let context = DecodingError.Context(
-                    codingPath: currentPath,
-                    debugDescription: "Expected FileDescriptor but found \(xpcTypeName(xpcType)) instead"
-                )
-                throw DecodingError.typeMismatch(type, context)
-            }
-            let rawFD = xpc_fd_dup(object)
-            guard rawFD != -1 else {
-                let context = DecodingError.Context(codingPath: currentPath, debugDescription: "XPC Frame work failed recognize FileDescriptor ")
-                throw DecodingError.dataCorrupted(context)
-            }
-            if let realFd = (type as! any XPCFileDescriptorProtocol.Type).init(rawValue: rawFD) {
-                value = realFd as! T
-            } else {
-                let context = DecodingError.Context(codingPath: currentPath, debugDescription: "fail to create \(type) from valid fileDescriptor \(rawFD)")
-                throw DecodingError.dataCorrupted(context)
-            }
-            break
         case is Data.Type:
             guard xpcType == XPC_TYPE_DATA else {
                 let context = DecodingError.Context(
@@ -816,26 +781,6 @@ private struct _XPCKeyedDecodingContainer<Key:CodingKey>: KeyedDecodingContainer
         let xpcType = xpc_get_type(object)
         let value:T
         switch type {
-        case is any XPCFileDescriptorProtocol.Type:
-            guard xpcType == XPC_TYPE_FD else {
-                let context = DecodingError.Context(
-                    codingPath: currentPath,
-                    debugDescription: "Expected FileDescriptor but found \(xpcTypeName(xpcType)) instead"
-                )
-                throw DecodingError.typeMismatch(type, context)
-            }
-            let rawFD = xpc_fd_dup(object)
-            guard rawFD != -1 else {
-                let context = DecodingError.Context(codingPath: currentPath, debugDescription: "XPC Frame work failed recognize FileDescriptor ")
-                throw DecodingError.dataCorrupted(context)
-            }
-            if let realFd = (type as! any XPCFileDescriptorProtocol.Type).init(rawValue: rawFD) {
-                value = realFd as! T
-            } else {
-                let context = DecodingError.Context(codingPath: currentPath, debugDescription: "fail to create \(type) from valid fileDescriptor \(rawFD)")
-                throw DecodingError.dataCorrupted(context)
-            }
-            break
         case is Data.Type:
             guard xpcType == XPC_TYPE_DATA else {
                 let context = DecodingError.Context(
