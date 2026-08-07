@@ -1,8 +1,11 @@
 import Foundation
+import XPC
 
 /// Encodes a `Codable` value into the pre-graph overlay byte stream.
 ///
-///     let body = try XPCLegacyOverlayEncoder().encode(value)   // -> _CodableBody
+///     let encoded = try XPCLegacyOverlayEncoder().encode(value)
+///     // encoded.body             -> _CodableBody
+///     // encoded.outOfLineObjects -> _CodableOutOfLine
 ///
 /// - Important: unlike ``XPCOverlayCoder``, nothing here has been checked against
 ///   Apple. macOS 27 ships the newer coder, so no legacy decoder exists on this
@@ -14,16 +17,38 @@ public struct XPCLegacyOverlayEncoder {
 
     public init() {}
 
-    public func encode<T: Encodable>(_ value: T) throws -> Data {
-        LegacyOverlayStreamWriter.serialize(try tree(value))
+    public struct Encoded {
+        /// Goes under `_CodableBody`.
+        public let body: Data
+        /// The same content as ``body`` before serialisation, for callers
+        /// assembling an envelope themselves or asserting on structure.
+        public let tree: LegacyOverlayValue
+        /// Goes under `_CodableOutOfLine`, in order. Live XPC objects such as an
+        /// `XPCEndpoint`, which the body refers to by index.
+        public let outOfLineObjects: [xpc_object_t]
     }
 
-    /// The value tree, for callers assembling an envelope themselves.
-    public func tree<T: Encodable>(_ value: T) throws -> LegacyOverlayValue {
+    /// Encoding is one call rather than a body call and an objects call, because a
+    /// value that put an `XPCEndpoint` in the side array produces a body that is
+    /// meaningless without it. Splitting them would let a caller keep the half
+    /// that decodes into a dangling index.
+    @available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
+    public func encode<T: Encodable>(_ value: T) throws -> Encoded {
+        // Apple's XPCEndpoint.encode(to:) reaches into userInfo for an array to put
+        // itself in, and throws CodingUserInfoKeyNotFound when there is none.
+        // Providing one is all it takes for a live object to travel through a coder
+        // written from scratch.
+        var info = userInfo
+        let objects = LegacyCodableObjects.install(into: &info)
+
         let root = LegacyEncodingNode()
-        try LegacyEncoderImpl(node: root, codingPath: [], userInfo: userInfo)
+        try LegacyEncoderImpl(node: root, codingPath: [], userInfo: info)
             .encodeTopLevel(value)
-        return root.materialise()
+
+        let tree = root.materialise()
+        return Encoded(body: LegacyOverlayStreamWriter.serialize(tree),
+                       tree: tree,
+                       outOfLineObjects: LegacyCodableObjects.drain(objects))
     }
 }
 

@@ -21,8 +21,9 @@ private struct Outer: Codable, Equatable {
 final class LegacyCodableSurfaceTests: XCTestCase {
 
     private func roundTrip<T: Codable & Equatable>(_ value: T) throws -> T {
-        let body = try XPCLegacyOverlayEncoder().encode(value)
-        return try XPCLegacyOverlayDecoder().decode(T.self, from: body)
+        let encoded = try XPCLegacyOverlayEncoder().encode(value)
+        return try XPCLegacyOverlayDecoder().decode(
+            T.self, from: encoded.body, outOfLineObjects: encoded.outOfLineObjects)
     }
 
     func testScalars() throws {
@@ -52,7 +53,7 @@ final class LegacyCodableSurfaceTests: XCTestCase {
         let value = Holder(blob: Data([1, 2, 3]))
         XCTAssertEqual(try roundTrip(value), value)
 
-        let tree = try XPCLegacyOverlayEncoder().tree(value)
+        let tree = try XPCLegacyOverlayEncoder().encode(value).tree
         guard case .keyed(let entries) = tree,
               case .unkeyed(let bytes)? = entries.first(where: { $0.key == "blob" })?.value
         else { return XCTFail("expected blob to be an unkeyed container, got \(tree)") }
@@ -72,7 +73,7 @@ final class LegacyCodableSurfaceTests: XCTestCase {
                 try c.encode(n)
             }
         }
-        XCTAssertEqual(try XPCLegacyOverlayEncoder().tree(Wrapped(7)), .int(7))
+        XCTAssertEqual(try XPCLegacyOverlayEncoder().encode(Wrapped(7)).tree, .int(7))
         XCTAssertEqual(try roundTrip(Wrapped(7)), Wrapped(7))
     }
 

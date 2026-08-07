@@ -1,4 +1,5 @@
 import Foundation
+import XPC
 
 /// Decodes a `Codable` value from the pre-graph overlay byte stream.
 ///
@@ -13,13 +14,30 @@ public struct XPCLegacyOverlayDecoder {
 
     public init() {}
 
-    public func decode<T: Decodable>(_ type: T.Type = T.self, from body: Data) throws -> T {
-        try decode(type, from: try LegacyOverlayStreamReader.parse(body))
+    /// - Parameter outOfLineObjects: whatever arrived under `_CodableOutOfLine`.
+    ///   The array is installed unconditionally, even when empty, because that is
+    ///   what the framework does.
+    ///
+    /// - Warning: pass the array that came with the body. Apple's
+    ///   `XPCEndpoint.init(from:)` resolves its index with `xpc_array_get_value`,
+    ///   which **aborts the process** on an out-of-range index rather than
+    ///   throwing. A body separated from its side array is not a decoding error
+    ///   you can catch; it is a `SIGTRAP`. Nothing on this side can guard it,
+    ///   because only the value being decoded knows which integers are indices.
+    @available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
+    public func decode<T: Decodable>(_ type: T.Type = T.self, from body: Data,
+                                     outOfLineObjects: [xpc_object_t] = []) throws -> T {
+        try decode(type, from: try LegacyOverlayStreamReader.parse(body),
+                   outOfLineObjects: outOfLineObjects)
     }
 
+    @available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
     public func decode<T: Decodable>(_ type: T.Type = T.self,
-                                     from value: LegacyOverlayValue) throws -> T {
-        try T(from: LegacyDecoderImpl(value: value, codingPath: [], userInfo: userInfo))
+                                     from value: LegacyOverlayValue,
+                                     outOfLineObjects: [xpc_object_t] = []) throws -> T {
+        var info = userInfo
+        LegacyCodableObjects.install(outOfLineObjects, into: &info)
+        return try T(from: LegacyDecoderImpl(value: value, codingPath: [], userInfo: info))
     }
 }
 
