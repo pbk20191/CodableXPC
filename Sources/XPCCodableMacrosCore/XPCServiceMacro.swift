@@ -638,6 +638,7 @@ public struct XPCServiceMacro: PeerMacro {
                             do { outcome.set(.success(\(rewrapped))) }
                             catch { outcome.set(.failure(error)) }
                         })
+                        outcome.set(.failure(unfulfilledSynchronousCall))
                         return try outcome.take()
                     }
                 """
@@ -654,6 +655,7 @@ public struct XPCServiceMacro: PeerMacro {
                         try proxy.\(call)
                             outcome.set(error.map { .failure($0) } ?? .success(()))
                         })
+                        outcome.set(.failure(unfulfilledSynchronousCall))
                         return try outcome.take()
                     }
                 """
@@ -701,6 +703,17 @@ public struct XPCServiceMacro: PeerMacro {
                     // its own connection reports through the call's reply block.
                     return shim
                 }
+            }
+
+            /// Why a blocking call came back with nothing written.
+            ///
+            /// First write wins, so this only takes effect when neither the reply
+            /// block nor the error handler ran -- and over a connection they always
+            /// do. It is reached when the shim is an object delivered as an
+            /// `XPCProxyMarker` argument, whose reply arrives later.
+            private var unfulfilledSynchronousCall: XPCServiceError {
+                if case .proxy = source { return .synchronousCallOverProxy }
+                return .missingReply
             }
 
             /// The blocking counterpart. NSXPC runs the reply block on this thread

@@ -73,6 +73,23 @@ public enum XPCServiceError: Error, Equatable, Sendable {
     /// The peer replied with neither a value nor an error. A correct peer cannot do
     /// this; a crashed or mismatched one can.
     case missingReply
+
+    /// A synchronous method was called on a service that arrived as an
+    /// `XPCProxyMarker` argument rather than over a connection of its own.
+    ///
+    /// A blocking call reads its result immediately after the call returns, which
+    /// works because `synchronousRemoteObjectProxyWithErrorHandler` runs the reply
+    /// first. An object delivered as an argument has no such proxy: its reply
+    /// arrives later, so there is nothing to read yet.
+    ///
+    /// Waiting for it is not the fix. A proxy received as an argument has no
+    /// failure channel of its own -- when the connection it came over dies, calls
+    /// on it simply never complete, with no error handler and no reply. Blocking
+    /// would turn a reported failure into a hung thread.
+    ///
+    /// Declare the method `async throws` instead. The same call then suspends, and
+    /// the reply resumes it whenever it arrives.
+    case synchronousCallOverProxy
 }
 
 /// Lets exactly one of several racing callbacks resume a continuation.
@@ -146,5 +163,14 @@ public final class XPCSyncOutcome<Value>: @unchecked Sendable {
         lock.unlock()
         guard let result else { throw XPCServiceError.missingReply }
         return try result.get()
+    }
+}
+
+extension XPCServiceError {
+    /// The declaration order, which is what a bridged `NSError` reports as its
+    /// code. Exposed so a test can name the case instead of hardcoding an index
+    /// that silently shifts when a case is inserted above it.
+    public static var allCasesForTesting: [XPCServiceError] {
+        [.proxyUnavailable, .missingReply, .synchronousCallOverProxy]
     }
 }
