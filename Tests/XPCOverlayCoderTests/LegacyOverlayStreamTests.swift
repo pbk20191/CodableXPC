@@ -1,5 +1,5 @@
 import XCTest
-@testable import XPCLegacyOverlayCoder
+@testable import XPCOverlayCoder
 
 /// Unlike `XPCOverlayCoder`, these fixtures are **hand-built from the documented
 /// grammar, not captured from a running system**. macOS 27 ships the newer coder,

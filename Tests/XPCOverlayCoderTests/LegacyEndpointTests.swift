@@ -1,7 +1,7 @@
 #if canImport(Darwin)
 import XCTest
 import XPC
-@testable import XPCLegacyOverlayCoder
+@testable import XPCOverlayCoder
 
 @available(macOS 15, macCatalyst 18, *)
 private struct Referral: Codable, Equatable {

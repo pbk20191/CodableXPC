@@ -1,6 +1,6 @@
 import XCTest
 import XPC
-@testable import XPCLegacyOverlayCoder
+@testable import XPCOverlayCoder
 
 private struct Scalars: Codable, Equatable {
     let flag: Bool

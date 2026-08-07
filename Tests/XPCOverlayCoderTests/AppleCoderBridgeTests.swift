@@ -2,7 +2,6 @@
 import XCTest
 import XPC
 @testable import XPCOverlayCoder
-@testable import XPCLegacyOverlayCoder
 
 @available(macOS 15, macCatalyst 18, *)
 private struct Reading: Codable, Equatable {
