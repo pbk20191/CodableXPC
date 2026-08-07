@@ -7,7 +7,7 @@ import XPC
 /// keeps a distinct tag per integer width, so a mismatch means the two sides
 /// disagree about the type rather than about the range.
 ///
-/// - Important: not verified against Apple. See ``XPCLegacyOverlayEncoder``.
+/// Verified against Apple's iOS 18 coder. See ``XPCLegacyOverlayEncoder``.
 public struct XPCLegacyOverlayDecoder {
 
     public var userInfo: [CodingUserInfoKey: Any] = [:]
@@ -37,7 +37,25 @@ public struct XPCLegacyOverlayDecoder {
                                      outOfLineObjects: [xpc_object_t] = []) throws -> T {
         var info = userInfo
         LegacyCodableObjects.install(outOfLineObjects, into: &info)
+        if T.self == Data.self {
+            return try LegacyDecoderImpl.outOfLineData(value, userInfo: info, codingPath: []) as! T
+        }
         return try T(from: LegacyDecoderImpl(value: value, codingPath: [], userInfo: info))
+    }
+}
+
+extension LegacyDecoderImpl {
+    /// `Data` arrives as an index into the side array, never as bytes in the
+    /// stream. Apple's iOS 18 coder does the same, and only for `Data`.
+    static func outOfLineData(_ value: LegacyOverlayValue,
+                              userInfo: [CodingUserInfoKey: Any],
+                              codingPath: [any CodingKey]) throws -> Data {
+        guard case .int(let index) = value else {
+            throw DecodingError.typeMismatch(Data.self, .init(
+                codingPath: codingPath,
+                debugDescription: "expected an out-of-line index for Data, found \(describe(value))"))
+        }
+        return try LegacyOutOfLineData.read(at: index, from: userInfo)
     }
 }
 
@@ -159,7 +177,12 @@ private struct LegacyKeyedContainer<Key: CodingKey>: KeyedDecodingContainerProto
     }
 
     func decode<T: Decodable>(_ type: T.Type, forKey key: Key) throws -> T {
-        try T(from: decoder.child(try value(for: key), forKey: key))
+        if type == Data.self {
+            return try LegacyDecoderImpl.outOfLineData(
+                try value(for: key), userInfo: decoder.userInfo,
+                codingPath: decoder.codingPath + [key]) as! T
+        }
+        return try T(from: decoder.child(try value(for: key), forKey: key))
     }
 
     func decode(_ t: Bool.Type, forKey k: Key) throws -> Bool { try primitive(t, k) }
@@ -242,6 +265,11 @@ private struct LegacyUnkeyedContainer: UnkeyedDecodingContainer {
 
     mutating func decode<T: Decodable>(_ type: T.Type) throws -> T {
         let key = LegacyIndexKey(currentIndex)
+        if type == Data.self {
+            return try LegacyDecoderImpl.outOfLineData(
+                try next(), userInfo: decoder.userInfo,
+                codingPath: decoder.codingPath + [key]) as! T
+        }
         return try T(from: decoder.child(try next(), forKey: key))
     }
 
@@ -292,7 +320,13 @@ private struct LegacySingleValueContainer: SingleValueDecodingContainer {
 
     func decodeNil() -> Bool { LegacyDecoderImpl.isNil(value) }
 
-    func decode<T: Decodable>(_ type: T.Type) throws -> T { try T(from: decoder) }
+    func decode<T: Decodable>(_ type: T.Type) throws -> T {
+        if type == Data.self {
+            return try LegacyDecoderImpl.outOfLineData(
+                value, userInfo: decoder.userInfo, codingPath: decoder.codingPath) as! T
+        }
+        return try T(from: decoder)
+    }
 
     func decode(_ t: Bool.Type) throws -> Bool { try primitive(t) }
     func decode(_ t: String.Type) throws -> String { try primitive(t) }

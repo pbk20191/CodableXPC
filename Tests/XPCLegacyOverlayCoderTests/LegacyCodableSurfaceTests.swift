@@ -1,4 +1,5 @@
 import XCTest
+import XPC
 @testable import XPCLegacyOverlayCoder
 
 private struct Scalars: Codable, Equatable {
@@ -46,18 +47,26 @@ final class LegacyCodableSurfaceTests: XCTestCase {
                        [Inner(value: 1), Inner(value: 2)])
     }
 
-    func testDataIsAnOrdinaryByteRun() throws {
-        // No out-of-line path in this generation: Data goes through its stock
-        // Codable conformance and becomes an unkeyed run of UInt8.
+    func testDataGoesOutOfLineNotIntoTheStream() throws {
+        // This test used to assert the opposite, on a reading of the disassembly.
+        // Apple's own iOS 18 coder, run in a 18.6 simulator, settles it: `Data`
+        // is appended to the side array as an `xpc_data` and the stream carries
+        // an integer index. It is the only type that does this.
         struct Holder: Codable, Equatable { let blob: Data }
         let value = Holder(blob: Data([1, 2, 3]))
-        XCTAssertEqual(try roundTrip(value), value)
+        let encoded = try XPCLegacyOverlayEncoder().encode(value)
 
-        let tree = try XPCLegacyOverlayEncoder().encode(value).tree
-        guard case .keyed(let entries) = tree,
-              case .unkeyed(let bytes)? = entries.first(where: { $0.key == "blob" })?.value
-        else { return XCTFail("expected blob to be an unkeyed container, got \(tree)") }
-        XCTAssertEqual(bytes, [.uint8(1), .uint8(2), .uint8(3)])
+        guard case .keyed(let entries) = encoded.tree,
+              let slot = entries.first(where: { $0.key == "blob" })?.value
+        else { return XCTFail("expected a blob entry, got \(encoded.tree)") }
+        XCTAssertEqual(slot, .int(0))
+
+        XCTAssertEqual(encoded.outOfLineObjects.count, 1)
+        XCTAssertEqual(xpc_get_type(encoded.outOfLineObjects[0]), XPC_TYPE_DATA)
+
+        XCTAssertEqual(try XPCLegacyOverlayDecoder().decode(
+            Holder.self, from: encoded.body,
+            outOfLineObjects: encoded.outOfLineObjects), value)
     }
 
     func testSingleValueContainerIsTransparent() throws {

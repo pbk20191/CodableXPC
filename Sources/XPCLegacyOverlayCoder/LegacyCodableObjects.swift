@@ -20,6 +20,12 @@ extension CodingUserInfoKey {
     ///   binary exists on a machine that can run one. Everything else about this
     ///   file is read directly from the iOS 18 disassembly.
     public static let xpcLegacyCodableObjects = CodingUserInfoKey(rawValue: "_XPCCodable")!
+
+    /// The same array, unwrapped. `XPCArray` is what Apple's code casts to, so the
+    /// key above has to hold one — but that type carries an OS floor this module
+    /// does not, and the `Data` path needs the array on every platform the package
+    /// supports. The raw handle costs nothing and is ours alone.
+    static let xpcLegacyRawObjectArray = CodingUserInfoKey(rawValue: "_XPCCodableRawArray")!
 }
 
 /// Bridges the `_CodableOutOfLine` side array in and out of `userInfo`.
@@ -39,6 +45,7 @@ enum LegacyCodableObjects {
     static func install(into userInfo: inout [CodingUserInfoKey: Any]) -> xpc_object_t {
         let array = xpc_array_create(nil, 0)
         userInfo[.xpcLegacyCodableObjects] = XPCArray(array)
+        userInfo[.xpcLegacyRawObjectArray] = array
         return array
     }
 
@@ -49,6 +56,7 @@ enum LegacyCodableObjects {
             xpc_array_append_value(array, object)
         }
         userInfo[.xpcLegacyCodableObjects] = XPCArray(array)
+        userInfo[.xpcLegacyRawObjectArray] = array
     }
 
     static func drain(_ array: xpc_object_t) -> [xpc_object_t] {
@@ -57,5 +65,54 @@ enum LegacyCodableObjects {
             objects.append(xpc_array_get_value(array, index))
         }
         return objects
+    }
+}
+
+/// `Data` does not travel in the byte stream. It goes in the side array as an
+/// `xpc_data`, and the stream carries an ordinary integer index to it.
+///
+/// Measured against Apple's own iOS 18 coder in a 18.6 simulator: encoding a
+/// `Data` with no `_XPCCodable` array in `userInfo` throws
+/// `CodingUserInfoKeyNotFound`, and with one it appends an `xpc_data` and writes
+/// tag 2 with the index. `Data` is the only type that does this — `String`,
+/// `Date`, `UUID`, `URL` and even `[UInt8]` all take their ordinary `Codable`
+/// path.
+enum LegacyOutOfLineData {
+
+    static func array(in userInfo: [CodingUserInfoKey: Any]) throws -> xpc_object_t {
+        guard let array = userInfo[.xpcLegacyRawObjectArray],
+              xpc_get_type(array as! xpc_object_t) == XPC_TYPE_ARRAY else {
+            throw LegacyOverlayCoderError.missingEnvelopeKey(
+                CodingUserInfoKey.xpcLegacyCodableObjects.rawValue)
+        }
+        return array as! xpc_object_t
+    }
+
+    static func append(_ data: Data, to userInfo: [CodingUserInfoKey: Any]) throws -> Int {
+        let objects = try array(in: userInfo)
+        let index = xpc_array_get_count(objects)
+        // An empty Data has a nil baseAddress, and xpc_data_create(nil, 0) does not
+        // produce an object -- the append would then be skipped and every later
+        // index would be off by one.
+        let object: xpc_object_t = data.isEmpty
+            ? xpc_data_create([UInt8](), 0)
+            : data.withUnsafeBytes { xpc_data_create($0.baseAddress, $0.count) }
+        xpc_array_append_value(objects, object)
+        return index
+    }
+
+    static func read(at index: Int, from userInfo: [CodingUserInfoKey: Any]) throws -> Data {
+        let objects = try array(in: userInfo)
+        guard index >= 0, index < xpc_array_get_count(objects) else {
+            throw LegacyOverlayCoderError.outOfLineIndexOutOfRange(index)
+        }
+        let object = xpc_array_get_value(objects, index)
+        guard xpc_get_type(object) == XPC_TYPE_DATA else {
+            throw LegacyOverlayCoderError.outOfLineIndexOutOfRange(index)
+        }
+        // An empty xpc_data has a nil bytes pointer, which is not a failure.
+        let length = xpc_data_get_length(object)
+        guard length > 0, let bytes = xpc_data_get_bytes_ptr(object) else { return Data() }
+        return Data(bytes: bytes, count: length)
     }
 }

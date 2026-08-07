@@ -18,7 +18,7 @@ import Foundation
 /// | `String` | `15` | `3` |
 /// | integers | `2`–`11` | `6`–`15` |
 /// | single-value container | transparent, never emitted | materialised |
-/// | `Data` | no special path — a run of `UInt8` | out-of-line index |
+/// | `Data` | out-of-line object, index in stream | out-of-line data, index in stream |
 /// | envelope | three keys, **no version** | five keys, version required |
 ///
 /// ## The version asymmetry, which is the point of having both
