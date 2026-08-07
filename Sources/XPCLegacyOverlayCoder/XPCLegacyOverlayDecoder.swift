@@ -12,7 +12,11 @@ public struct XPCLegacyOverlayDecoder {
 
     public var userInfo: [CodingUserInfoKey: Any] = [:]
 
+    /// Which build produced the message. See ``LegacyOverlayGeneration``.
+    public var generation: LegacyOverlayGeneration = .iOS18
+
     public init() {}
+    public init(generation: LegacyOverlayGeneration) { self.generation = generation }
 
     /// - Parameter outOfLineObjects: whatever arrived under `_CodableOutOfLine`.
     ///   The array is installed unconditionally, even when empty, because that is
@@ -36,8 +40,10 @@ public struct XPCLegacyOverlayDecoder {
                                      from value: LegacyOverlayValue,
                                      outOfLineObjects: [xpc_object_t] = []) throws -> T {
         var info = userInfo
-        LegacyCodableObjects.install(outOfLineObjects, into: &info)
-        if T.self == Data.self {
+        if generation.carriesOutOfLineObjects {
+            LegacyCodableObjects.install(outOfLineObjects, into: &info)
+        }
+        if T.self == Data.self, LegacyOutOfLineData.isEnabled(info) {
             return try LegacyDecoderImpl.outOfLineData(value, userInfo: info, codingPath: []) as! T
         }
         return try T(from: LegacyDecoderImpl(value: value, codingPath: [], userInfo: info))
@@ -177,7 +183,7 @@ private struct LegacyKeyedContainer<Key: CodingKey>: KeyedDecodingContainerProto
     }
 
     func decode<T: Decodable>(_ type: T.Type, forKey key: Key) throws -> T {
-        if type == Data.self {
+        if type == Data.self, LegacyOutOfLineData.isEnabled(decoder.userInfo) {
             return try LegacyDecoderImpl.outOfLineData(
                 try value(for: key), userInfo: decoder.userInfo,
                 codingPath: decoder.codingPath + [key]) as! T
@@ -265,7 +271,7 @@ private struct LegacyUnkeyedContainer: UnkeyedDecodingContainer {
 
     mutating func decode<T: Decodable>(_ type: T.Type) throws -> T {
         let key = LegacyIndexKey(currentIndex)
-        if type == Data.self {
+        if type == Data.self, LegacyOutOfLineData.isEnabled(decoder.userInfo) {
             return try LegacyDecoderImpl.outOfLineData(
                 try next(), userInfo: decoder.userInfo,
                 codingPath: decoder.codingPath + [key]) as! T
@@ -321,7 +327,7 @@ private struct LegacySingleValueContainer: SingleValueDecodingContainer {
     func decodeNil() -> Bool { LegacyDecoderImpl.isNil(value) }
 
     func decode<T: Decodable>(_ type: T.Type) throws -> T {
-        if type == Data.self {
+        if type == Data.self, LegacyOutOfLineData.isEnabled(decoder.userInfo) {
             return try LegacyDecoderImpl.outOfLineData(
                 value, userInfo: decoder.userInfo, codingPath: decoder.codingPath) as! T
         }

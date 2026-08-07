@@ -30,6 +30,34 @@ import Foundation
 /// message. The tag spaces overlap almost completely, so it does not fail at the
 /// first byte — it fails somewhere inside, as a type mismatch or a trap. Adding a
 /// version field protects only the readers that ship after it.
+/// Which build of the pre-graph overlay a message belongs to.
+///
+/// The byte stream is the same in both — every tag ordinal matches, checked
+/// against a decompiled iOS 17.6.1 build and against a live iOS 18.6 runtime.
+/// What differs is what sits beside it.
+///
+/// | | ``iOS17`` | ``iOS18`` |
+/// |---|---|---|
+/// | envelope | `_CodableBody`, `_CodableIsSync` | plus `_CodableOutOfLine` |
+/// | `Data` | an unkeyed run of `UInt8` | an `xpc_data` in the side array |
+/// | live objects (`XPCEndpoint`) | no mechanism at all | `XPCCodableObject` |
+///
+/// iOS 17 has no `XPCCodableObject`, no `XPCCodableObjectRepresentableCache` and
+/// no `_XPCCodable` key — 220 references to that machinery in the iOS 18 binary,
+/// none in the iOS 17 one. Its `encodeMessage` writes two keys and stops.
+///
+/// Nothing in a message says which it is, so this cannot be detected: a caller
+/// who knows the peer picks. ``iOS18`` is the default because it is the one
+/// checked against a running system.
+public enum LegacyOverlayGeneration: Sendable, Equatable {
+    /// macOS 14 / iOS 17.
+    case iOS17
+    /// macOS 15 / iOS 18.
+    case iOS18
+
+    var carriesOutOfLineObjects: Bool { self == .iOS18 }
+}
+
 public enum LegacyOverlayWireFormat {
 
     /// The byte written for a value is its `wireType` plus one. Apple's encoder

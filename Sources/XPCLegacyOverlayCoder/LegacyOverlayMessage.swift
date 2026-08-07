@@ -22,12 +22,16 @@ extension LegacyOverlayEnvelope {
     /// `XPCOverlayCoder`'s envelope. The absence is not an omission to be fixed:
     /// it is the signal a newer reader uses to reject the message.
     public static func message(_ encoded: XPCLegacyOverlayEncoder.Encoded,
-                               isSync: Bool = false) -> xpc_object_t {
+                               isSync: Bool = false,
+                               generation: LegacyOverlayGeneration = .iOS18) -> xpc_object_t {
         let message = xpc_dictionary_create(nil, nil, 0)
         encoded.body.withUnsafeBytes {
             xpc_dictionary_set_data(message, body, $0.baseAddress, $0.count)
         }
         xpc_dictionary_set_bool(message, isSyncKey, isSync)
+
+        // iOS 17 writes two keys and stops -- its encodeMessage has no third.
+        guard generation.carriesOutOfLineObjects else { return message }
 
         let objects = xpc_array_create(nil, 0)
         for object in encoded.outOfLineObjects {
@@ -82,7 +86,7 @@ extension XPCLegacyOverlayEncoder {
     /// Encode straight to a legacy message dictionary.
     @available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
     public func message<T: Encodable>(_ value: T, isSync: Bool = false) throws -> xpc_object_t {
-        LegacyOverlayEnvelope.message(try encode(value), isSync: isSync)
+        LegacyOverlayEnvelope.message(try encode(value), isSync: isSync, generation: generation)
     }
 }
 

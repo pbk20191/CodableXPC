@@ -81,3 +81,66 @@ final class AppleIOS18FixtureTests: XCTestCase {
     }
 }
 #endif
+
+#if canImport(Darwin)
+/// iOS 17 is the same byte stream with less around it.
+///
+/// Every tag ordinal in a decompiled iOS 17.6.1 `libswiftXPC` matches this
+/// module's — `CodingContainer.wireType` gives 0…19 and the emitted byte is that
+/// plus one, so nil is 1, `Int`…`String` are 2…15, unkeyed is 16, keyed is 17,
+/// single-value 18, absent-optional 19, encoder 20. What is missing is the
+/// machinery beside it: no `XPCCodableObject`, no
+/// `XPCCodableObjectRepresentableCache`, no `_XPCCodable` — 220 references in the
+/// iOS 18 binary, none in the iOS 17 one — and an `encodeMessage` that writes
+/// `_CodableBody` and `_CodableIsSync` and stops.
+///
+/// So `Data` cannot go out-of-line there, because there is nowhere for it to go.
+final class LegacyGenerationTests: XCTestCase {
+
+    private struct Holder: Codable, Equatable { let blob: Data }
+    private let value = Holder(blob: Data([1, 2, 3]))
+
+    func testIOS17WritesDataIntoTheStream() throws {
+        let encoded = try XPCLegacyOverlayEncoder(generation: .iOS17).encode(value)
+
+        XCTAssertTrue(encoded.outOfLineObjects.isEmpty)
+        guard case .keyed(let entries) = encoded.tree,
+              case .unkeyed(let bytes)? = entries.first(where: { $0.key == "blob" })?.value
+        else { return XCTFail("expected a byte run, got \(encoded.tree)") }
+        XCTAssertEqual(bytes, [.uint8(1), .uint8(2), .uint8(3)])
+
+        XCTAssertEqual(try XPCLegacyOverlayDecoder(generation: .iOS17)
+            .decode(Holder.self, from: encoded.body), value)
+    }
+
+    func testIOS18PutsItBesideTheStream() throws {
+        let encoded = try XPCLegacyOverlayEncoder(generation: .iOS18).encode(value)
+
+        XCTAssertEqual(encoded.outOfLineObjects.count, 1)
+        guard case .keyed(let entries) = encoded.tree else { return XCTFail("expected keyed") }
+        XCTAssertEqual(entries.first(where: { $0.key == "blob" })?.value, .int(0))
+    }
+
+    /// Nothing in a message says which generation it is, so the wrong setting is
+    /// a decode failure rather than a wrong answer.
+    func testTheGenerationsDoNotReadEachOther() throws {
+        let fromEighteen = try XPCLegacyOverlayEncoder(generation: .iOS18).encode(value)
+        XCTAssertThrowsError(try XPCLegacyOverlayDecoder(generation: .iOS17)
+            .decode(Holder.self, from: fromEighteen.body))
+
+        let fromSeventeen = try XPCLegacyOverlayEncoder(generation: .iOS17).encode(value)
+        XCTAssertThrowsError(try XPCLegacyOverlayDecoder(generation: .iOS18)
+            .decode(Holder.self, from: fromSeventeen.body,
+                    outOfLineObjects: fromSeventeen.outOfLineObjects))
+    }
+
+    /// Everything that is not `Data` is generation-independent, which is most of
+    /// the format.
+    func testEverythingElseIsIdenticalAcrossGenerations() throws {
+        struct Plain: Codable, Equatable { let a: Int; let b: String; let c: [Bool] }
+        let plain = Plain(a: -1, b: "same", c: [true, false])
+        XCTAssertEqual(try XPCLegacyOverlayEncoder(generation: .iOS17).encode(plain).body,
+                       try XPCLegacyOverlayEncoder(generation: .iOS18).encode(plain).body)
+    }
+}
+#endif

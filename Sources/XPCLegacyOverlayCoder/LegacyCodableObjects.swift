@@ -79,6 +79,12 @@ enum LegacyCodableObjects {
 /// path.
 enum LegacyOutOfLineData {
 
+    /// Whether this message's generation carries a side array at all. An iOS 17
+    /// coder installs none, and `Data` then takes its ordinary `Codable` path.
+    static func isEnabled(_ userInfo: [CodingUserInfoKey: Any]) -> Bool {
+        userInfo[.xpcLegacyRawObjectArray] != nil
+    }
+
     static func array(in userInfo: [CodingUserInfoKey: Any]) throws -> xpc_object_t {
         guard let array = userInfo[.xpcLegacyRawObjectArray],
               xpc_get_type(array as! xpc_object_t) == XPC_TYPE_ARRAY else {
