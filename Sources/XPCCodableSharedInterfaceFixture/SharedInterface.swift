@@ -42,7 +42,7 @@ public protocol Courier {
 @XPCService
 public protocol AuditLedger {
     func note(_ text: String)
-    func total() async throws -> XPCCodableMarker<Int>
+    func total() async throws -> Int
 }
 
 /// Takes a `AuditLedger` by proxy and hands one back the same way. Neither crosses as
@@ -51,7 +51,7 @@ public protocol AuditLedger {
 @XPCService
 public protocol Auditor {
     func attach(_ ledger: XPCProxyMarker<AuditLedger>)
-    func reconcile(_ ledger: XPCProxyMarker<AuditLedger>, label: String) async throws -> XPCCodableMarker<Int>
+    func reconcile(_ ledger: XPCProxyMarker<AuditLedger>, label: String) async throws -> Int
     func current() async throws -> XPCProxyMarker<AuditLedger>
 }
 #endif

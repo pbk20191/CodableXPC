@@ -7,16 +7,13 @@ import XPCCodable
 private final class LedgerImpl: AuditLedger, @unchecked Sendable {
     var notes: [String] = []
     func note(_ text: String) { notes.append(text) }
-    func total() async throws -> XPCCodableMarker<Int> {
-        XPCCodableMarker(wrappedValue: notes.count)
-    }
+    func total() async throws -> Int { notes.count }
 }
 
 private final class AuditorImpl: Auditor, @unchecked Sendable {
     var attached: (any AuditLedger)?
     func attach(_ ledger: XPCProxyMarker<AuditLedger>) { attached = ledger.wrappedValue }
-    func reconcile(_ ledger: XPCProxyMarker<AuditLedger>, label: String)
-        async throws -> XPCCodableMarker<Int> {
+    func reconcile(_ ledger: XPCProxyMarker<AuditLedger>, label: String) async throws -> Int {
         ledger.wrappedValue.note(label)
         return try await ledger.wrappedValue.total()
     }
@@ -88,7 +85,7 @@ final class ProxyMarkerTests: XCTestCase {
 
         let total = try await auditor.reconcile(
             XPCProxyMarker(wrappedValue: rebuilt), label: "audited")
-        XCTAssertEqual(total.wrappedValue, 2)
+        XCTAssertEqual(total, 2)
         XCTAssertEqual(ledger.notes, ["opening", "audited"])
     }
 

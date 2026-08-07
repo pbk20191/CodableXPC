@@ -102,6 +102,21 @@ private struct Parameter {
     }
 }
 
+/// Swift's numeric and `Bool` types bridge to `NSNumber`, but only the class is
+/// representable in an `@objc` block: a reply carrying `Int?` will not compile,
+/// while `NSNumber?` will. Carrying them boxed is the same bridge Objective-C
+/// would have used, and the accessor puts the value back exactly.
+///
+/// Parameters need none of this -- a non-optional `Int` is representable. It is
+/// the optionality a reply block forces that these types cannot express.
+private let numberAccessors: [String: String] = [
+    "Int": "intValue", "Int8": "int8Value", "Int16": "int16Value",
+    "Int32": "int32Value", "Int64": "int64Value",
+    "UInt": "uintValue", "UInt8": "uint8Value", "UInt16": "uint16Value",
+    "UInt32": "uint32Value", "UInt64": "uint64Value",
+    "Double": "doubleValue", "Float": "floatValue", "Bool": "boolValue",
+]
+
 private struct Method {
     let decl: FunctionDeclSyntax
     let shape: Shape
@@ -111,11 +126,20 @@ private struct Method {
     /// The service named by a returned `XPCProxyMarker<Service>`, or `nil`.
     let returnsProxyService: String?
 
-    /// What the shim's reply block carries. Three cases, and they are exclusive:
-    /// a proxy to the peer's object, a box of encoded bytes, or the value itself.
+    /// The `NSNumber` accessor for a bridged return, or `nil`.
+    func numberAccessor(_ returnType: TypeSyntax) -> String? {
+        guard !returnsMarker, returnsProxyService == nil else { return nil }
+        return numberAccessors[returnType.trimmedDescription]
+    }
+
+    /// What the shim's reply block carries. Four cases, and they are exclusive:
+    /// a proxy to the peer's object, a box of encoded bytes, an `NSNumber` for a
+    /// type that cannot be optional in Objective-C, or the value itself.
     func replyType(_ returnType: TypeSyntax) -> String {
         if let service = returnsProxyService { return "(any \(service)XPCShim)?" }
-        return returnsMarker ? "NSXPCCodableBridgeBox?" : "\(returnType.trimmedDescription)?"
+        if returnsMarker { return "NSXPCCodableBridgeBox?" }
+        if numberAccessor(returnType) != nil { return "NSNumber?" }
+        return "\(returnType.trimmedDescription)?"
     }
 
     var name: String { decl.name.text }
@@ -500,7 +524,7 @@ public struct XPCServiceMacro: PeerMacro {
                     .map { "XPCProxyMarker(wrappedValue: \($0)XPCClient(proxy: box))" }
                     ?? (method.returnsMarker
                         ? "XPCCodableMarker(wrappedValue: try box.decode(\(payload).self))"
-                        : "box")
+                        : (method.numberAccessor(returnType).map { "box.\($0)" } ?? "box"))
                 return """
                     \(access)func \(method.name)\(signature) {
                         try await withCheckedThrowingContinuation { continuation in
@@ -616,7 +640,9 @@ public struct XPCServiceMacro: PeerMacro {
                 let produced = method.returnsProxyService.map { "\($0)XPCAdapter(result.wrappedValue)" }
                     ?? (method.returnsMarker
                         ? "try NSXPCCodableBridgeBox(result\(unwrapReturn))"
-                        : "result")
+                        : (method.numberAccessor(returnType) != nil
+                            ? "NSNumber(value: result)"
+                            : "result"))
                 return """
                     \(access)func \(method.name)(\((parameters + ["reply: @escaping (\(replyType), (any Error)?) -> Void"]).joined(separator: ", "))) {
                         let implementation = self.implementation
