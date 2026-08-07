@@ -69,11 +69,27 @@ public enum AppleCoderBridge {
     private typealias MakeReceivedMessage =
         @convention(thin) (__owned XPCDictionary) -> XPCReceivedMessage
 
+    /// Looked up in `libswiftXPC` by name rather than through `RTLD_DEFAULT`, so
+    /// the image the symbol comes from is written down rather than searched for.
+    ///
+    /// It has to be `libswiftXPC`: the name is mangled into module `XPC`, and
+    /// `libswiftCore` does not export it. That mistake compiles, builds, and
+    /// leaves `isAvailable` permanently `false` — the whole bridge disabled with
+    /// no diagnostic, and every test that depends on it reporting a skip.
+    ///
+    /// The handle is not closed on success, because the function pointer lives in
+    /// that image. Closing it is harmless in practice — this module's own
+    /// `import XPC` holds the image open regardless, which is also why the
+    /// `dlopen` cannot fail here — but using a pointer into an image you have
+    /// released is not something to rely on being harmless.
     private static let receivedMessageInit: MakeReceivedMessage? = {
         // "$s3XPC18XPCReceivedMessageV10dictionaryAcA13XPCDictionaryV_tcfC"
         // = XPC.XPCReceivedMessage.init(dictionary: XPC.XPCDictionary) -> …
         let mangled = "$s3XPC18XPCReceivedMessageV10dictionaryAcA13XPCDictionaryV_tcfC"
-        guard let symbol = dlsym(UnsafeMutableRawPointer(bitPattern: -2), mangled) else {
+        guard let image = dlopen("/usr/lib/swift/libswiftXPC.dylib", RTLD_NOW | RTLD_LOCAL)
+        else { return nil }
+        guard let symbol = dlsym(image, mangled) else {
+            dlclose(image)
             return nil
         }
         return unsafeBitCast(symbol, to: MakeReceivedMessage.self)
