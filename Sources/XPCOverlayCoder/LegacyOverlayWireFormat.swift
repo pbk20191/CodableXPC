@@ -3,9 +3,11 @@ import Foundation
 /// The wire format Apple's XPC Swift overlay used before the encoding-graph
 /// rewrite — the macOS 15 / iOS 18 generation.
 ///
-/// It is a different format from ``XPCOverlayCoder``'s, not an older revision of
-/// it. Every tag value differs, the framing differs, and the envelope differs.
-/// There is no subset that round-trips between them.
+/// It is a different format from the encoding-graph one in this same module, not
+/// an older revision of it. Every tag value differs, the framing differs, and the
+/// envelope differs. There is no subset that round-trips between them — which is
+/// why they are two implementations rather than one with a flag, and why
+/// ``XPCOverlayGeneration`` exists to pick.
 ///
 /// ## How the two relate
 ///

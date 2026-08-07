@@ -44,9 +44,6 @@ let package = Package(
         .library(
             name: "XPCOverlayCoder",
             targets: ["XPCOverlayCoder"]),
-        .library(
-            name: "XPCLegacyOverlayCoder",
-            targets: ["XPCLegacyOverlayCoder"]),
     ],
     dependencies: [
         // Only the macro plugin needs this. SwiftPM resolves it for anyone who
@@ -79,17 +76,13 @@ let package = Package(
         .target(
             name: "XPCCodable",
             dependencies: ["XPCCodableMacros", "CodableXPC"]),
-        // Reproduces the wire format Apple's XPC Swift overlay uses for Codable.
-        // Separate from CodableXPC on purpose: that one builds a native xpc tree,
-        // this one builds Apple's flat byte stream.
+        // Reproduces every wire format Apple's XPC Swift overlay has used for
+        // Codable -- the iOS 17/18 byte stream and the iOS 26+ encoding graph.
+        // They share no tag values, no framing and no envelope, only a lineage, so
+        // they are two implementations behind one generation-selecting surface.
+        // Separate from CodableXPC on purpose: that one builds a native xpc tree.
         .target(
             name: "XPCOverlayCoder",
-            dependencies: []),
-        // The pre-graph overlay format, the macOS 15 / iOS 18 generation. A
-        // separate module rather than a mode of XPCOverlayCoder because the two
-        // share no tag values, no framing and no envelope -- only a lineage.
-        .target(
-            name: "XPCLegacyOverlayCoder",
             dependencies: []),
         // The macro plugin. Runs in the compiler, never in a consumer binary, so it
         // carries no deployment floor of its own.
@@ -125,12 +118,7 @@ let package = Package(
             dependencies: ["XPCActors"]),
         .testTarget(
             name: "XPCOverlayCoderTests",
-            // The legacy coder is here to build a versionless envelope, which is
-            // the only way to check that both readers reject the other generation.
-            dependencies: ["XPCOverlayCoder", "XPCLegacyOverlayCoder"]),
-        .testTarget(
-            name: "XPCLegacyOverlayCoderTests",
-            dependencies: ["XPCLegacyOverlayCoder"]),
+            dependencies: ["XPCOverlayCoder"]),
         // Declares a public @XPCService protocol and nothing else. Its only job is
         // to be a *different module* from the tests that consume it.
         .target(

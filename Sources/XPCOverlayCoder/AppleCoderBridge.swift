@@ -84,7 +84,7 @@ public enum AppleCoderBridge {
     /// released is not something to rely on being harmless.
     private static let receivedMessageInit: MakeReceivedMessage? = {
         // "$s3XPC18XPCReceivedMessageV10dictionaryAcA13XPCDictionaryV_tcfC"
-        // = XPC.XPCReceivedMessage.init(dictionary: XPC.XPCDictionary) -> …
+        // = XPC.	.init(dictionary: XPC.XPCDictionary) -> …
         let mangled = "$s3XPC18XPCReceivedMessageV10dictionaryAcA13XPCDictionaryV_tcfC"
         guard let image = dlopen("/usr/lib/swift/libswiftXPC.dylib", RTLD_NOW | RTLD_LOCAL)
         else { return nil }

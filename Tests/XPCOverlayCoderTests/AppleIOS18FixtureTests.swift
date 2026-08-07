@@ -1,7 +1,7 @@
 #if canImport(Darwin)
 import XCTest
 import XPC
-@testable import XPCLegacyOverlayCoder
+@testable import XPCOverlayCoder
 
 private struct Scalars: Codable, Equatable {
     let flag: Bool; let small: Int8; let wide: UInt32; let name: String; let ratio: Double
