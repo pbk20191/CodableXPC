@@ -125,7 +125,9 @@ let package = Package(
             dependencies: ["XPCActors"]),
         .testTarget(
             name: "XPCOverlayCoderTests",
-            dependencies: ["XPCOverlayCoder"]),
+            // The legacy coder is here to build a versionless envelope, which is
+            // the only way to check that both readers reject the other generation.
+            dependencies: ["XPCOverlayCoder", "XPCLegacyOverlayCoder"]),
         .testTarget(
             name: "XPCLegacyOverlayCoderTests",
             dependencies: ["XPCLegacyOverlayCoder"]),
