@@ -86,6 +86,20 @@ private struct Method {
     var name: String { decl.name.text }
     var hasBoxedParameter: Bool { parameters.contains(where: \.isBoxed) }
 
+    /// `submit(_:count:note:reply:)` — the argument-label form `#selector` needs.
+    ///
+    /// Built rather than spelled as a string because Swift's selector mangling is
+    /// not mechanical: `ping(reply:)` becomes `pingWithReply:`, not `ping:reply:`.
+    /// Letting the compiler resolve it removes a whole class of silent mistakes.
+    var selectorLabels: String {
+        var pieces = parameters.map { "\($0.label ?? "_"):" }
+        switch shape {
+        case .twoWayValue, .twoWayVoid: pieces.append("reply:")
+        case .oneWay: break
+        }
+        return "\(name)(\(pieces.joined()))"
+    }
+
     /// Approximates the Objective-C selector, for collision detection.
     var selectorKey: String {
         let tail = parameters.enumerated().map { index, parameter in
@@ -163,7 +177,7 @@ public struct XPCServiceMacro: PeerMacro {
             DeclSyntax(stringLiteral: shim(name: name, access: access, methods: methods)),
             DeclSyntax(stringLiteral: client(name: name, access: access, methods: methods)),
             DeclSyntax(stringLiteral: adapter(name: name, access: access, methods: methods)),
-            DeclSyntax(stringLiteral: facade(name: name, access: access)),
+            DeclSyntax(stringLiteral: facade(name: name, access: access, methods: methods)),
         ]
     }
 
@@ -175,6 +189,63 @@ public struct XPCServiceMacro: PeerMacro {
         proto.modifiers.first {
             ["public", "package", "internal", "fileprivate", "private"].contains($0.name.text)
         }.map { "\($0.name.text) " } ?? ""
+    }
+
+    /// The Objective-C class a leaf type arrives as.
+    private static func leafClassName(_ type: TypeSyntax) -> String {
+        switch type.trimmedDescription {
+        case "String": return "NSString"
+        case "Int", "UInt", "Int8", "Int16", "Int32", "Int64",
+             "UInt8", "UInt16", "UInt32", "UInt64", "Double", "Float", "Bool":
+            return "NSNumber"
+        case "Data": return "NSData"
+        case "Date": return "NSDate"
+        case "URL": return "NSURL"
+        case "UUID": return "NSUUID"
+        default: return type.trimmedDescription
+        }
+    }
+
+    /// Appends every class NSXPC has to be told about for `type`, and reports
+    /// whether a container was involved.
+    ///
+    /// Only containers need this. A class named directly in an `@objc` signature is
+    /// allowed automatically — verified — but the moment it sits inside an array or
+    /// dictionary NSXPC refuses it unless the interface whitelists the element type
+    /// as well as the container.
+    @discardableResult
+    private static func collectClasses(_ type: TypeSyntax, into out: inout [String]) -> Bool {
+        if let optional = type.as(OptionalTypeSyntax.self) {
+            return collectClasses(optional.wrappedType, into: &out)
+        }
+        if let array = type.as(ArrayTypeSyntax.self) {
+            out.append("NSArray")
+            collectClasses(array.element, into: &out)
+            return true
+        }
+        if let dictionary = type.as(DictionaryTypeSyntax.self) {
+            out.append("NSDictionary")
+            collectClasses(dictionary.key, into: &out)
+            collectClasses(dictionary.value, into: &out)
+            return true
+        }
+        if let identifier = type.as(IdentifierTypeSyntax.self),
+           identifier.name.text == "Set",
+           let element = identifier.genericArgumentClause?.arguments.first?.argument.as(TypeSyntax.self) {
+            out.append("NSSet")
+            collectClasses(element, into: &out)
+            return true
+        }
+        out.append(leafClassName(type))
+        return false
+    }
+
+    /// The classes to register for `type`, or `nil` when no registration is needed.
+    fileprivate static func containerClasses(for type: TypeSyntax) -> [String]? {
+        var classes: [String] = []
+        guard collectClasses(type, into: &classes) else { return nil }
+        var seen = Set<String>()
+        return classes.filter { seen.insert($0).inserted }
     }
 
     /// The `T` in `XPCCodableMarker<T>`, or `nil` if this is not a marker.
@@ -438,13 +509,48 @@ public struct XPCServiceMacro: PeerMacro {
         """
     }
 
-    private static func facade(name: String, access: String) -> String {
-        """
+    private static func facade(name: String, access: String, methods: [Method]) -> String {
+        // A class named directly in the signature is allowed automatically; one
+        // inside a container is not. Emit the whitelisting NSXPC would otherwise
+        // reject the message for, so a passed-through `[Item]` just works.
+        var registrations: [String] = []
+        for method in methods {
+            let selector = "#selector(\(name)XPCShim.\(method.selectorLabels))"
+            for (index, parameter) in method.parameters.enumerated() where !parameter.isBoxed {
+                guard let classes = containerClasses(for: parameter.declaredType) else { continue }
+                registrations.append("""
+                        interface.setClasses(
+                            NSSet(array: [\(classes.map { "\($0).self" }.joined(separator: ", "))]) as! Set<AnyHashable>,
+                            for: \(selector), argumentIndex: \(index), ofReply: false)
+                """)
+            }
+            if case .twoWayValue(let returnType) = method.shape, !method.returnsMarker,
+               let classes = containerClasses(for: returnType) {
+                registrations.append("""
+                        interface.setClasses(
+                            NSSet(array: [\(classes.map { "\($0).self" }.joined(separator: ", "))]) as! Set<AnyHashable>,
+                            for: \(selector), argumentIndex: 0, ofReply: true)
+                """)
+            }
+        }
+        let body = registrations.isEmpty
+            ? "        NSXPCInterface(with: \(name)XPCShim.self)"
+            : """
+                    let interface = NSXPCInterface(with: \(name)XPCShim.self)
+            \(registrations.joined(separator: "\n"))
+                    return interface
+            """
+
+        return """
         /// Entry points generated by `@XPCService`.
         \(access)enum \(name)XPC {
             /// Assign to both `exportedInterface` and `remoteObjectInterface`.
+            ///
+            /// Any container-typed parameter that crosses natively is whitelisted here
+            /// already — NSXPC rejects a class nested inside an array or dictionary
+            /// unless the interface names both.
             \(access)static var interface: NSXPCInterface {
-                NSXPCInterface(with: \(name)XPCShim.self)
+        \(body)
             }
 
             /// Wrap `connection` so it can be called through `\(name)`.
