@@ -85,7 +85,7 @@ let package = Package(
             dependencies: ["XPCCodableMacros", "CodableXPC"]),
         // Reproduces the wire format Apple's XPC Swift overlay uses for Codable.
         // Separate from CodableXPC on purpose: that one builds a native xpc tree,
-        // this one builds Apple's flat byte stream. Foundation only.
+        // this one builds Apple's flat byte stream.
         .target(
             name: "XPCOverlayCoder",
             dependencies: []),
