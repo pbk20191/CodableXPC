@@ -15,17 +15,17 @@ private struct Arrival: Codable, Equatable {
 }
 
 @objc private protocol Probe {
-    func inspect(_ box: CodableBox, reply: @escaping (CodableBox?, (any Error)?) -> Void)
+    func inspect(_ box: NSXPCCodableBridgeBox, reply: @escaping (NSXPCCodableBridgeBox?, (any Error)?) -> Void)
 }
 
 private final class ProbeService: NSObject, Probe {
-    func inspect(_ box: CodableBox, reply: @escaping (CodableBox?, (any Error)?) -> Void) {
+    func inspect(_ box: NSXPCCodableBridgeBox, reply: @escaping (NSXPCCodableBridgeBox?, (any Error)?) -> Void) {
         do {
             // `payload` is nil exactly when the box is carrying an xpc_object_t,
             // because no public API can turn one into bytes.
             let arrival = Arrival(heldNativeXPC: box.payload == nil,
                                   decoded: try box.decode(Reading.self))
-            reply(try CodableBox(arrival), nil)
+            reply(try NSXPCCodableBridgeBox(arrival), nil)
         } catch {
             reply(nil, error)
         }
@@ -62,7 +62,7 @@ final class NativeXPCPathTests: XCTestCase {
                 if once.claim() { continuation.resume(throwing: error) }
             } as? Probe
             do {
-                try proxy?.inspect(CodableBox(reading)) { box, error in
+                try proxy?.inspect(NSXPCCodableBridgeBox(reading)) { box, error in
                     guard once.claim() else { return }
                     if let error { continuation.resume(throwing: error); return }
                     do { continuation.resume(returning: try box!.decode(Arrival.self)) }
@@ -83,9 +83,9 @@ final class NativeXPCPathTests: XCTestCase {
         // the bytes path. Both routes have to keep working.
         let reading = Reading(sensor: "thermistor", value: 21.5)
         let data = try NSKeyedArchiver.archivedData(
-            withRootObject: try CodableBox(reading), requiringSecureCoding: true)
+            withRootObject: try NSXPCCodableBridgeBox(reading), requiringSecureCoding: true)
         let box = try XCTUnwrap(
-            NSKeyedUnarchiver.unarchivedObject(ofClass: CodableBox.self, from: data))
+            NSKeyedUnarchiver.unarchivedObject(ofClass: NSXPCCodableBridgeBox.self, from: data))
         XCTAssertNotNil(box.payload, "an archived box must arrive holding bytes")
         XCTAssertEqual(try box.decode(Reading.self), reading)
     }

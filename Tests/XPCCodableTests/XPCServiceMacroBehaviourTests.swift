@@ -15,7 +15,7 @@ enum GreeterFailure: Error {
     case refused
 }
 
-/// The whole point: ordinary Swift types, no `CodableBox` in sight.
+/// The whole point: ordinary Swift types, no `NSXPCCodableBridgeBox` in sight.
 @XPCService
 protocol Greeter {
     func greet(_ person: XPCCodableMarker<Visitor>) async throws -> XPCCodableMarker<Greeting>

@@ -13,7 +13,7 @@ import CodableXPC
 /// `@objc(StableName)` either — the compiler rejects that with *"generic subclasses
 /// of '@objc' classes cannot have an explicit '@objc' because they are not directly
 /// visible from Objective-C"*. A generic box would also embed its module name and
-/// its payload type into every archive it appears in (`_TtGC6MyMod10CodableBox…`),
+/// its payload type into every archive it appears in (`_TtGC6MyMod21NSXPCCodableBridgeBoxVS_6Person_`),
 /// so renaming either one silently breaks every stored archive and every peer built
 /// from a different module.
 ///
@@ -37,14 +37,14 @@ import CodableXPC
 /// dictionary does require registration.
 ///
 ///     @objc protocol Greeter {
-///         func greet(_ person: CodableBox, reply: @escaping (CodableBox?, Error?) -> Void)
+///         func greet(_ person: NSXPCCodableBridgeBox, reply: @escaping (NSXPCCodableBridgeBox?, Error?) -> Void)
 ///     }
 ///
 /// - Note: Do not try to swap the decoded object for another type from
 ///   `awakeAfter(using:)`. It works under `NSKeyedUnarchiver`, but `NSXPCDecoder`
 ///   crashes with `EXC_BAD_ACCESS` inside `swift_retain`.
-@objc(CodableBox)
-public final class CodableBox: NSObject, NSSecureCoding {
+@objc(NSXPCCodableBridgeBox)
+public final class NSXPCCodableBridgeBox: NSObject, NSSecureCoding {
 
     /// What the box is holding, which depends on where it came from and where it
     /// is going.
@@ -90,7 +90,7 @@ public final class CodableBox: NSObject, NSSecureCoding {
     public init<Value: Encodable>(_ value: Value) throws {
         storage = .pending(
             encodeToXPC: { try XPCEncoder().encode(value) },
-            encodeToData: { try CodableBox.defaultEncoder().encode(value) })
+            encodeToData: { try NSXPCCodableBridgeBox.defaultEncoder().encode(value) })
     }
 
     /// Encode `value` with a caller-supplied JSON encoder, for date and key
@@ -130,7 +130,7 @@ public final class CodableBox: NSObject, NSSecureCoding {
     /// Decode with a caller-supplied JSON decoder, matching whatever encoded it.
     public func decode<Value: Decodable>(_ type: Value.Type = Value.self, decoder: JSONDecoder) throws -> Value {
         guard let payload else {
-            throw CodableBoxError.nativePayloadNeedsNoJSONDecoder
+            throw NSXPCCodableBridgeBoxError.nativePayloadNeedsNoJSONDecoder
         }
         return try decoder.decode(type, from: payload)
     }
@@ -165,14 +165,14 @@ public final class CodableBox: NSObject, NSSecureCoding {
         // The native path skips JSON entirely: an NSXPC message is an xpc dictionary
         // already, so handing it one costs no serialisation.
         if coder.responds(to: SPI.encode), let object = try? nativeObject() {
-            CodableBox.spi(coder).encodeXPCObject(object, forKey: Key.payload)
+            NSXPCCodableBridgeBox.spi(coder).encodeXPCObject(object, forKey: Key.payload)
             return
         }
         // Keyed, not `encode(_:)`. The unkeyed pair works — an NSKeyedArchiver
         // generates positional keys — but it leaves the payload unnamed in the
         // archive, which makes the format impossible to evolve.
         guard let payload else {
-            coder.failWithError(CodableBoxError.nativePayloadCannotBeArchived)
+            coder.failWithError(NSXPCCodableBridgeBoxError.nativePayloadCannotBeArchived)
             return
         }
         coder.encode(payload, forKey: Key.payload)
@@ -180,7 +180,7 @@ public final class CodableBox: NSObject, NSSecureCoding {
 
     public required init?(coder: NSCoder) {
         if coder.responds(to: SPI.decode),
-           let object = CodableBox.spi(coder).decodeXPCObject(forKey: Key.payload) {
+           let object = NSXPCCodableBridgeBox.spi(coder).decodeXPCObject(forKey: Key.payload) {
             storage = .xpc(object)
             return
         }
@@ -209,18 +209,18 @@ public final class CodableBox: NSObject, NSSecureCoding {
 
     public override var description: String {
         switch storage {
-        case .data(let data): return "CodableBox(\(data.count) bytes)"
-        case .xpc: return "CodableBox(native xpc)"
-        case .pending: return "CodableBox(pending)"
+        case .data(let data): return "NSXPCCodableBridgeBox(\(data.count) bytes)"
+        case .xpc: return "NSXPCCodableBridgeBox(native xpc)"
+        case .pending: return "NSXPCCodableBridgeBox(pending)"
         }
     }
 }
 
 /// Failures specific to how a box is carrying its payload.
-public enum CodableBoxError: Error, Equatable {
+public enum NSXPCCodableBridgeBoxError: Error, Equatable {
     /// The box arrived over NSXPC and holds an `xpc_object_t`. No public API turns
     /// one into bytes, so it cannot be written to an archive or read with a
-    /// `JSONDecoder`. Use ``CodableBox/decode(_:)``.
+    /// `JSONDecoder`. Use ``NSXPCCodableBridgeBox/decode(_:)``.
     case nativePayloadCannotBeArchived
     case nativePayloadNeedsNoJSONDecoder
 }

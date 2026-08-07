@@ -66,7 +66,7 @@ private struct Parameter {
     var isBoxed: Bool { boxedType != nil }
 
     /// What the shim declares: a box when marked, the type verbatim otherwise.
-    var shimType: String { isBoxed ? "CodableBox" : declaredType.trimmedDescription }
+    var shimType: String { isBoxed ? "NSXPCCodableBridgeBox" : declaredType.trimmedDescription }
 
     /// What the convenience overload declares: unwrapped when marked.
     var bareType: String { (boxedType ?? declaredType).trimmedDescription }
@@ -108,7 +108,7 @@ private struct Method {
         return "\(name):\(tail)"
     }
 
-    /// `_ a0: CodableBox, id a1: Int, …` keeping the original labels so the
+    /// `_ a0: NSXPCCodableBridgeBox, id a1: Int, …` keeping the original labels so the
     /// generated selector reads naturally.
     var shimParameters: [String] {
         parameters.enumerated().map { index, parameter in
@@ -134,7 +134,7 @@ private struct Method {
         parameters.map { parameter in
             parameter.labelled(
                 parameter.isBoxed
-                    ? "try CodableBox(\(parameter.internalName).wrappedValue)"
+                    ? "try NSXPCCodableBridgeBox(\(parameter.internalName).wrappedValue)"
                     : parameter.internalName)
         }
     }
@@ -332,7 +332,7 @@ public struct XPCServiceMacro: PeerMacro {
             let parameters = method.shimParameters
             switch method.shape {
             case .twoWayValue(let returnType):
-                let replyType = method.returnsMarker ? "CodableBox?" : "\(returnType.trimmedDescription)?"
+                let replyType = method.returnsMarker ? "NSXPCCodableBridgeBox?" : "\(returnType.trimmedDescription)?"
                 return "    func \(method.name)(\((parameters + ["reply: @escaping (\(replyType), (any Error)?) -> Void"]).joined(separator: ", ")))"
             case .twoWayVoid:
                 return "    func \(method.name)(\((parameters + ["reply: @escaping ((any Error)?) -> Void"]).joined(separator: ", ")))"
@@ -455,9 +455,9 @@ public struct XPCServiceMacro: PeerMacro {
 
             switch method.shape {
             case .twoWayValue(let returnType):
-                let replyType = method.returnsMarker ? "CodableBox?" : "\(returnType.trimmedDescription)?"
+                let replyType = method.returnsMarker ? "NSXPCCodableBridgeBox?" : "\(returnType.trimmedDescription)?"
                 let produced = method.returnsMarker
-                    ? "try CodableBox(result\(unwrapReturn))"
+                    ? "try NSXPCCodableBridgeBox(result\(unwrapReturn))"
                     : "result"
                 return """
                     \(access)func \(method.name)(\((parameters + ["reply: @escaping (\(replyType), (any Error)?) -> Void"]).joined(separator: ", "))) {

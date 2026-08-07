@@ -6,27 +6,27 @@ private struct Person: Codable, Equatable {
     let age: Int
 }
 
-final class CodableBoxTests: XCTestCase {
+final class NSXPCCodableBridgeBoxTests: XCTestCase {
 
     // MARK: value round trip
 
     func testRoundTripsAStruct() throws {
         let person = Person(name: "Ada", age: 36)
-        XCTAssertEqual(try CodableBox(person).decode(Person.self), person)
+        XCTAssertEqual(try NSXPCCodableBridgeBox(person).decode(Person.self), person)
     }
 
     func testRoundTripsTopLevelFragments() throws {
         // The whole reason this box uses JSON. PropertyListEncoder rejects every one
         // of these with "the data couldn't be written because it isn't in the correct
         // format", which a generated XPC shim would hit on its first String argument.
-        XCTAssertEqual(try CodableBox("hello").decode(String.self), "hello")
-        XCTAssertEqual(try CodableBox(42).decode(Int.self), 42)
-        XCTAssertEqual(try CodableBox([1, 2, 3]).decode([Int].self), [1, 2, 3])
-        XCTAssertNil(try CodableBox(Int?.none).decode(Int?.self))
+        XCTAssertEqual(try NSXPCCodableBridgeBox("hello").decode(String.self), "hello")
+        XCTAssertEqual(try NSXPCCodableBridgeBox(42).decode(Int.self), 42)
+        XCTAssertEqual(try NSXPCCodableBridgeBox([1, 2, 3]).decode([Int].self), [1, 2, 3])
+        XCTAssertNil(try NSXPCCodableBridgeBox(Int?.none).decode(Int?.self))
     }
 
     func testDecodingTheWrongTypeThrows() throws {
-        let box = try CodableBox(Person(name: "Ada", age: 36))
+        let box = try NSXPCCodableBridgeBox(Person(name: "Ada", age: 36))
         XCTAssertThrowsError(try box.decode([String].self))
     }
 
@@ -37,7 +37,7 @@ final class CodableBoxTests: XCTestCase {
         decoder.keyDecodingStrategy = .convertFromSnakeCase
 
         struct Wrapper: Codable, Equatable { let userName: String }
-        let box = try CodableBox(Wrapper(userName: "ada"), encoder: encoder)
+        let box = try NSXPCCodableBridgeBox(Wrapper(userName: "ada"), encoder: encoder)
         XCTAssertTrue(String(decoding: try XCTUnwrap(box.payload), as: UTF8.self).contains("user_name"))
         XCTAssertEqual(try box.decode(Wrapper.self, decoder: decoder), Wrapper(userName: "ada"))
     }
@@ -48,8 +48,8 @@ final class CodableBoxTests: XCTestCase {
         // Not the mangled Swift name. An archive embeds this string, so it has to
         // survive a module rename -- and it can only be pinned because the class is
         // not generic.
-        XCTAssertEqual(NSStringFromClass(CodableBox.self), "CodableBox")
-        XCTAssertTrue(CodableBox.self === NSClassFromString("CodableBox"))
+        XCTAssertEqual(NSStringFromClass(NSXPCCodableBridgeBox.self), "NSXPCCodableBridgeBox")
+        XCTAssertTrue(NSXPCCodableBridgeBox.self === NSClassFromString("NSXPCCodableBridgeBox"))
     }
 
     func testDefaultEncodingIsReproducible() throws {
@@ -57,8 +57,8 @@ final class CodableBoxTests: XCTestCase {
         // in Swift Dictionary order, which is seeded per process, so the same value
         // can encode to {"name":…,"age":…} in one run and {"age":…,"name":…} in the
         // next. A caller who caches or diffs on the bytes needs this to hold.
-        let a = try CodableBox(Person(name: "Ada", age: 36))
-        let b = try CodableBox(Person(name: "Ada", age: 36))
+        let a = try NSXPCCodableBridgeBox(Person(name: "Ada", age: 36))
+        let b = try NSXPCCodableBridgeBox(Person(name: "Ada", age: 36))
         XCTAssertEqual(a.payload, b.payload)
         XCTAssertEqual(String(decoding: try XCTUnwrap(a.payload), as: UTF8.self),
                        #"{"age":36,"name":"Ada"}"#)
@@ -66,10 +66,10 @@ final class CodableBoxTests: XCTestCase {
 
     func testEqualityIsIdentityNotPayload() throws {
         // Two boxes holding the same value are NOT equal, on purpose -- see the note
-        // in CodableBox. Byte equality would be right only until someone passed a
+        // in NSXPCCodableBridgeBox. Byte equality would be right only until someone passed a
         // custom encoder.
-        let a = try CodableBox(Person(name: "Ada", age: 36))
-        let b = try CodableBox(Person(name: "Ada", age: 36))
+        let a = try NSXPCCodableBridgeBox(Person(name: "Ada", age: 36))
+        let b = try NSXPCCodableBridgeBox(Person(name: "Ada", age: 36))
         XCTAssertNotEqual(a, b)
         XCTAssertEqual(a, a)
     }
@@ -79,21 +79,21 @@ final class CodableBoxTests: XCTestCase {
     func testSurvivesSecureKeyedArchiving() throws {
         let person = Person(name: "Ada", age: 36)
         let data = try NSKeyedArchiver.archivedData(
-            withRootObject: try CodableBox(person), requiringSecureCoding: true)
+            withRootObject: try NSXPCCodableBridgeBox(person), requiringSecureCoding: true)
         let box = try XCTUnwrap(
-            NSKeyedUnarchiver.unarchivedObject(ofClass: CodableBox.self, from: data))
+            NSKeyedUnarchiver.unarchivedObject(ofClass: NSXPCCodableBridgeBox.self, from: data))
         XCTAssertEqual(try box.decode(Person.self), person)
     }
 
     func testArchiveEmbedsThePinnedName() throws {
         let data = try NSKeyedArchiver.archivedData(
-            withRootObject: try CodableBox(Person(name: "Ada", age: 36)),
+            withRootObject: try NSXPCCodableBridgeBox(Person(name: "Ada", age: 36)),
             requiringSecureCoding: true)
         let plist = try XCTUnwrap(
             try PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any])
         let objects = try XCTUnwrap(plist["$objects"] as? [Any])
         let names = objects.compactMap { ($0 as? [String: Any])?["$classname"] as? String }
-        XCTAssertTrue(names.contains("CodableBox"),
+        XCTAssertTrue(names.contains("NSXPCCodableBridgeBox"),
                       "expected the pinned name in the archive, got \(names)")
     }
 }
