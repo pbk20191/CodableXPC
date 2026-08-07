@@ -1,4 +1,5 @@
 import Foundation
+import XPC
 
 /// Decodes a `Codable` value from the byte stream Apple's XPC overlay produces.
 ///
@@ -49,10 +50,36 @@ public struct XPCOverlayDecoder {
         return try decode(type, from: body, outOfLine: outOfLine)
     }
 
+    /// Decode a message that carries live XPC objects, such as an `XPCEndpoint`.
+    ///
+    /// `outOfLineObjects` is `_CodableOutOfLine4CodableObject`. It is installed in
+    /// `userInfo` under the key Apple's own decoding code looks for, so the
+    /// overlay's types recover themselves without this module understanding them.
+    @available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
+    public func decode<T: Decodable>(
+        _ type: T.Type = T.self,
+        from body: Data,
+        outOfLine: [Data] = [],
+        outOfLineObjects: [xpc_object_t]
+    ) throws -> T {
+        var info = userInfo
+        OverlayCodableObjects.install(outOfLineObjects, into: &info)
+        return try Self.decode(type, from: body, outOfLine: outOfLine, userInfo: info)
+    }
+
     public func decode<T: Decodable>(
         _ type: T.Type = T.self,
         from body: Data,
         outOfLine: [Data] = []
+    ) throws -> T {
+        try Self.decode(type, from: body, outOfLine: outOfLine, userInfo: userInfo)
+    }
+
+    private static func decode<T: Decodable>(
+        _ type: T.Type,
+        from body: Data,
+        outOfLine: [Data],
+        userInfo: [CodingUserInfoKey: Any]
     ) throws -> T {
         let (root, containers) = try OverlayStreamReader.parse(body)
         let node = try OverlayValue.resolve(root, in: containers)

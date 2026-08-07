@@ -1,4 +1,5 @@
 import Foundation
+import XPC
 
 /// Encodes a `Codable` value into the byte stream Apple's XPC overlay expects.
 ///
@@ -27,13 +28,27 @@ public struct XPCOverlayEncoder {
         public let body: Data
         /// Goes under `_CodableOutOfLine`, in order.
         public let outOfLine: [Data]
+        /// Goes under `_CodableOutOfLine4CodableObject`, in order. Live XPC objects
+        /// such as an `XPCEndpoint`, which the body refers to by index.
+        public let outOfLineObjects: [xpc_object_t]
     }
 
+    @available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
     public func encode<T: Encodable>(_ value: T) throws -> Encoded {
+        // Apple's XPCEndpoint.encode(to:) reaches into userInfo for an array to put
+        // itself in. Providing one is all it takes for a live object to travel
+        // through a coder written from scratch.
+        var info = userInfo
+        let objects = OverlayCodableObjects.install(into: &info)
+
         let root = OverlayEncodingNode()
-        let encoder = OverlayEncoderImpl(node: root, codingPath: [], userInfo: userInfo)
-        try encoder.encodeTopLevel(value)
-        return OverlaySerializer.serialize(root)
+        try OverlayEncoderImpl(node: root, codingPath: [], userInfo: info)
+            .encodeTopLevel(value)
+
+        let serialized = OverlaySerializer.serialize(root)
+        return Encoded(body: serialized.body,
+                       outOfLine: serialized.outOfLine,
+                       outOfLineObjects: OverlayCodableObjects.drain(objects))
     }
 }
 
@@ -90,7 +105,7 @@ enum OverlaySerializer {
             bytes.append(OverlayTag.containerStart.rawValue)
             emit(node, into: &bytes, ids: ids, outOfLine: &outOfLine)
         }
-        return .init(body: Data(bytes), outOfLine: outOfLine)
+        return .init(body: Data(bytes), outOfLine: outOfLine, outOfLineObjects: [])
     }
 
     private static func emit(_ node: OverlayEncodingNode,
