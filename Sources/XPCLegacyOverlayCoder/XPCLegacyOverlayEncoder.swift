@@ -20,7 +20,11 @@ public struct XPCLegacyOverlayEncoder {
 
     public var userInfo: [CodingUserInfoKey: Any] = [:]
 
+    /// Which build to write for. See ``LegacyOverlayGeneration``.
+    public var generation: LegacyOverlayGeneration = .iOS18
+
     public init() {}
+    public init(generation: LegacyOverlayGeneration) { self.generation = generation }
 
     public struct Encoded {
         /// Goes under `_CodableBody`.
@@ -44,7 +48,11 @@ public struct XPCLegacyOverlayEncoder {
         // Providing one is all it takes for a live object to travel through a coder
         // written from scratch.
         var info = userInfo
-        let objects = LegacyCodableObjects.install(into: &info)
+        // iOS 17 has no side array, and installing one would let a Data or an
+        // XPCEndpoint encode in a shape that build cannot read.
+        let objects = generation.carriesOutOfLineObjects
+            ? LegacyCodableObjects.install(into: &info)
+            : nil
 
         let root = LegacyEncodingNode()
         try LegacyEncoderImpl(node: root, codingPath: [], userInfo: info)
@@ -53,7 +61,7 @@ public struct XPCLegacyOverlayEncoder {
         let tree = root.materialise()
         return Encoded(body: LegacyOverlayStreamWriter.serialize(tree),
                        tree: tree,
-                       outOfLineObjects: LegacyCodableObjects.drain(objects))
+                       outOfLineObjects: objects.map(LegacyCodableObjects.drain) ?? [])
     }
 }
 
@@ -118,7 +126,7 @@ final class LegacyEncoderImpl: Encoder {
     func encodeTopLevel<T: Encodable>(_ value: T) throws {
         // A top-level Data never reaches a container, so the hook has to be here
         // too -- otherwise it writes its own byte run and Apple reads an index.
-        if let data = value as? Data {
+        if let data = value as? Data, LegacyOutOfLineData.isEnabled(userInfo) {
             node.kind = .single
             node.leaf = .int(try LegacyOutOfLineData.append(data, to: userInfo))
             return
@@ -201,7 +209,7 @@ private struct LegacyKeyedEncodingContainer<Key: CodingKey>: KeyedEncodingContai
     mutating func encode(_ v: UInt64, forKey key: Key) throws { try put(.uint64(v), key.stringValue) }
 
     mutating func encode<T: Encodable>(_ value: T, forKey key: Key) throws {
-        if let data = value as? Data {
+        if let data = value as? Data, LegacyOutOfLineData.isEnabled(encoder.userInfo) {
             try put(.int(LegacyOutOfLineData.append(data, to: encoder.userInfo)), key.stringValue)
             return
         }
@@ -296,7 +304,7 @@ private struct LegacyUnkeyedEncodingContainer: UnkeyedEncodingContainer {
     mutating func encode(_ v: UInt64) throws { put(.uint64(v)) }
 
     mutating func encode<T: Encodable>(_ value: T) throws {
-        if let data = value as? Data {
+        if let data = value as? Data, LegacyOutOfLineData.isEnabled(encoder.userInfo) {
             put(.int(try LegacyOutOfLineData.append(data, to: encoder.userInfo)))
             return
         }
@@ -353,7 +361,7 @@ private struct LegacySingleValueEncodingContainer: SingleValueEncodingContainer 
     /// Encoding into the same node, not a child: the container is transparent, so
     /// whatever the value writes becomes this node's own content.
     mutating func encode<T: Encodable>(_ value: T) throws {
-        if let data = value as? Data {
+        if let data = value as? Data, LegacyOutOfLineData.isEnabled(encoder.userInfo) {
             put(.int(try LegacyOutOfLineData.append(data, to: encoder.userInfo)))
             return
         }
