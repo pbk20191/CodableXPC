@@ -18,8 +18,8 @@ enum GreeterFailure: Error {
 /// The whole point: ordinary Swift types, no `CodableBox` in sight.
 @XPCService
 protocol Greeter {
-    func greet(_ person: Visitor) async throws -> Greeting
-    func ping() async throws -> Int
+    func greet(_ person: XPCCodableMarker<Visitor>) async throws -> XPCCodableMarker<Greeting>
+    func ping() async throws -> XPCCodableMarker<Int>
     func refuse() async throws
     func note(_ line: String)
 }
@@ -35,10 +35,14 @@ final class Notebook: @unchecked Sendable {
 struct GreeterService: Greeter {
     let notebook: Notebook
 
-    func greet(_ person: Visitor) async throws -> Greeting {
-        Greeting(text: "Hello \(person.name), age \(person.age)")
+    // The implementation side sees the markers too: the requirement is the marked
+    // one, so a service unwraps its arguments and wraps its result.
+    func greet(_ person: XPCCodableMarker<Visitor>) async throws -> XPCCodableMarker<Greeting> {
+        let visitor = person.wrappedValue
+        return XPCCodableMarker(wrappedValue:
+            Greeting(text: "Hello \(visitor.name), age \(visitor.age)"))
     }
-    func ping() async throws -> Int { 7 }
+    func ping() async throws -> XPCCodableMarker<Int> { XPCCodableMarker(wrappedValue: 7) }
     func refuse() async throws { throw GreeterFailure.refused }
     func note(_ line: String) { notebook.append(line) }
 }
@@ -86,6 +90,7 @@ final class XPCServiceMacroBehaviourTests: XCTestCase {
 
     func testTwoWayCallWithAValue() async throws {
         let greeter = GreeterXPC.remote(connection)
+        // The convenience overload takes and returns bare values.
         let greeting = try await greeter.greet(Visitor(name: "Ada", age: 36))
         XCTAssertEqual(greeting, Greeting(text: "Hello Ada, age 36"))
     }
@@ -94,8 +99,10 @@ final class XPCServiceMacroBehaviourTests: XCTestCase {
         // A zero-parameter method is the case where naive argument joining emits
         // `ping(, reply:)` and fails to compile.
         let greeter = GreeterXPC.remote(connection)
+        // ping() takes no arguments, so there is no convenience overload to
+        // generate -- the requirement itself is what you call, markers and all.
         let pong = try await greeter.ping()
-        XCTAssertEqual(pong, 7)
+        XCTAssertEqual(pong.wrappedValue, 7)
     }
 
     func testThrownErrorReachesTheCaller() async throws {
@@ -149,20 +156,20 @@ public struct PublicPayload: Codable, Sendable { public init() {} }
 /// too, or they cannot satisfy a public shim requirement.
 @XPCService
 public protocol PublicService {
-    func work(_ value: XPCCodableMarker<PublicPayload>) async throws -> PublicPayload
+    func work(_ value: XPCCodableMarker<PublicPayload>) async throws -> XPCCodableMarker<PublicPayload>
 }
 
 /// Inherited protocols must not confuse the generator.
 @XPCService
 protocol InheritingService: Sendable {
-    func work(_ value: PublicPayload) async throws -> PublicPayload
+    func work(_ value: XPCCodableMarker<PublicPayload>) async throws -> XPCCodableMarker<PublicPayload>
 }
 
 /// Argument labels have to survive into the Objective-C selector, and several
 /// parameters have to be boxed independently.
 @XPCService
 protocol LabelledService {
-    func move(to destination: PublicPayload) async throws -> PublicPayload
-    func pair(_ first: PublicPayload, with second: PublicPayload) async throws -> PublicPayload
+    func move(to destination: XPCCodableMarker<PublicPayload>) async throws -> XPCCodableMarker<PublicPayload>
+    func pair(_ first: XPCCodableMarker<PublicPayload>, with second: XPCCodableMarker<PublicPayload>) async throws -> XPCCodableMarker<PublicPayload>
 }
 #endif

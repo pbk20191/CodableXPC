@@ -59,6 +59,7 @@
 /// is almost always top-level. Naming them also means `GreeterXPC` and friends
 /// resolve in an editor before the macro has ever run.
 @attached(peer, names: suffixed(XPCShim), suffixed(XPCClient), suffixed(XPCAdapter), suffixed(XPC))
+@attached(extension, names: arbitrary)
 public macro XPCService() = #externalMacro(module: "XPCCodableMacros", type: "XPCServiceMacro")
 
 /// Failures raised by generated client code, as opposed to by the peer.

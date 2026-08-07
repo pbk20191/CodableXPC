@@ -11,7 +11,7 @@ import XPCCodableMacrosCore
 /// expansion itself lives in `XPCCodableMacrosCore`, a plain library, because
 /// `@testable import` of a `.macro` executable does not link under the swiftbuild
 /// build system — so the tests link the library and this file forwards to it.
-public struct XPCServiceMacro: PeerMacro {
+public struct XPCServiceMacro: PeerMacro, ExtensionMacro {
     public static func expansion(
         of node: AttributeSyntax,
         providingPeersOf declaration: some DeclSyntaxProtocol,
@@ -19,6 +19,18 @@ public struct XPCServiceMacro: PeerMacro {
     ) throws -> [DeclSyntax] {
         try XPCCodableMacrosCore.XPCServiceMacro.expansion(
             of: node, providingPeersOf: declaration, in: context)
+    }
+
+    public static func expansion(
+        of node: AttributeSyntax,
+        attachedTo declaration: some DeclGroupSyntax,
+        providingExtensionsOf type: some TypeSyntaxProtocol,
+        conformingTo protocols: [TypeSyntax],
+        in context: some MacroExpansionContext
+    ) throws -> [ExtensionDeclSyntax] {
+        try XPCCodableMacrosCore.XPCServiceMacro.expansion(
+            of: node, attachedTo: declaration, providingExtensionsOf: type,
+            conformingTo: protocols, in: context)
     }
 }
 

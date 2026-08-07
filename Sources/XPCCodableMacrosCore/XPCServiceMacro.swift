@@ -1,4 +1,5 @@
 import SwiftSyntax
+import SwiftSyntaxBuilder
 import SwiftSyntaxMacros
 import SwiftDiagnostics
 
@@ -40,7 +41,7 @@ enum XPCServiceDiagnostic: String, DiagnosticMessage {
     }
 }
 
-// MARK: - Method model
+// MARK: - Model
 
 /// How a protocol requirement maps onto an `@objc` shim method.
 private enum Shape {
@@ -52,47 +53,75 @@ private enum Shape {
     case oneWay
 }
 
+private struct Parameter {
+    /// The label as written, `nil` where the source used `_`.
+    let label: String?
+    /// The name the parameter is known by inside a body.
+    let internalName: String
+    /// As written in the protocol: `XPCCodableMarker<Person>`, or `Int`.
+    let declaredType: TypeSyntax
+    /// The payload inside the marker, or `nil` when the parameter passes through.
+    let boxedType: TypeSyntax?
+
+    var isBoxed: Bool { boxedType != nil }
+
+    /// What the shim declares: a box when marked, the type verbatim otherwise.
+    var shimType: String { isBoxed ? "CodableBox" : declaredType.trimmedDescription }
+
+    /// What the convenience overload declares: unwrapped when marked.
+    var bareType: String { (boxedType ?? declaredType).trimmedDescription }
+
+    func labelled(_ value: String) -> String {
+        label.map { "\($0): \(value)" } ?? value
+    }
+}
+
 private struct Method {
     let decl: FunctionDeclSyntax
     let shape: Shape
-    /// Argument labels as written, `nil` where the source used `_`.
-    let labels: [String?]
-    /// The name each parameter is known by inside a body.
-    let internalNames: [String]
-    let types: [TypeSyntax]
+    let parameters: [Parameter]
+    /// True when the return type was written as `XPCCodableMarker<T>`.
+    let returnsMarker: Bool
 
     var name: String { decl.name.text }
+    var hasBoxedParameter: Bool { parameters.contains(where: \.isBoxed) }
 
     /// Approximates the Objective-C selector, for collision detection.
     var selectorKey: String {
-        let tail = labels.enumerated().map { index, label in
-            index == 0 ? "" : (label ?? "_")
+        let tail = parameters.enumerated().map { index, parameter in
+            index == 0 ? "" : (parameter.label ?? "_")
         }.joined(separator: ":")
         return "\(name):\(tail)"
     }
 
-    /// `_ a0: CodableBox, to a1: CodableBox, …` preserving the original labels so
-    /// the generated selector reads naturally.
-    var boxedParameters: [String] {
-        labels.enumerated().map { index, label in
-            "\(label ?? "_") a\(index): CodableBox"
+    /// `_ a0: CodableBox, id a1: Int, …` keeping the original labels so the
+    /// generated selector reads naturally.
+    var shimParameters: [String] {
+        parameters.enumerated().map { index, parameter in
+            "\(parameter.label ?? "_") a\(index): \(parameter.shimType)"
         }
     }
 
-    /// `try a0.decode(Person.self)`, labelled for the call into the implementation.
-    var decodedArguments: [String] {
-        zip(labels, types).enumerated().map { index, pair in
-            let (label, type) = pair
-            let value = "try a\(index).decode(\(type.trimmedDescription).self)"
-            return label.map { "\($0): \(value)" } ?? value
+    /// What the adapter passes into the implementation. A boxed parameter is decoded
+    /// and re-wrapped, because the implementation's signature still says
+    /// `XPCCodableMarker<Person>`.
+    var adapterArguments: [String] {
+        parameters.enumerated().map { index, parameter in
+            guard let boxed = parameter.boxedType else {
+                return parameter.labelled("a\(index)")
+            }
+            return parameter.labelled(
+                "XPCCodableMarker(wrappedValue: try a\(index).decode(\(boxed.trimmedDescription).self))")
         }
     }
 
-    /// `try CodableBox(person)`, positional, for the call into the shim.
-    var boxedArguments: [String] {
-        zip(labels, internalNames).map { label, name in
-            let value = "try CodableBox(\(name))"
-            return label.map { "\($0): \(value)" } ?? value
+    /// What the client passes into the shim.
+    var clientArguments: [String] {
+        parameters.map { parameter in
+            parameter.labelled(
+                parameter.isBoxed
+                    ? "try CodableBox(\(parameter.internalName).wrappedValue)"
+                    : parameter.internalName)
         }
     }
 }
@@ -128,11 +157,7 @@ public struct XPCServiceMacro: PeerMacro {
         }
 
         let name = proto.name.text
-        // Mirror the protocol's visibility so the generated surface is reachable
-        // exactly where the protocol is.
-        let access = proto.modifiers.first {
-            ["public", "package", "internal", "fileprivate", "private"].contains($0.name.text)
-        }.map { "\($0.name.text) " } ?? ""
+        let access = accessModifier(of: proto)
 
         return [
             DeclSyntax(stringLiteral: shim(name: name, access: access, methods: methods)),
@@ -144,7 +169,26 @@ public struct XPCServiceMacro: PeerMacro {
 
     // MARK: parsing
 
-    private static func parse(
+    /// Mirror the protocol's visibility so the generated surface is reachable
+    /// exactly where the protocol is.
+    fileprivate static func accessModifier(of proto: ProtocolDeclSyntax) -> String {
+        proto.modifiers.first {
+            ["public", "package", "internal", "fileprivate", "private"].contains($0.name.text)
+        }.map { "\($0.name.text) " } ?? ""
+    }
+
+    /// The `T` in `XPCCodableMarker<T>`, or `nil` if this is not a marker.
+    fileprivate static func markerPayload(_ type: TypeSyntax) -> TypeSyntax? {
+        guard let identifier = type.as(IdentifierTypeSyntax.self),
+              identifier.name.text == "XPCCodableMarker",
+              let arguments = identifier.genericArgumentClause?.arguments,
+              arguments.count == 1,
+              let only = arguments.first
+        else { return nil }
+        return only.argument.as(TypeSyntax.self)
+    }
+
+    fileprivate static func parse(
         _ proto: ProtocolDeclSyntax,
         in context: some MacroExpansionContext
     ) -> [Method]? {
@@ -164,11 +208,17 @@ public struct XPCServiceMacro: PeerMacro {
             let isThrowing = effects?.throwsClause != nil
             let returnType = fn.signature.returnClause?.type
             let returnsValue = returnType.map { !isVoid($0) } ?? false
+            let returnsMarker = returnType.flatMap(markerPayload) != nil
 
             let shape: Shape
             switch (returnsValue, isAsync, isThrowing) {
             case (true, true, true):
-                shape = .twoWayValue(returnType: returnType!)
+                // Same rule as parameters: marked means Codable-boxed, unmarked
+                // crosses as itself so an NSSecureCoding class can be returned
+                // natively. Note the reply block needs an optional, so an unmarked
+                // value type like Int is not representable -- the generated @objc
+                // protocol reports that, which is the honest signal.
+                shape = .twoWayValue(returnType: markerPayload(returnType!) ?? returnType!)
             case (false, true, true):
                 shape = .twoWayVoid
             case (false, false, false):
@@ -178,14 +228,23 @@ public struct XPCServiceMacro: PeerMacro {
                 return nil
             }
 
-            let params = fn.signature.parameterClause.parameters
-            methods.append(Method(
-                decl: fn,
-                shape: shape,
-                labels: params.map { $0.firstName.text == "_" ? nil : $0.firstName.text },
-                internalNames: params.map { ($0.secondName ?? $0.firstName).text },
-                types: params.map { $0.type }
-            ))
+            var parameters: [Parameter] = []
+            for syntax in fn.signature.parameterClause.parameters {
+                // Unmarked types pass through as themselves. That is deliberate: a
+                // custom NSSecureCoding class is exactly what NSXPC exists to carry,
+                // and forcing it through Codable would be wrong. If a type is not
+                // representable in Objective-C the generated @objc protocol says so.
+                let declared = syntax.type
+                let boxed = markerPayload(declared)
+                parameters.append(Parameter(
+                    label: syntax.firstName.text == "_" ? nil : syntax.firstName.text,
+                    internalName: (syntax.secondName ?? syntax.firstName).text,
+                    declaredType: declared,
+                    boxedType: boxed))
+            }
+
+            methods.append(Method(decl: fn, shape: shape,
+                                  parameters: parameters, returnsMarker: returnsMarker))
         }
         return methods
     }
@@ -199,14 +258,15 @@ public struct XPCServiceMacro: PeerMacro {
 
     private static func shim(name: String, access: String, methods: [Method]) -> String {
         let requirements = methods.map { method -> String in
-            let boxed = method.boxedParameters
+            let parameters = method.shimParameters
             switch method.shape {
-            case .twoWayValue:
-                return "    func \(method.name)(\((boxed + ["reply: @escaping (CodableBox?, (any Error)?) -> Void"]).joined(separator: ", ")))"
+            case .twoWayValue(let returnType):
+                let replyType = method.returnsMarker ? "CodableBox?" : "\(returnType.trimmedDescription)?"
+                return "    func \(method.name)(\((parameters + ["reply: @escaping (\(replyType), (any Error)?) -> Void"]).joined(separator: ", ")))"
             case .twoWayVoid:
-                return "    func \(method.name)(\((boxed + ["reply: @escaping ((any Error)?) -> Void"]).joined(separator: ", ")))"
+                return "    func \(method.name)(\((parameters + ["reply: @escaping ((any Error)?) -> Void"]).joined(separator: ", ")))"
             case .oneWay:
-                return "    func \(method.name)(\(boxed.joined(separator: ", ")))"
+                return "    func \(method.name)(\(parameters.joined(separator: ", ")))"
             }
         }.joined(separator: "\n")
 
@@ -222,16 +282,20 @@ public struct XPCServiceMacro: PeerMacro {
     private static func client(name: String, access: String, methods: [Method]) -> String {
         let implementations = methods.map { method -> String in
             let signature = method.decl.signature.trimmedDescription
-            let boxed = method.boxedArguments
+            let arguments = method.clientArguments
 
             switch method.shape {
             case .twoWayValue(let returnType):
-                // `boxed` is empty for a no-argument method, so the reply closure has to
-                // be joined as a list element rather than appended after a comma.
-                let call = method.name + "(" + (boxed + ["reply: { box, error in"]).joined(separator: ", ")
+                // `arguments` is empty for a no-argument method, so the reply closure
+                // has to join as a list element rather than follow a comma.
+                let call = method.name + "(" + (arguments + ["reply: { box, error in"]).joined(separator: ", ")
+                let payload = returnType.trimmedDescription
+                let rewrapped = method.returnsMarker
+                    ? "XPCCodableMarker(wrappedValue: try box.decode(\(payload).self))"
+                    : "box"
                 return """
                     \(access)func \(method.name)\(signature) {
-                        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<\(returnType.trimmedDescription), any Error>) in
+                        try await withCheckedThrowingContinuation { continuation in
                             let once = XPCOneShot()
                             guard let proxy = proxy(resumingOnFailure: { error in
                                 if once.claim() { continuation.resume(throwing: error) }
@@ -247,7 +311,7 @@ public struct XPCServiceMacro: PeerMacro {
                                         continuation.resume(throwing: XPCServiceError.missingReply)
                                         return
                                     }
-                                    do { continuation.resume(returning: try box.decode(\(returnType.trimmedDescription).self)) }
+                                    do { continuation.resume(returning: \(rewrapped)) }
                                     catch { continuation.resume(throwing: error) }
                                 })
                             } catch {
@@ -257,7 +321,7 @@ public struct XPCServiceMacro: PeerMacro {
                     }
                 """
             case .twoWayVoid:
-                let call = method.name + "(" + (boxed + ["reply: { error in"]).joined(separator: ", ")
+                let call = method.name + "(" + (arguments + ["reply: { error in"]).joined(separator: ", ")
                 return """
                     \(access)func \(method.name)\(signature) {
                         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
@@ -286,7 +350,7 @@ public struct XPCServiceMacro: PeerMacro {
                 return """
                     \(access)func \(method.name)\(signature) {
                         guard let proxy = proxy(resumingOnFailure: { _ in }) else { return }
-                        try? proxy.\(method.name)(\(boxed.joined(separator: ", ")))
+                        try? proxy.\(method.name)(\(arguments.joined(separator: ", ")))
                     }
                 """
             }
@@ -314,36 +378,43 @@ public struct XPCServiceMacro: PeerMacro {
 
     private static func adapter(name: String, access: String, methods: [Method]) -> String {
         let implementations = methods.map { method -> String in
-            let boxed = method.boxedParameters
-            let decoded = method.decodedArguments.joined(separator: ", ")
+            let parameters = method.shimParameters
+            let arguments = method.adapterArguments.joined(separator: ", ")
+            let unwrapReturn = method.returnsMarker ? ".wrappedValue" : ""
 
             switch method.shape {
-            case .twoWayValue:
+            case .twoWayValue(let returnType):
+                let replyType = method.returnsMarker ? "CodableBox?" : "\(returnType.trimmedDescription)?"
+                let produced = method.returnsMarker
+                    ? "try CodableBox(result\(unwrapReturn))"
+                    : "result"
                 return """
-                    \(access)func \(method.name)(\((boxed + ["reply: @escaping (CodableBox?, (any Error)?) -> Void"]).joined(separator: ", "))) {
+                    \(access)func \(method.name)(\((parameters + ["reply: @escaping (\(replyType), (any Error)?) -> Void"]).joined(separator: ", "))) {
                         let implementation = self.implementation
                         Task {
-                            do { reply(try CodableBox(try await implementation.\(method.name)(\(decoded))), nil) }
-                            catch { reply(nil, error) }
+                            do {
+                                let result = try await implementation.\(method.name)(\(arguments))
+                                reply(\(produced), nil)
+                            } catch { reply(nil, error) }
                         }
                     }
                 """
             case .twoWayVoid:
                 return """
-                    \(access)func \(method.name)(\((boxed + ["reply: @escaping ((any Error)?) -> Void"]).joined(separator: ", "))) {
+                    \(access)func \(method.name)(\((parameters + ["reply: @escaping ((any Error)?) -> Void"]).joined(separator: ", "))) {
                         let implementation = self.implementation
                         Task {
-                            do { try await implementation.\(method.name)(\(decoded)); reply(nil) }
+                            do { try await implementation.\(method.name)(\(arguments)); reply(nil) }
                             catch { reply(error) }
                         }
                     }
                 """
             case .oneWay:
                 return """
-                    \(access)func \(method.name)(\(boxed.joined(separator: ", "))) {
+                    \(access)func \(method.name)(\(parameters.joined(separator: ", "))) {
                         // One-way: there is no reply block, so a decode failure has nowhere
                         // to go. Dropping it matches NSXPC's own behaviour for such calls.
-                        try? implementation.\(method.name)(\(decoded))
+                        try? implementation.\(method.name)(\(arguments))
                     }
                 """
             }
@@ -388,4 +459,93 @@ public struct XPCServiceMacro: PeerMacro {
         }
         """
     }
+}
+
+// MARK: - Convenience overloads
+
+extension XPCServiceMacro: ExtensionMacro {
+
+    /// Adds an overload of every marked method taking and returning bare values, so
+    /// a caller writes `greet(person)` rather than
+    /// `greet(XPCCodableMarker(wrappedValue: person))`.
+    ///
+    /// This has to be an extension role. A peer macro cannot emit one — the compiler
+    /// rejects that with "macro expansion cannot introduce extension" — and without
+    /// these overloads, marking a parameter would make every call site worse rather
+    /// than better.
+    public static func expansion(
+        of node: AttributeSyntax,
+        attachedTo declaration: some DeclGroupSyntax,
+        providingExtensionsOf type: some TypeSyntaxProtocol,
+        conformingTo protocols: [TypeSyntax],
+        in context: some MacroExpansionContext
+    ) throws -> [ExtensionDeclSyntax] {
+        // Both roles parse the same protocol. Diagnostics are suppressed here so a
+        // rejected requirement is reported once, by the peer role, rather than twice.
+        guard let proto = declaration.as(ProtocolDeclSyntax.self),
+              let methods = parse(proto, in: SilentContext(wrapping: context))
+        else { return [] }
+
+        let access = accessModifier(of: proto)
+
+        let overloads = methods.filter(\.hasBoxedParameter).map { method -> String in
+            let declared = method.parameters.map {
+                "\($0.label ?? "_") \($0.internalName): \($0.bareType)"
+            }.joined(separator: ", ")
+
+            let forwarded = method.parameters.map { parameter in
+                parameter.labelled(
+                    parameter.isBoxed
+                        ? "XPCCodableMarker(wrappedValue: \(parameter.internalName))"
+                        : parameter.internalName)
+            }.joined(separator: ", ")
+
+            switch method.shape {
+            case .twoWayValue(let returnType):
+                return """
+                    \(access)func \(method.name)(\(declared)) async throws -> \(returnType.trimmedDescription) {
+                        try await \(method.name)(\(forwarded))\(method.returnsMarker ? ".wrappedValue" : "")
+                    }
+                """
+            case .twoWayVoid:
+                return """
+                    \(access)func \(method.name)(\(declared)) async throws {
+                        try await \(method.name)(\(forwarded))
+                    }
+                """
+            case .oneWay:
+                return """
+                    \(access)func \(method.name)(\(declared)) {
+                        \(method.name)(\(forwarded))
+                    }
+                """
+            }
+        }
+        guard !overloads.isEmpty else { return [] }
+
+        let text: DeclSyntax = """
+            extension \(raw: type.trimmedDescription) {
+            \(raw: overloads.joined(separator: "\n\n"))
+            }
+            """
+        return text.as(ExtensionDeclSyntax.self).map { [$0] } ?? []
+    }
+}
+
+/// Discards diagnostics. Used so the extension role can re-parse without repeating
+/// what the peer role already reported.
+private final class SilentContext<Wrapped: MacroExpansionContext>: MacroExpansionContext {
+    let wrapped: Wrapped
+    init(wrapping wrapped: Wrapped) { self.wrapped = wrapped }
+
+    func makeUniqueName(_ name: String) -> TokenSyntax { wrapped.makeUniqueName(name) }
+    func diagnose(_ diagnostic: Diagnostic) {}
+    func location(
+        of node: some SyntaxProtocol,
+        at position: PositionInSyntaxNode,
+        filePathMode: SourceLocationFilePathMode
+    ) -> AbstractSourceLocation? {
+        wrapped.location(of: node, at: position, filePathMode: filePathMode)
+    }
+    var lexicalContext: [Syntax] { wrapped.lexicalContext }
 }

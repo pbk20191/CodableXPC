@@ -12,6 +12,6 @@ struct ReExportPayload: Codable {}
 
 @XPCService
 protocol ReExportService {
-    func work(_ value: ReExportPayload) async throws -> ReExportPayload
+    func work(_ value: XPCCodableMarker<ReExportPayload>) async throws -> XPCCodableMarker<ReExportPayload>
 }
 #endif
