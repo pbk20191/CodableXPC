@@ -212,7 +212,7 @@ private struct Method {
             // sees the Swift protocol it declared.
             if let service = parameter.proxyService {
                 return parameter.labelled(
-                    "XPCProxyMarker(wrappedValue: \(service)XPCClient(proxy: a\(index)))")
+                    "XPCProxyMarker(wrappedValue: \(service)XPCClient(proxy: a\(index), lifetime: lifetime))")
             }
             guard let boxed = parameter.boxedType else {
                 return parameter.labelled("a\(index)")
@@ -679,7 +679,7 @@ public struct XPCServiceMacro: PeerMacro {
             /// over as an argument be driven by exactly the same code as a connection.
             private enum Source {
                 case connection(NSXPCConnection)
-                case proxy(any \(name)XPCShim)
+                case proxy(any \(name)XPCShim, XPCProxyLifetime)
             }
             private let source: Source
 
@@ -688,8 +688,13 @@ public struct XPCServiceMacro: PeerMacro {
             }
 
             /// Wrap a peer's object that arrived as an `XPCProxyMarker` argument.
-            \(access)init(proxy: any \(name)XPCShim) {
-                self.source = .proxy(proxy)
+            ///
+            /// The lifetime is the object's only failure channel: a proxy is not a
+            /// connection and has no error handler, so without one a call made
+            /// after the far side went away never completes at all.
+            \(access)init(proxy: any \(name)XPCShim,
+                          lifetime: XPCProxyLifetime = .unbounded) {
+                self.source = .proxy(proxy, lifetime)
             }
 
             private func proxy(
@@ -698,9 +703,12 @@ public struct XPCServiceMacro: PeerMacro {
                 switch source {
                 case .connection(let connection):
                     return connection.remoteObjectProxyWithErrorHandler(onFailure) as? any \(name)XPCShim
-                case .proxy(let shim):
-                    // An error handler belongs to a connection. A proxy that has lost
-                    // its own connection reports through the call's reply block.
+                case .proxy(let shim, let lifetime):
+                    // A proxy has no error handler of its own, so the lifetime the
+                    // adapter recorded stands in for one. Registering here means an
+                    // in-flight call is resolved when the connection dies rather
+                    // than waiting for a reply that cannot arrive.
+                    lifetime.onFailure(onFailure)
                     return shim
                 }
             }
@@ -726,7 +734,8 @@ public struct XPCServiceMacro: PeerMacro {
                 switch source {
                 case .connection(let connection):
                     return connection.synchronousRemoteObjectProxyWithErrorHandler(onFailure) as? any \(name)XPCShim
-                case .proxy(let shim):
+                case .proxy(let shim, let lifetime):
+                    lifetime.onFailure(onFailure)
                     return shim
                 }
             }
@@ -741,6 +750,14 @@ public struct XPCServiceMacro: PeerMacro {
             let parameters = method.shimParameters
             let arguments = method.adapterArguments.joined(separator: ", ")
             let unwrapReturn = method.returnsMarker ? ".wrappedValue" : ""
+            // NSXPCConnection.current() is set only while the call is being
+            // handled: it is nil inside a Task, and reading it from an async
+            // context is an error under the Swift 6 language mode. Capture first.
+            // Folded into the first line of the body so the interpolation keeps the
+            // literal's indentation; an empty string leaves that line untouched.
+            let captureLifetime = method.hasProxyParameter
+                ? "let lifetime = XPCProxyLifetime(watching: NSXPCConnection.current())\n                        "
+                : ""
 
             switch method.shape {
             case .twoWayValue(let returnType):
@@ -754,7 +771,7 @@ public struct XPCServiceMacro: PeerMacro {
                             : "result"))
                 return """
                     \(access)func \(method.name)(\((parameters + ["reply: @escaping (\(replyType), (any Error)?) -> Void"]).joined(separator: ", "))) {
-                        let implementation = self.implementation
+                        \(captureLifetime)let implementation = self.implementation
                         Task {
                             do {
                                 let result = try await implementation.\(method.name)(\(arguments))
@@ -766,7 +783,7 @@ public struct XPCServiceMacro: PeerMacro {
             case .twoWayVoid:
                 return """
                     \(access)func \(method.name)(\((parameters + ["reply: @escaping ((any Error)?) -> Void"]).joined(separator: ", "))) {
-                        let implementation = self.implementation
+                        \(captureLifetime)let implementation = self.implementation
                         Task {
                             do { try await implementation.\(method.name)(\(arguments)); reply(nil) }
                             catch { reply(error) }
@@ -783,7 +800,7 @@ public struct XPCServiceMacro: PeerMacro {
                             : "result"))
                 return """
                     \(access)func \(method.name)(\((parameters + ["reply: @escaping (\(replyType), (any Error)?) -> Void"]).joined(separator: ", "))) {
-                        // No Task: the implementation is synchronous too, and the caller
+                        \(captureLifetime)// No Task: the implementation is synchronous too, and the caller
                         // is blocked on this reply running before the call returns.
                         do {
                             let result = try implementation.\(method.name)(\(arguments))
@@ -794,14 +811,14 @@ public struct XPCServiceMacro: PeerMacro {
             case .syncVoid:
                 return """
                     \(access)func \(method.name)(\((parameters + ["reply: @escaping ((any Error)?) -> Void"]).joined(separator: ", "))) {
-                        do { try implementation.\(method.name)(\(arguments)); reply(nil) }
+                        \(captureLifetime)do { try implementation.\(method.name)(\(arguments)); reply(nil) }
                         catch { reply(error) }
                     }
                 """
             case .oneWay:
                 return """
                     \(access)func \(method.name)(\(parameters.joined(separator: ", "))) {
-                        // One-way: there is no reply block, so a decode failure has nowhere
+                        \(captureLifetime)// One-way: there is no reply block, so a decode failure has nowhere
                         // to go. Dropping it matches NSXPC's own behaviour for such calls.
                         try? implementation.\(method.name)(\(arguments))
                     }

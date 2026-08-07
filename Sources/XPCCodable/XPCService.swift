@@ -90,6 +90,11 @@ public enum XPCServiceError: Error, Equatable, Sendable {
     /// Declare the method `async throws` instead. The same call then suspends, and
     /// the reply resumes it whenever it arrives.
     case synchronousCallOverProxy
+
+    /// The connection an `XPCProxyMarker` argument arrived over was invalidated,
+    /// so nothing further can be called on it. Without this a call on such a
+    /// proxy never completes at all -- see ``XPCProxyLifetime``.
+    case proxyConnectionInvalidated
 }
 
 /// Lets exactly one of several racing callbacks resume a continuation.
@@ -171,6 +176,73 @@ extension XPCServiceError {
     /// code. Exposed so a test can name the case instead of hardcoding an index
     /// that silently shifts when a case is inserted above it.
     public static var allCasesForTesting: [XPCServiceError] {
-        [.proxyUnavailable, .missingReply, .synchronousCallOverProxy]
+        [.proxyUnavailable, .missingReply, .synchronousCallOverProxy,
+         .proxyConnectionInvalidated]
+    }
+}
+
+/// The failure channel an `XPCProxyMarker` argument does not otherwise have.
+///
+/// A proxy delivered as an argument is not a connection: it has no error handler,
+/// and when the connection it arrived over dies, calls on it neither reply nor
+/// fail — they simply never complete. The adapter that received it *does* know
+/// the connection, though, because `NSXPCConnection.current()` is set while the
+/// call is being handled. Recording invalidation there gives every later call on
+/// that proxy something to fail with.
+///
+/// - Note: `current()` is only valid in the synchronous part of the method. It
+///   returns `nil` inside a `Task`, and reading it from an async context is an
+///   error under the Swift 6 language mode, so the adapter captures it first.
+public final class XPCProxyLifetime: @unchecked Sendable {
+
+    private let lock = NSLock()
+    private var failure: (any Error)?
+    private var waiting: [(any Error) -> Void] = []
+
+    /// A lifetime for a proxy whose connection is unknown. It never fails, which
+    /// is the old behaviour, and is what a locally constructed client gets.
+    public static let unbounded = XPCProxyLifetime()
+
+    public init() {}
+
+    /// Chains onto whatever the connection already had rather than replacing it:
+    /// the handler is a single slot, and it belongs to whoever made the
+    /// connection, not to us.
+    public convenience init(watching connection: NSXPCConnection?) {
+        self.init()
+        guard let connection else { return }
+        let existing = connection.invalidationHandler
+        connection.invalidationHandler = { [weak self] in
+            self?.fail(XPCServiceError.proxyConnectionInvalidated)
+            existing?()
+        }
+    }
+
+    public func fail(_ error: any Error) {
+        lock.lock()
+        let callbacks: [(any Error) -> Void]
+        if failure == nil {
+            failure = error
+            callbacks = waiting
+            waiting = []
+        } else {
+            callbacks = []
+        }
+        lock.unlock()
+        for callback in callbacks { callback(error) }
+    }
+
+    /// Registers `onFailure`, calling it immediately if the connection is already
+    /// gone. Every call over the proxy registers, so an in-flight one is resolved
+    /// rather than left waiting forever.
+    public func onFailure(_ onFailure: @escaping (any Error) -> Void) {
+        lock.lock()
+        if let failure {
+            lock.unlock()
+            onFailure(failure)
+            return
+        }
+        waiting.append(onFailure)
+        lock.unlock()
     }
 }

@@ -13,6 +13,8 @@ protocol Meter {
 
 @XPCService
 protocol Gauge {
+    func hold(_ meter: XPCProxyMarker<Meter>)
+    func callHeld() async throws -> Int
     func inspect(_ meter: XPCProxyMarker<Meter>) async throws -> Int
     func inspectSynchronously(_ meter: XPCProxyMarker<Meter>) async throws -> Int
 }
@@ -22,7 +24,13 @@ private final class MeterImpl: Meter, @unchecked Sendable {
     func reading() throws -> Int { 7 }
 }
 
+/// Survives the connection, so a held proxy can be called after it dies.
+private final class Held: @unchecked Sendable { var meter: (any Meter)? }
+private let held = Held()
+
 private final class GaugeImpl: Gauge, @unchecked Sendable {
+    func hold(_ meter: XPCProxyMarker<Meter>) { held.meter = meter.wrappedValue }
+    func callHeld() async throws -> Int { try await held.meter!.peek() }
     func inspect(_ meter: XPCProxyMarker<Meter>) async throws -> Int {
         try await meter.wrappedValue.peek()
     }
@@ -96,17 +104,35 @@ final class ProxyOverTheWireTests: XCTestCase {
         }
     }
 
-    /// Not a test, because it cannot be written as one: it hangs.
+    /// The case that used to hang forever.
     ///
-    /// Hold a proxy, invalidate the connection it arrived on, then call it. The
-    /// call never completes — the continuation is never resumed, no reply arrives,
-    /// and there is no error handler to fire, because an error handler belongs to
-    /// a connection and this object is not one. Measured: a run blocked past two
-    /// minutes with no output.
+    /// Hold a proxy, invalidate the connection it arrived over, then call it. A
+    /// proxy is not a connection and has no error handler, so nothing replied and
+    /// nothing failed -- the continuation was simply never resumed. A run blocked
+    /// past two minutes with no output.
     ///
-    /// So a proxy has no failure channel of its own. Anything awaiting one should
-    /// be bounded by the caller, or torn down from the connection's own
-    /// invalidation handler, which does still fire.
-    func testAProxyHasNoFailureChannel() {}
+    /// The adapter that received the proxy knows the connection, because
+    /// `NSXPCConnection.current()` is set while the call is being handled. It
+    /// records invalidation there, and that recording is what this call now fails
+    /// with instead of waiting.
+    func testAProxyFailsOnceItsConnectionIsGone() async throws {
+        held.meter = nil
+        GaugeXPC.remote(connection).hold(MeterImpl())
+        // hold() is one-way, so wait for it to have landed before tearing down.
+        for _ in 0..<50 where held.meter == nil {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        let meter = try XCTUnwrap(held.meter, "the proxy never arrived")
+
+        connection.invalidate()
+        try await Task.sleep(nanoseconds: 200_000_000)
+
+        do {
+            let value = try await meter.peek()
+            XCTFail("expected a failure once the connection was gone, got \(value)")
+        } catch {
+            XCTAssertEqual(error as? XPCServiceError, .proxyConnectionInvalidated)
+        }
+    }
 }
 #endif
