@@ -44,6 +44,9 @@ let package = Package(
         .library(
             name: "XPCCodable",
             targets: ["XPCCodable"]),
+        .library(
+            name: "XPCOverlayCoder",
+            targets: ["XPCOverlayCoder"]),
     ],
     dependencies: [
         // Only the macro plugin needs this. SwiftPM resolves it for anyone who
@@ -80,6 +83,12 @@ let package = Package(
         .target(
             name: "XPCCodable",
             dependencies: ["XPCCodableMacros", "CodableXPC"]),
+        // Reproduces the wire format Apple's XPC Swift overlay uses for Codable.
+        // Separate from CodableXPC on purpose: that one builds a native xpc tree,
+        // this one builds Apple's flat byte stream. Foundation only.
+        .target(
+            name: "XPCOverlayCoder",
+            dependencies: []),
         // The macro plugin. Runs in the compiler, never in a consumer binary, so it
         // carries no deployment floor of its own.
         .macro(
@@ -112,6 +121,9 @@ let package = Package(
         .testTarget(
             name: "XPCActorsTests",
             dependencies: ["XPCActors"]),
+        .testTarget(
+            name: "XPCOverlayCoderTests",
+            dependencies: ["XPCOverlayCoder"]),
         .testTarget(
             name: "XPCCodableTests",
             dependencies: ["XPCCodable"]),
