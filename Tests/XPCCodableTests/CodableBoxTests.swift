@@ -38,7 +38,7 @@ final class CodableBoxTests: XCTestCase {
 
         struct Wrapper: Codable, Equatable { let userName: String }
         let box = try CodableBox(Wrapper(userName: "ada"), encoder: encoder)
-        XCTAssertTrue(String(decoding: box.payload, as: UTF8.self).contains("user_name"))
+        XCTAssertTrue(String(decoding: try XCTUnwrap(box.payload), as: UTF8.self).contains("user_name"))
         XCTAssertEqual(try box.decode(Wrapper.self, decoder: decoder), Wrapper(userName: "ada"))
     }
 
@@ -60,7 +60,8 @@ final class CodableBoxTests: XCTestCase {
         let a = try CodableBox(Person(name: "Ada", age: 36))
         let b = try CodableBox(Person(name: "Ada", age: 36))
         XCTAssertEqual(a.payload, b.payload)
-        XCTAssertEqual(String(decoding: a.payload, as: UTF8.self), #"{"age":36,"name":"Ada"}"#)
+        XCTAssertEqual(String(decoding: try XCTUnwrap(a.payload), as: UTF8.self),
+                       #"{"age":36,"name":"Ada"}"#)
     }
 
     func testEqualityIsIdentityNotPayload() throws {

@@ -1,4 +1,6 @@
 import Foundation
+import XPC
+import CodableXPC
 
 /// Carries a `Codable` value across an `NSXPCConnection` or an `NSKeyedArchiver`.
 ///
@@ -44,16 +46,34 @@ import Foundation
 @objc(CodableBox)
 public final class CodableBox: NSObject, NSSecureCoding {
 
-    /// The encoded payload. JSON, per the note above.
-    public let payload: Data
+    /// What the box is holding, which depends on where it came from and where it
+    /// is going.
+    ///
+    /// Encoding is deferred rather than done at construction because the right
+    /// representation depends on the coder, and the coder is not known until
+    /// `encode(with:)` runs. An `NSXPCCoder` takes an `xpc_object_t` directly, so
+    /// there is no reason to serialise; an `NSKeyedArchiver` needs bytes, and an
+    /// `xpc_object_t` cannot be turned into bytes by any public API.
+    private enum Storage {
+        /// Outgoing, not yet encoded. Holds the value and a closure that can encode
+        /// it either way once the coder reveals itself.
+        case pending(encodeToXPC: () throws -> xpc_object_t, encodeToData: () throws -> Data)
+        /// Arrived over NSXPC.
+        case xpc(xpc_object_t)
+        /// Arrived from an archive, or was built from bytes directly.
+        case data(Data)
+    }
+
+    private let storage: Storage
 
     public class var supportsSecureCoding: Bool { true }
 
+    /// Wrap bytes that are already an encoded payload.
     public init(payload: Data) {
-        self.payload = payload
+        storage = .data(payload)
     }
 
-    /// The encoder used when the caller does not supply one.
+    /// The JSON encoder used when the caller does not supply one.
     ///
     /// `.sortedKeys` is not cosmetic. Without it, `JSONEncoder` emits object keys in
     /// Swift `Dictionary` iteration order, which is seeded per process — the same
@@ -66,45 +86,116 @@ public final class CodableBox: NSObject, NSSecureCoding {
         return encoder
     }
 
-    /// Encode `value` into a new box.
-    public convenience init<Value: Encodable>(_ value: Value) throws {
-        self.init(payload: try CodableBox.defaultEncoder().encode(value))
+    /// Encode `value` into a new box, choosing the representation later.
+    public init<Value: Encodable>(_ value: Value) throws {
+        storage = .pending(
+            encodeToXPC: { try XPCEncoder().encode(value) },
+            encodeToData: { try CodableBox.defaultEncoder().encode(value) })
     }
 
-    /// Encode `value` with a caller-supplied encoder, for date and key strategies.
+    /// Encode `value` with a caller-supplied JSON encoder, for date and key
+    /// strategies. Forces the bytes path: a custom `JSONEncoder` has no meaning for
+    /// the native representation.
     public convenience init<Value: Encodable>(_ value: Value, encoder: JSONEncoder) throws {
         self.init(payload: try encoder.encode(value))
     }
 
-    /// Decode the payload back into `Value`.
-    public func decode<Value: Decodable>(_ type: Value.Type = Value.self) throws -> Value {
-        try JSONDecoder().decode(type, from: payload)
+    /// The encoded bytes, for a box that has them or can produce them.
+    ///
+    /// A box that arrived over NSXPC holds an `xpc_object_t`, which no public API
+    /// can serialise, so this is `nil` for that case. Use ``decode(_:)`` instead —
+    /// it works whatever the box is holding.
+    public var payload: Data? {
+        switch storage {
+        case .data(let data): return data
+        case .pending(_, let encodeToData): return try? encodeToData()
+        case .xpc: return nil
+        }
     }
 
-    /// Decode with a caller-supplied decoder, matching whatever encoded it.
+    /// Decode the payload back into `Value`.
+    public func decode<Value: Decodable>(_ type: Value.Type = Value.self) throws -> Value {
+        switch storage {
+        case .xpc(let object):
+            return try XPCDecoder().decode(type, from: object)
+        case .data(let data):
+            return try JSONDecoder().decode(type, from: data)
+        case .pending(_, let encodeToData):
+            // Round-tripping a box that never left the process. Rare, but it should
+            // not be an error.
+            return try JSONDecoder().decode(type, from: try encodeToData())
+        }
+    }
+
+    /// Decode with a caller-supplied JSON decoder, matching whatever encoded it.
     public func decode<Value: Decodable>(_ type: Value.Type = Value.self, decoder: JSONDecoder) throws -> Value {
-        try decoder.decode(type, from: payload)
+        guard let payload else {
+            throw CodableBoxError.nativePayloadNeedsNoJSONDecoder
+        }
+        return try decoder.decode(type, from: payload)
     }
 
     // MARK: NSSecureCoding
 
-    // Keyed, not `encode(_:)` / `decodeData()`. The unkeyed pair does work — an
-    // NSKeyedArchiver generates positional keys for it — but it gives the payload
-    // no name in the archive, which makes the format impossible to evolve and
-    // unreadable in a plist dump.
     private enum Key {
         static let payload = "payload"
     }
 
+    /// Selectors on `NSXPCCoder`, which is not public API. Guarded by
+    /// `responds(to:)` at every use, so a future OS that removes them falls back to
+    /// the bytes path rather than crashing.
+    private enum SPI {
+        static let encode = NSSelectorFromString("encodeXPCObject:forKey:")
+        static let decode = NSSelectorFromString("decodeXPCObjectForKey:")
+    }
+
+    @objc private protocol XPCCoderSPI {
+        @objc(encodeXPCObject:forKey:) func encodeXPCObject(_ object: xpc_object_t, forKey key: String)
+        @objc(decodeXPCObjectForKey:) func decodeXPCObject(forKey key: String) -> xpc_object_t?
+    }
+
+    // Bitcast rather than cast: NSXPCCoder does not advertise conformance to
+    // anything, so `as?` fails. The bitcast only ever forms an objc_msgSend, and it
+    // is reached only after `responds(to:)` has confirmed the selector exists.
+    private static func spi(_ coder: NSCoder) -> XPCCoderSPI {
+        unsafeBitCast(coder, to: XPCCoderSPI.self)
+    }
+
     public func encode(with coder: NSCoder) {
+        // The native path skips JSON entirely: an NSXPC message is an xpc dictionary
+        // already, so handing it one costs no serialisation.
+        if coder.responds(to: SPI.encode), let object = try? nativeObject() {
+            CodableBox.spi(coder).encodeXPCObject(object, forKey: Key.payload)
+            return
+        }
+        // Keyed, not `encode(_:)`. The unkeyed pair works — an NSKeyedArchiver
+        // generates positional keys — but it leaves the payload unnamed in the
+        // archive, which makes the format impossible to evolve.
+        guard let payload else {
+            coder.failWithError(CodableBoxError.nativePayloadCannotBeArchived)
+            return
+        }
         coder.encode(payload, forKey: Key.payload)
     }
 
     public required init?(coder: NSCoder) {
+        if coder.responds(to: SPI.decode),
+           let object = CodableBox.spi(coder).decodeXPCObject(forKey: Key.payload) {
+            storage = .xpc(object)
+            return
+        }
         guard let data = coder.decodeObject(of: NSData.self, forKey: Key.payload) as Data? else {
             return nil
         }
-        self.payload = data
+        storage = .data(data)
+    }
+
+    private func nativeObject() throws -> xpc_object_t {
+        switch storage {
+        case .xpc(let object): return object
+        case .pending(let encodeToXPC, _): return try encodeToXPC()
+        case .data(let data): return try XPCEncoder().encode(data)
+        }
     }
 
     // MARK: Equality — deliberately inherited
@@ -117,8 +208,21 @@ public final class CodableBox: NSObject, NSSecureCoding {
     // least predictable. Compare the decoded values instead.
 
     public override var description: String {
-        "CodableBox(\(payload.count) bytes)"
+        switch storage {
+        case .data(let data): return "CodableBox(\(data.count) bytes)"
+        case .xpc: return "CodableBox(native xpc)"
+        case .pending: return "CodableBox(pending)"
+        }
     }
+}
+
+/// Failures specific to how a box is carrying its payload.
+public enum CodableBoxError: Error, Equatable {
+    /// The box arrived over NSXPC and holds an `xpc_object_t`. No public API turns
+    /// one into bytes, so it cannot be written to an archive or read with a
+    /// `JSONDecoder`. Use ``CodableBox/decode(_:)``.
+    case nativePayloadCannotBeArchived
+    case nativePayloadNeedsNoJSONDecoder
 }
 
 @propertyWrapper
