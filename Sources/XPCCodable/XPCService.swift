@@ -74,23 +74,6 @@ public enum XPCServiceError: Error, Equatable, Sendable {
     /// this; a crashed or mismatched one can.
     case missingReply
 
-    /// A synchronous method was called on a service that arrived as an
-    /// `XPCProxyMarker` argument rather than over a connection of its own.
-    ///
-    /// A blocking call reads its result immediately after the call returns, which
-    /// works because `synchronousRemoteObjectProxyWithErrorHandler` runs the reply
-    /// first. An object delivered as an argument has no such proxy: its reply
-    /// arrives later, so there is nothing to read yet.
-    ///
-    /// Waiting for it is not the fix. A proxy received as an argument has no
-    /// failure channel of its own -- when the connection it came over dies, calls
-    /// on it simply never complete, with no error handler and no reply. Blocking
-    /// would turn a reported failure into a hung thread.
-    ///
-    /// Declare the method `async throws` instead. The same call then suspends, and
-    /// the reply resumes it whenever it arrives.
-    case synchronousCallOverProxy
-
     /// The connection an `XPCProxyMarker` argument arrived over was invalidated,
     /// so nothing further can be called on it. Without this a call on such a
     /// proxy never completes at all -- see ``XPCProxyLifetime``.
@@ -151,13 +134,32 @@ protocol NSXPCConnectionDelegate {
 public final class XPCSyncOutcome<Value>: @unchecked Sendable {
     private let lock = NSLock()
     private var stored: Result<Value, any Error>?
+    private let arrived = DispatchSemaphore(value: 0)
 
     public init() {}
 
     public func set(_ result: Result<Value, any Error>) {
         lock.lock()
-        defer { lock.unlock() }
-        if stored == nil { stored = result }
+        let first = stored == nil
+        if first { stored = result }
+        lock.unlock()
+        if first { arrived.signal() }
+    }
+
+    /// Blocks until something is written.
+    ///
+    /// Over a connection this returns at once: the synchronous proxy has already
+    /// run the reply block or the error handler by the time the call returns. It
+    /// only waits for a service reached as an `XPCProxyMarker` argument, whose
+    /// reply arrives afterwards and whose failures come from its
+    /// ``XPCProxyLifetime``.
+    ///
+    /// - Warning: unbounded, like every other wait here. It ends when the peer
+    ///   replies or the proxy's connection is invalidated. Two peers that each
+    ///   make a synchronous call to the other satisfy neither.
+    public func wait() {
+        arrived.wait()
+        arrived.signal()
     }
 
     /// - Throws: ``XPCServiceError/missingReply`` when neither path ran, which
@@ -176,8 +178,7 @@ extension XPCServiceError {
     /// code. Exposed so a test can name the case instead of hardcoding an index
     /// that silently shifts when a case is inserted above it.
     public static var allCasesForTesting: [XPCServiceError] {
-        [.proxyUnavailable, .missingReply, .synchronousCallOverProxy,
-         .proxyConnectionInvalidated]
+        [.proxyUnavailable, .missingReply, .proxyConnectionInvalidated]
     }
 }
 

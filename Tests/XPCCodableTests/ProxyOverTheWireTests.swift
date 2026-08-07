@@ -15,6 +15,7 @@ protocol Meter {
 protocol Gauge {
     func hold(_ meter: XPCProxyMarker<Meter>)
     func callHeld() async throws -> Int
+    func callHeldSynchronously() async throws -> Int
     func inspect(_ meter: XPCProxyMarker<Meter>) async throws -> Int
     func inspectSynchronously(_ meter: XPCProxyMarker<Meter>) async throws -> Int
 }
@@ -31,6 +32,7 @@ private let held = Held()
 private final class GaugeImpl: Gauge, @unchecked Sendable {
     func hold(_ meter: XPCProxyMarker<Meter>) { held.meter = meter.wrappedValue }
     func callHeld() async throws -> Int { try await held.meter!.peek() }
+    func callHeldSynchronously() async throws -> Int { try held.meter!.reading() }
     func inspect(_ meter: XPCProxyMarker<Meter>) async throws -> Int {
         try await meter.wrappedValue.peek()
     }
@@ -83,25 +85,15 @@ final class ProxyOverTheWireTests: XCTestCase {
         XCTAssertEqual(got, 7, "the service should have called back into our object")
     }
 
-    /// A synchronous method does not, and says so.
+    /// A synchronous method works too, by waiting.
     ///
-    /// A blocking client reads its result on the line after the call, which holds
-    /// for `synchronousRemoteObjectProxyWithErrorHandler` because that runs the
-    /// reply first. An object delivered as an argument has no such proxy: the
-    /// reply arrives later and there is nothing to read yet.
-    func testASynchronousMethodThroughAProxyIsReportedNotGuessed() async throws {
-        do {
-            _ = try await GaugeXPC.remote(connection).inspectSynchronously(MeterImpl())
-            XCTFail("expected the synchronous call over a proxy to be reported")
-        } catch {
-            // It crossed a connection on the way back, so it arrives bridged: the
-            // service threw XPCServiceError and NSXPC delivered an NSError carrying
-            // the domain and the case's index.
-            let ns = error as NSError
-            XCTAssertEqual(ns.domain, "XPCCodable.XPCServiceError")
-            XCTAssertEqual(ns.code, XPCServiceError.allCasesForTesting
-                .firstIndex(of: .synchronousCallOverProxy))
-        }
+    /// Over a connection the blocking client reads its result on the line after
+    /// the call, because the synchronous proxy has already run the reply. A proxy
+    /// argument has no such proxy, so the client waits — which is only safe
+    /// because the lifetime unblocks it if the connection dies first.
+    func testASynchronousMethodWorksThroughAProxy() async throws {
+        let got = try await GaugeXPC.remote(connection).inspectSynchronously(MeterImpl())
+        XCTAssertEqual(got, 7)
     }
 
     /// The case that used to hang forever.
@@ -130,6 +122,28 @@ final class ProxyOverTheWireTests: XCTestCase {
         do {
             let value = try await meter.peek()
             XCTFail("expected a failure once the connection was gone, got \(value)")
+        } catch {
+            XCTAssertEqual(error as? XPCServiceError, .proxyConnectionInvalidated)
+        }
+    }
+
+    /// The load-bearing half of letting a blocking call wait at all: the wait has
+    /// to end when the connection dies, or a reported failure becomes a hung
+    /// thread. Same setup as above, through the synchronous path.
+    func testABlockingCallOnADeadProxyUnblocksRatherThanHanging() async throws {
+        held.meter = nil
+        GaugeXPC.remote(connection).hold(MeterImpl())
+        for _ in 0..<50 where held.meter == nil {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        let meter = try XCTUnwrap(held.meter, "the proxy never arrived")
+
+        connection.invalidate()
+        try await Task.sleep(nanoseconds: 200_000_000)
+
+        do {
+            let value = try meter.reading()
+            XCTFail("expected the blocking call to be unblocked by failure, got \(value)")
         } catch {
             XCTAssertEqual(error as? XPCServiceError, .proxyConnectionInvalidated)
         }
