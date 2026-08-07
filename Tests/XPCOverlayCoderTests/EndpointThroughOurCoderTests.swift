@@ -77,22 +77,8 @@ final class EndpointThroughOurCoderTests: XCTestCase {
         try session.activate()
         defer { session.cancel(reason: "done") }
 
-        let encoded = try XPCOverlayEncoder().encode(
+        let envelope = try XPCOverlayEncoder().message(
             Referral(label: "forwarding", endpoint: target.endpoint))
-
-        let envelope = xpc_dictionary_create(nil, nil, 0)
-        encoded.body.withUnsafeBytes {
-            xpc_dictionary_set_data(envelope, OverlayEnvelope.body, $0.baseAddress, $0.count)
-        }
-        xpc_dictionary_set_int64(envelope, OverlayEnvelope.coderVersion,
-                                 OverlayWireFormat.coderVersion)
-        xpc_dictionary_set_bool(envelope, OverlayEnvelope.isSync, false)
-        xpc_dictionary_set_value(envelope, OverlayEnvelope.outOfLine, xpc_array_create(nil, 0))
-
-        let objects = xpc_array_create(nil, 0)
-        for object in encoded.outOfLineObjects { xpc_array_append_value(objects, object) }
-        xpc_dictionary_set_value(envelope, OverlayEnvelope.outOfLineObjects, objects)
-
         try session.send(message: XPCDictionary(envelope))
         wait(for: [arrived], timeout: 10)
 
