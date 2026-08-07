@@ -12,13 +12,21 @@ private final class LedgerImpl: AuditLedger, @unchecked Sendable {
 
 private final class AuditorImpl: Auditor, @unchecked Sendable {
     var attached: (any AuditLedger)?
-    func attach(_ ledger: XPCProxyMarker<AuditLedger>) { attached = ledger.wrappedValue }
-    func reconcile(_ ledger: XPCProxyMarker<AuditLedger>, label: String) async throws -> Int {
-        ledger.wrappedValue.note(label)
-        return try await ledger.wrappedValue.total()
+
+    /// One line turns the shim back into the Swift protocol, carrying the failure
+    /// channel the adapter recorded.
+    private func rebuild(_ marker: XPCProxyMarker<AuditLedgerXPCShim>) -> any AuditLedger {
+        AuditLedgerXPCClient(proxy: marker.wrappedValue, lifetime: marker.lifetime)
     }
-    func current() async throws -> XPCProxyMarker<AuditLedger> {
-        XPCProxyMarker(wrappedValue: attached ?? LedgerImpl())
+
+    func attach(_ ledger: XPCProxyMarker<AuditLedgerXPCShim>) { attached = rebuild(ledger) }
+    func reconcile(_ ledger: XPCProxyMarker<AuditLedgerXPCShim>, label: String) async throws -> Int {
+        let peer = rebuild(ledger)
+        peer.note(label)
+        return try await peer.total()
+    }
+    func current() async throws -> XPCProxyMarker<AuditLedgerXPCShim> {
+        XPCProxyMarker(wrappedValue: AuditLedgerXPCAdapter(attached ?? LedgerImpl()))
     }
 }
 
@@ -80,11 +88,11 @@ final class ProxyMarkerTests: XCTestCase {
         let rebuilt = AuditLedgerXPCClient(proxy: asShim)
 
         rebuilt.note("opening")
-        auditor.attach(XPCProxyMarker(wrappedValue: rebuilt))
+        auditor.attach(XPCProxyMarker(wrappedValue: asShim))
         XCTAssertNotNil(auditor.attached)
 
         let total = try await auditor.reconcile(
-            XPCProxyMarker(wrappedValue: rebuilt), label: "audited")
+            XPCProxyMarker(wrappedValue: asShim), label: "audited")
         XCTAssertEqual(total, 2)
         XCTAssertEqual(ledger.notes, ["opening", "audited"])
     }
@@ -94,8 +102,9 @@ final class ProxyMarkerTests: XCTestCase {
     func testTheBareOverloadTakesTheProtocolItself() async throws {
         let auditor = AuditorImpl()
         let ledger = LedgerImpl()
-        auditor.attach(ledger)                       // no XPCProxyMarker at the call site
-        let total = try await auditor.reconcile(ledger, label: "bare")
+        let shim = AuditLedgerXPCAdapter(ledger)
+        auditor.attach(shim)                         // no XPCProxyMarker at the call site
+        let total = try await auditor.reconcile(shim, label: "bare")
         XCTAssertEqual(total, 1)
     }
 }

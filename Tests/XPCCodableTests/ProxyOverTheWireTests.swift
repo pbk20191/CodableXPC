@@ -13,11 +13,11 @@ protocol Meter {
 
 @XPCService
 protocol Gauge {
-    func hold(_ meter: XPCProxyMarker<Meter>)
+    func hold(_ meter: XPCProxyMarker<MeterXPCShim>)
     func callHeld() async throws -> Int
     func callHeldSynchronously() async throws -> Int
-    func inspect(_ meter: XPCProxyMarker<Meter>) async throws -> Int
-    func inspectSynchronously(_ meter: XPCProxyMarker<Meter>) async throws -> Int
+    func inspect(_ meter: XPCProxyMarker<MeterXPCShim>) async throws -> Int
+    func inspectSynchronously(_ meter: XPCProxyMarker<MeterXPCShim>) async throws -> Int
 }
 
 private final class MeterImpl: Meter, @unchecked Sendable {
@@ -29,15 +29,19 @@ private final class MeterImpl: Meter, @unchecked Sendable {
 private final class Held: @unchecked Sendable { var meter: (any Meter)? }
 private let held = Held()
 
+private func rebuild(_ marker: XPCProxyMarker<MeterXPCShim>) -> any Meter {
+    MeterXPCClient(proxy: marker.wrappedValue, lifetime: marker.lifetime)
+}
+
 private final class GaugeImpl: Gauge, @unchecked Sendable {
-    func hold(_ meter: XPCProxyMarker<Meter>) { held.meter = meter.wrappedValue }
+    func hold(_ meter: XPCProxyMarker<MeterXPCShim>) { held.meter = rebuild(meter) }
     func callHeld() async throws -> Int { try await held.meter!.peek() }
     func callHeldSynchronously() async throws -> Int { try held.meter!.reading() }
-    func inspect(_ meter: XPCProxyMarker<Meter>) async throws -> Int {
-        try await meter.wrappedValue.peek()
+    func inspect(_ meter: XPCProxyMarker<MeterXPCShim>) async throws -> Int {
+        try await rebuild(meter).peek()
     }
-    func inspectSynchronously(_ meter: XPCProxyMarker<Meter>) async throws -> Int {
-        try meter.wrappedValue.reading()
+    func inspectSynchronously(_ meter: XPCProxyMarker<MeterXPCShim>) async throws -> Int {
+        try rebuild(meter).reading()
     }
 }
 
@@ -81,7 +85,7 @@ final class ProxyOverTheWireTests: XCTestCase {
     }
 
     func testAnAsyncMethodWorksThroughAProxy() async throws {
-        let got = try await GaugeXPC.remote(connection).inspect(MeterImpl())
+        let got = try await GaugeXPC.remote(connection).inspect(MeterXPCAdapter(MeterImpl()))
         XCTAssertEqual(got, 7, "the service should have called back into our object")
     }
 
@@ -92,7 +96,7 @@ final class ProxyOverTheWireTests: XCTestCase {
     /// argument has no such proxy, so the client waits — which is only safe
     /// because the lifetime unblocks it if the connection dies first.
     func testASynchronousMethodWorksThroughAProxy() async throws {
-        let got = try await GaugeXPC.remote(connection).inspectSynchronously(MeterImpl())
+        let got = try await GaugeXPC.remote(connection).inspectSynchronously(MeterXPCAdapter(MeterImpl()))
         XCTAssertEqual(got, 7)
     }
 
@@ -109,7 +113,7 @@ final class ProxyOverTheWireTests: XCTestCase {
     /// with instead of waiting.
     func testAProxyFailsOnceItsConnectionIsGone() async throws {
         held.meter = nil
-        GaugeXPC.remote(connection).hold(MeterImpl())
+        GaugeXPC.remote(connection).hold(MeterXPCAdapter(MeterImpl()))
         // hold() is one-way, so wait for it to have landed before tearing down.
         for _ in 0..<50 where held.meter == nil {
             try await Task.sleep(nanoseconds: 20_000_000)
@@ -132,7 +136,7 @@ final class ProxyOverTheWireTests: XCTestCase {
     /// thread. Same setup as above, through the synchronous path.
     func testABlockingCallOnADeadProxyUnblocksRatherThanHanging() async throws {
         held.meter = nil
-        GaugeXPC.remote(connection).hold(MeterImpl())
+        GaugeXPC.remote(connection).hold(MeterXPCAdapter(MeterImpl()))
         for _ in 0..<50 where held.meter == nil {
             try await Task.sleep(nanoseconds: 20_000_000)
         }

@@ -270,34 +270,50 @@ extension XPCCodableMarker: BitwiseCopyable where T: BitwiseCopyable {}
 /// Marks a parameter or return value that should cross as an NSXPC **proxy**
 /// rather than as data.
 ///
-/// The service it names must itself be `@XPCService`. `@XPCService` then wires
-/// `NSXPCInterface.setInterface(_:for:argumentIndex:ofReply:)` for that position,
-/// which is what tells NSXPC to vend the object instead of trying to encode it.
+/// `@XPCService` turns the position into
+/// `NSXPCInterface.setInterface(_:for:argumentIndex:ofReply:)`, which is what
+/// tells NSXPC to vend the object instead of trying to encode it.
 ///
 ///     @XPCService
 ///     public protocol Auditor {
-///         func attach(_ ledger: XPCProxyMarker<Ledger>)
+///         func attach(_ ledger: XPCProxyMarker<AuditLedgerXPCShim>)
 ///     }
 ///
-/// ## Why there is no constraint on `Service`
+/// ## What `Service` may be
 ///
-/// There is no way to write one. `Service: AnyObject` rejects every protocol
-/// existential, including class-bound ones. A marker-protocol bound
-/// (`Service: SomeMarker`) only admits `@objc` protocols, because those are the
-/// only existentials that self-conform — and an `@XPCService` protocol is
-/// deliberately *not* `@objc`; generating the `@objc` face from a Swift-native
-/// one is the entire point of the macro. So the checking lives in the macro,
-/// which reads this annotation syntactically and reports what it cannot use.
+/// `AnyObject` is the constraint, and it admits exactly what NSXPC can vend: an
+/// `@objc` protocol, or a class. Measured — an `@objc` protocol's existential
+/// passes because those self-conform and are class-bound, while a plain Swift
+/// protocol does not, `AnyObject`-refined or otherwise.
 ///
-/// ## Lifetime
+/// So a Swift-native `@XPCService` protocol cannot be named here. Name its
+/// generated shim instead, which is `@objc` and does qualify. The object arrives
+/// as that shim, and one line turns it back into the Swift protocol, with the
+/// ``lifetime`` supplying the failure channel:
 ///
-/// A proxy is live only while the sender keeps the object alive and the
-/// connection stands. Neither is visible in the type, so a value that outlives
-/// its connection becomes a proxy whose calls fail rather than a dangling
-/// reference — an error at the call site, not a crash.
-public struct XPCProxyMarker<Service> {
+///     func attach(_ ledger: XPCProxyMarker<AuditLedgerXPCShim>) {
+///         let peer = AuditLedgerXPCClient(proxy: ledger.wrappedValue,
+///                                         lifetime: ledger.lifetime)
+///     }
+///
+/// That line is the price of a constraint that actually holds. The alternative
+/// was for the macro to assume every named protocol was `@XPCService` and emit
+/// `<Name>XPCShim` on faith, which no type could check and which shut out every
+/// `@objc` protocol anyone already had.
+public struct XPCProxyMarker<Service: AnyObject> {
     public var wrappedValue: Service
-    public init(wrappedValue: Service) {
+
+    /// The failure channel the proxy itself does not have.
+    ///
+    /// A proxy is not a connection: no error handler, and when the connection it
+    /// arrived over dies, calls on it neither reply nor fail. The adapter that
+    /// received it knows that connection and records invalidation here. On a
+    /// marker you construct yourself — sending, rather than receiving — it is
+    /// ``XPCProxyLifetime/unbounded``, which never fails.
+    public var lifetime: XPCProxyLifetime
+
+    public init(wrappedValue: Service, lifetime: XPCProxyLifetime = .unbounded) {
         self.wrappedValue = wrappedValue
+        self.lifetime = lifetime
     }
 }

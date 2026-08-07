@@ -110,7 +110,16 @@ extension NSXPCConnection {
     @objc(remoteObjectProxyWithUserInfo:errorHandler:)
     @NSManaged func remoteObjectProxy(with userInfo: NSObjectProtocol?, errorHandler: @convention(block) @escaping (Error) -> Void) -> NSObjectProtocol
     @NSManaged weak var delegate: NSXPCConnectionDelegate?
+    
+//    +(void)_handoffCurrentReplyToQueue:(id)arg1 block:(/*^block*/id)arg2 ;
+    
+    func asdf() {
+//        NSXPCConnection.trans
+    }
+
 }
+
+
 
 
 @objc(NSXPCConnectionDelegate)

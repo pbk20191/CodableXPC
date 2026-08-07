@@ -94,7 +94,7 @@ private struct Parameter {
     /// What the shim declares: the peer's `@objc` face for a proxy, a box when
     /// marked for encoding, the type verbatim otherwise.
     var shimType: String {
-        if let service = proxyService { return "any \(service)XPCShim" }
+        if let service = proxyService { return "any \(service)" }
         return isBoxed ? "NSXPCCodableBridgeBox" : declaredType.trimmedDescription
     }
 
@@ -143,7 +143,7 @@ private struct Method {
     /// a proxy to the peer's object, a box of encoded bytes, an `NSNumber` for a
     /// type that cannot be optional in Objective-C, or the value itself.
     func replyType(_ returnType: TypeSyntax) -> String {
-        if let service = returnsProxyService { return "(any \(service)XPCShim)?" }
+        if let service = returnsProxyService { return "(any \(service))?" }
         if returnsMarker { return "NSXPCCodableBridgeBox?" }
         if numberAccessor(returnType) != nil { return "NSNumber?" }
         return "\(returnType.trimmedDescription)?"
@@ -211,8 +211,9 @@ private struct Method {
             // A proxy arrives as the peer's shim; wrap it so the implementation still
             // sees the Swift protocol it declared.
             if let service = parameter.proxyService {
+                _ = service
                 return parameter.labelled(
-                    "XPCProxyMarker(wrappedValue: \(service)XPCClient(proxy: a\(index), lifetime: lifetime))")
+                    "XPCProxyMarker(wrappedValue: a\(index), lifetime: lifetime)")
             }
             guard let boxed = parameter.boxedType else {
                 return parameter.labelled("a\(index)")
@@ -227,9 +228,10 @@ private struct Method {
         parameters.map { parameter in
             // Vend the caller's own object. NSXPC turns it into a proxy on the far
             // side; the adapter is only the @objc face it needs to do that.
-            if let service = parameter.proxyService {
-                return parameter.labelled(
-                    "\(service)XPCAdapter(\(parameter.internalName).wrappedValue)")
+            if parameter.isProxy {
+                // Vend the caller's own object. NSXPC turns it into a proxy on the
+                // far side; nothing here has to understand what it is.
+                return parameter.labelled("\(parameter.internalName).wrappedValue")
             }
             return parameter.labelled(
                 parameter.isBoxed
@@ -553,7 +555,7 @@ public struct XPCServiceMacro: PeerMacro {
                 let call = method.name + "(" + (arguments + ["reply: { box, error in"]).joined(separator: ", ")
                 let payload = returnType.trimmedDescription
                 let rewrapped = method.returnsProxyService
-                    .map { "XPCProxyMarker(wrappedValue: \($0)XPCClient(proxy: box))" }
+                    .map { _ in "XPCProxyMarker(wrappedValue: box, lifetime: sourceLifetime)" }
                     ?? (method.returnsMarker
                         ? "XPCCodableMarker(wrappedValue: try box.decode(\(payload).self))"
                         : (method.numberAccessor(returnType).map { "box.\($0)" } ?? "box"))
@@ -612,7 +614,7 @@ public struct XPCServiceMacro: PeerMacro {
                 let call = method.name + "(" + (arguments + ["reply: { box, error in"]).joined(separator: ", ")
                 let payload = returnType.trimmedDescription
                 let rewrapped = method.returnsProxyService
-                    .map { "XPCProxyMarker(wrappedValue: \($0)XPCClient(proxy: box))" }
+                    .map { _ in "XPCProxyMarker(wrappedValue: box, lifetime: sourceLifetime)" }
                     ?? (method.returnsMarker
                         ? "XPCCodableMarker(wrappedValue: try box.decode(\(payload).self))"
                         : (method.numberAccessor(returnType).map { "box.\($0)" } ?? "box"))
@@ -713,6 +715,16 @@ public struct XPCServiceMacro: PeerMacro {
                 }
             }
 
+            /// The failure channel to attach to a proxy that arrives in a *reply*.
+            /// Its lifetime is this client's own connection, since that is what the
+            /// object came over.
+            private var sourceLifetime: XPCProxyLifetime {
+                switch source {
+                case .connection(let connection): return XPCProxyLifetime(watching: connection)
+                case .proxy(_, let lifetime): return lifetime
+                }
+            }
+
             /// The blocking counterpart. NSXPC runs the reply block on this thread
             /// before the proxy call returns; a proxy handed over as an argument is
             /// already local, and its adapter replies inline for these shapes, so the
@@ -752,7 +764,7 @@ public struct XPCServiceMacro: PeerMacro {
             case .twoWayValue(let returnType):
                 let replyType = method.replyType(returnType)
                 // Same three cases as the reply type, in the same order.
-                let produced = method.returnsProxyService.map { "\($0)XPCAdapter(result.wrappedValue)" }
+                let produced = method.returnsProxyService.map { _ in "result.wrappedValue" }
                     ?? (method.returnsMarker
                         ? "try NSXPCCodableBridgeBox(result\(unwrapReturn))"
                         : (method.numberAccessor(returnType) != nil
@@ -781,7 +793,7 @@ public struct XPCServiceMacro: PeerMacro {
                 """
             case .syncValue(let returnType):
                 let replyType = method.replyType(returnType)
-                let produced = method.returnsProxyService.map { "\($0)XPCAdapter(result.wrappedValue)" }
+                let produced = method.returnsProxyService.map { _ in "result.wrappedValue" }
                     ?? (method.returnsMarker
                         ? "try NSXPCCodableBridgeBox(result\(unwrapReturn))"
                         : (method.numberAccessor(returnType) != nil
@@ -846,7 +858,7 @@ public struct XPCServiceMacro: PeerMacro {
                 if let service = parameter.proxyService {
                     registrations.append("""
                             interface.setInterface(
-                                \(service)XPC.interface,
+                                NSXPCInterface(with: \(service).self),
                                 for: \(selector), argumentIndex: \(index), ofReply: false)
                     """)
                     continue
@@ -862,7 +874,7 @@ public struct XPCServiceMacro: PeerMacro {
             if method.valueReturnType != nil, let service = method.returnsProxyService {
                 registrations.append("""
                         interface.setInterface(
-                            \(service)XPC.interface,
+                            NSXPCInterface(with: \(service).self),
                             for: \(selector), argumentIndex: 0, ofReply: true)
                 """)
             }

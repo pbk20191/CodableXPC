@@ -45,13 +45,18 @@ public protocol AuditLedger {
     func total() async throws -> Int
 }
 
-/// Takes a `AuditLedger` by proxy and hands one back the same way. Neither crosses as
+/// Takes a ledger by proxy and hands one back the same way. Neither crosses as
 /// data: `XPCProxyMarker` makes the macro emit `NSXPCInterface.setInterface`, so
 /// NSXPC vends the object and the far side calls back into it.
+///
+/// The marker names `AuditLedgerXPCShim`, not `AuditLedger`. Only an `@objc`
+/// protocol can be vended, and the shim is the `@objc` face `@XPCService`
+/// generated for the Swift one. Turning it back is one line at the receiving
+/// end — see `AuditLedgerXPCClient(proxy:lifetime:)`.
 @XPCService
 public protocol Auditor {
-    func attach(_ ledger: XPCProxyMarker<AuditLedger>)
-    func reconcile(_ ledger: XPCProxyMarker<AuditLedger>, label: String) async throws -> Int
-    func current() async throws -> XPCProxyMarker<AuditLedger>
+    func attach(_ ledger: XPCProxyMarker<AuditLedgerXPCShim>)
+    func reconcile(_ ledger: XPCProxyMarker<AuditLedgerXPCShim>, label: String) async throws -> Int
+    func current() async throws -> XPCProxyMarker<AuditLedgerXPCShim>
 }
 #endif
