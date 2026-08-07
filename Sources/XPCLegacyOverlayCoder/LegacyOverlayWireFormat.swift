@@ -47,6 +47,15 @@ public enum LegacyOverlayEnvelope {
     public static let isSync = "_CodableIsSync"
     /// `xpc_array` of live XPC objects, referenced from the stream by index.
     ///
+    /// The index is written by an ordinary single-value container, so it lands on
+    /// the wire as a plain integer. That is why ``LegacyOverlayTag`` has no case
+    /// for an object reference — the format does not need one, and a reader
+    /// cannot tell an object index from any other `Int` without knowing the type.
+    ///
+    /// Populate it via ``CodingUserInfoKey/xpcLegacyCodableObjects``; Apple's
+    /// `XPCCodableObject` throws `CodingUserInfoKeyNotFound` when the key is
+    /// absent, so a coder that never installs the array cannot carry an endpoint.
+    ///
     /// Note the name is reused with a different meaning in the newer format, where
     /// it holds `Data` blobs and the object array moved to
     /// `_CodableOutOfLine4CodableObject`. A reader that keyed off the name alone
