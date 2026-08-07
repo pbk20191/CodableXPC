@@ -11,14 +11,14 @@ private struct Referral: Codable, Equatable {
 
 /// A live `XPCEndpoint` through the reconstructed legacy coder.
 ///
-/// The bytes cannot be checked against Apple — macOS 27 ships the newer coder —
-/// but these tests are not only self-consistency. The code that puts the endpoint
-/// into the side array is Apple's own `XPCEndpoint.encode(to:)`, running here,
-/// driven by this module's `userInfo`. So the mechanism is verified even though
-/// the surrounding grammar is not.
+/// The bytes themselves are checked elsewhere, against Apple's own iOS 18 coder
+/// in an 18.6 simulator — see `AppleIOS18FixtureTests`. What these tests add is
+/// the mechanism: the code that puts the endpoint into the side array is Apple's
+/// own `XPCEndpoint.encode(to:)`, running here, driven by this module's
+/// `userInfo`.
 ///
 /// The iOS 18 disassembly shows `XPCCodableObject.encode(to:)` doing exactly what
-/// the iOS 26 build does: read `userInfo`, project the `xpcCodable` key, throw
+/// the newer build does: read `userInfo`, project the `xpcCodable` key, throw
 /// `CodingUserInfoKeyNotFound` when it is missing, append to the array, and write
 /// the pre-append count through a single-value container. Only the envelope key
 /// holding the array differs — `_CodableOutOfLine` here, and in the newer format
