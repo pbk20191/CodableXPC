@@ -23,9 +23,12 @@ enum XPCServiceDiagnostic: String, DiagnosticMessage {
             return "@XPCService can only be applied to a protocol"
         case .unsupportedShape:
             return """
-                @XPCService requires 'async throws' on any method that returns a value or \
-                reports failure, and no effects at all on a one-way method. A method that \
-                returns a value without throwing cannot report a dropped connection.
+                @XPCService cannot express this method. A method that returns a value \
+                has to be able to throw: a dropped connection is not something it could \
+                otherwise report, and inventing a return value for it would be worse. \
+                Add 'throws' -- with 'async' the caller suspends, without it the caller \
+                blocks. A method that returns nothing may also be 'async throws', \
+                'throws', or have no effects at all and be one-way.
                 """
         case .duplicateSelector:
             return """
@@ -66,6 +69,10 @@ private enum Shape {
     case twoWayVoid
     /// no effects, no return: fire and forget, no reply block.
     case oneWay
+    /// `throws`: same wire shape as ``twoWayVoid``, but the caller blocks.
+    case syncVoid
+    /// `throws -> R`: same wire shape as ``twoWayValue``, but the caller blocks.
+    case syncValue(returnType: TypeSyntax)
 }
 
 private struct Parameter {
@@ -145,6 +152,27 @@ private struct Method {
     var name: String { decl.name.text }
     var hasBoxedParameter: Bool { parameters.contains(where: \.isBoxed) }
     var hasProxyParameter: Bool { parameters.contains(where: \.isProxy) }
+
+    /// Every shape but ``Shape/oneWay`` carries a reply block. A sync method has the
+    /// same wire shape as its async counterpart -- the difference is entirely in the
+    /// client, which blocks on the reply instead of suspending.
+    var expectsReply: Bool {
+        if case .oneWay = shape { return false }
+        return true
+    }
+    var isSynchronous: Bool {
+        switch shape {
+        case .syncVoid, .syncValue: return true
+        case .twoWayValue, .twoWayVoid, .oneWay: return false
+        }
+    }
+    /// The declared return type for the two value-returning shapes.
+    var valueReturnType: TypeSyntax? {
+        switch shape {
+        case .twoWayValue(let type), .syncValue(let type): return type
+        case .twoWayVoid, .oneWay, .syncVoid: return nil
+        }
+    }
     /// Whether the caller-facing overload has to unwrap what the marked method returns.
     var returnIsWrapped: Bool { returnsMarker || returnsProxyService != nil }
 
@@ -155,10 +183,7 @@ private struct Method {
     /// Letting the compiler resolve it removes a whole class of silent mistakes.
     var selectorLabels: String {
         var pieces = parameters.map { "\($0.label ?? "_"):" }
-        switch shape {
-        case .twoWayValue, .twoWayVoid: pieces.append("reply:")
-        case .oneWay: break
-        }
+        if expectsReply { pieces.append("reply:") }
         return "\(name)(\(pieces.joined()))"
     }
 
@@ -443,6 +468,13 @@ public struct XPCServiceMacro: PeerMacro {
                         ?? returnType!)
             case (false, true, true):
                 shape = .twoWayVoid
+            case (false, false, true):
+                shape = .syncVoid
+            case (true, false, true):
+                shape = .syncValue(
+                    returnType: markerPayload(returnType!)
+                        ?? returnsProxyService.map { TypeSyntax(stringLiteral: "any \($0)") }
+                        ?? returnType!)
             case (false, false, false):
                 shape = .oneWay
             default:
@@ -490,10 +522,10 @@ public struct XPCServiceMacro: PeerMacro {
         let requirements = methods.map { method -> String in
             let parameters = method.shimParameters
             switch method.shape {
-            case .twoWayValue(let returnType):
+            case .twoWayValue(let returnType), .syncValue(let returnType):
                 let replyType = method.replyType(returnType)
                 return "    func \(method.name)(\((parameters + ["reply: @escaping (\(replyType), (any Error)?) -> Void"]).joined(separator: ", ")))"
-            case .twoWayVoid:
+            case .twoWayVoid, .syncVoid:
                 return "    func \(method.name)(\((parameters + ["reply: @escaping ((any Error)?) -> Void"]).joined(separator: ", ")))"
             case .oneWay:
                 return "    func \(method.name)(\(parameters.joined(separator: ", ")))"
@@ -576,6 +608,55 @@ public struct XPCServiceMacro: PeerMacro {
                         }
                     }
                 """
+            case .syncValue(let returnType):
+                let call = method.name + "(" + (arguments + ["reply: { box, error in"]).joined(separator: ", ")
+                let payload = returnType.trimmedDescription
+                let rewrapped = method.returnsProxyService
+                    .map { "XPCProxyMarker(wrappedValue: \($0)XPCClient(proxy: box))" }
+                    ?? (method.returnsMarker
+                        ? "XPCCodableMarker(wrappedValue: try box.decode(\(payload).self))"
+                        : (method.numberAccessor(returnType).map { "box.\($0)" } ?? "box"))
+                let declared = method.returnsMarker
+                    ? "XPCCodableMarker<\(payload)>"
+                    : (method.returnsProxyService.map { "XPCProxyMarker<\($0)>" } ?? payload)
+                return """
+                    \(access)func \(method.name)\(signature) {
+                        // The synchronous proxy runs the reply block, or the error
+                        // handler, before this call returns -- so the outcome is
+                        // already there to be read on the line after.
+                        let outcome = XPCSyncOutcome<\(declared)>()
+                        guard let proxy = synchronousProxy(reportingFailureTo: {
+                            outcome.set(.failure($0))
+                        }) else {
+                            throw XPCServiceError.proxyUnavailable
+                        }
+                        try proxy.\(call)
+                            if let error { outcome.set(.failure(error)); return }
+                            guard let box else {
+                                outcome.set(.failure(XPCServiceError.missingReply)); return
+                            }
+                            do { outcome.set(.success(\(rewrapped))) }
+                            catch { outcome.set(.failure(error)) }
+                        })
+                        return try outcome.take()
+                    }
+                """
+            case .syncVoid:
+                let call = method.name + "(" + (arguments + ["reply: { error in"]).joined(separator: ", ")
+                return """
+                    \(access)func \(method.name)\(signature) {
+                        let outcome = XPCSyncOutcome<Void>()
+                        guard let proxy = synchronousProxy(reportingFailureTo: {
+                            outcome.set(.failure($0))
+                        }) else {
+                            throw XPCServiceError.proxyUnavailable
+                        }
+                        try proxy.\(call)
+                            outcome.set(error.map { .failure($0) } ?? .success(()))
+                        })
+                        return try outcome.take()
+                    }
+                """
             case .oneWay:
                 // No reply block, so nothing can report a failure. Encoding errors and
                 // a missing proxy are dropped, matching how NSXPC treats a one-way call.
@@ -622,6 +703,21 @@ public struct XPCServiceMacro: PeerMacro {
                 }
             }
 
+            /// The blocking counterpart. NSXPC runs the reply block on this thread
+            /// before the proxy call returns; a proxy handed over as an argument is
+            /// already local, and its adapter replies inline for these shapes, so the
+            /// same code reads the outcome either way.
+            private func synchronousProxy(
+                reportingFailureTo onFailure: @escaping @Sendable (any Error) -> Void
+            ) -> (any \(name)XPCShim)? {
+                switch source {
+                case .connection(let connection):
+                    return connection.synchronousRemoteObjectProxyWithErrorHandler(onFailure) as? any \(name)XPCShim
+                case .proxy(let shim):
+                    return shim
+                }
+            }
+
         \(implementations)
         }
         """
@@ -662,6 +758,31 @@ public struct XPCServiceMacro: PeerMacro {
                             do { try await implementation.\(method.name)(\(arguments)); reply(nil) }
                             catch { reply(error) }
                         }
+                    }
+                """
+            case .syncValue(let returnType):
+                let replyType = method.replyType(returnType)
+                let produced = method.returnsProxyService.map { "\($0)XPCAdapter(result.wrappedValue)" }
+                    ?? (method.returnsMarker
+                        ? "try NSXPCCodableBridgeBox(result\(unwrapReturn))"
+                        : (method.numberAccessor(returnType) != nil
+                            ? "NSNumber(value: result)"
+                            : "result"))
+                return """
+                    \(access)func \(method.name)(\((parameters + ["reply: @escaping (\(replyType), (any Error)?) -> Void"]).joined(separator: ", "))) {
+                        // No Task: the implementation is synchronous too, and the caller
+                        // is blocked on this reply running before the call returns.
+                        do {
+                            let result = try implementation.\(method.name)(\(arguments))
+                            reply(\(produced), nil)
+                        } catch { reply(nil, error) }
+                    }
+                """
+            case .syncVoid:
+                return """
+                    \(access)func \(method.name)(\((parameters + ["reply: @escaping ((any Error)?) -> Void"]).joined(separator: ", "))) {
+                        do { try implementation.\(method.name)(\(arguments)); reply(nil) }
+                        catch { reply(error) }
                     }
                 """
             case .oneWay:
@@ -719,14 +840,14 @@ public struct XPCServiceMacro: PeerMacro {
                             for: \(selector), argumentIndex: \(index), ofReply: false)
                 """)
             }
-            if case .twoWayValue = method.shape, let service = method.returnsProxyService {
+            if method.valueReturnType != nil, let service = method.returnsProxyService {
                 registrations.append("""
                         interface.setInterface(
                             \(service)XPC.interface,
                             for: \(selector), argumentIndex: 0, ofReply: true)
                 """)
             }
-            if case .twoWayValue(let returnType) = method.shape,
+            if let returnType = method.valueReturnType,
                !method.returnsMarker, method.returnsProxyService == nil,
                let classes = containerClasses(for: returnType) {
                 registrations.append("""
@@ -799,8 +920,11 @@ extension XPCServiceMacro: ExtensionMacro {
 
         let overloads = methods.filter { $0.hasBoxedParameter || $0.hasProxyParameter }
             .map { method -> String in
-            let declared = method.parameters.map {
-                "\($0.label ?? "_") \($0.internalName): \($0.bareType)"
+            let declared = method.parameters.map { parameter -> String in
+                // `memo memo:` is a duplicate name, not a label plus a name.
+                let label = parameter.label ?? "_"
+                let prefix = label == parameter.internalName ? "" : "\(label) "
+                return "\(prefix)\(parameter.internalName): \(parameter.bareType)"
             }.joined(separator: ", ")
 
             let forwarded = method.parameters.map { parameter in
@@ -825,6 +949,18 @@ extension XPCServiceMacro: ExtensionMacro {
                 return """
                     \(access)func \(method.name)(\(declared)) async throws {
                         try await \(method.name)(\(forwarded))
+                    }
+                """
+            case .syncValue(let returnType):
+                return """
+                    \(access)func \(method.name)(\(declared)) throws -> \(returnType.trimmedDescription) {
+                        try \(method.name)(\(forwarded))\(method.returnIsWrapped ? ".wrappedValue" : "")
+                    }
+                """
+            case .syncVoid:
+                return """
+                    \(access)func \(method.name)(\(declared)) throws {
+                        try \(method.name)(\(forwarded))
                     }
                 """
             case .oneWay:

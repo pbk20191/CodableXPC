@@ -117,3 +117,34 @@ protocol NSXPCConnectionDelegate {
     @objc(replacementObjectForXPCConnection:encoder:object:)
     optional func replacementObject(for: NSXPCConnection, encoder: NSXPCCoder, object: Any) -> Any?
 }
+
+/// Collects the single outcome of a synchronous call.
+///
+/// `synchronousRemoteObjectProxyWithErrorHandler` runs the reply block — or the
+/// error handler — before the proxy call returns, so a blocking client only has
+/// to read the result afterwards. Two things can still race to fill it: a peer
+/// that replies while the connection is failing reaches both paths. First write
+/// wins, matching ``XPCOneShot``, so the caller sees whichever outcome actually
+/// happened first rather than the last one to be written.
+public final class XPCSyncOutcome<Value>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: Result<Value, any Error>?
+
+    public init() {}
+
+    public func set(_ result: Result<Value, any Error>) {
+        lock.lock()
+        defer { lock.unlock() }
+        if stored == nil { stored = result }
+    }
+
+    /// - Throws: ``XPCServiceError/missingReply`` when neither path ran, which
+    ///   means the proxy returned without replying and without reporting why.
+    public func take() throws -> Value {
+        lock.lock()
+        let result = stored
+        lock.unlock()
+        guard let result else { throw XPCServiceError.missingReply }
+        return try result.get()
+    }
+}
