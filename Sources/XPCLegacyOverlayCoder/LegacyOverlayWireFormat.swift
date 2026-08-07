@@ -9,7 +9,7 @@ import Foundation
 ///
 /// ## How the two relate
 ///
-/// | | this module (iOS 18) | `XPCOverlayCoder` (iOS 26) |
+/// | | this module (iOS 17–18) | `XPCOverlayCoder` (iOS 26+ / macOS 26+) |
 /// |---|---|---|
 /// | shape | one pass, length-prefixed | two-pass graph, reference-based |
 /// | container | `[tag][u64 count][u64 bodyLength][body]` | metadata tag, bodies deferred |
@@ -23,11 +23,12 @@ import Foundation
 ///
 /// ## The version asymmetry, which is the point of having both
 ///
-/// An iOS 26 reader rejects an iOS 18 message cleanly: `_CodableCoderVersion` is
-/// absent and its check treats that the same as a wrong version.
+/// A newer reader rejects one of these cleanly: `_CodableCoderVersion` is absent
+/// and its check treats that the same as a wrong version. Observed, in its own
+/// words — "Received message from a process running old XPC coder".
 ///
-/// An iOS 18 reader has no version to check, so it will *attempt* an iOS 26
-/// message. The tag spaces overlap almost completely, so it does not fail at the
+/// A reader of this generation has no version to check, so it will *attempt* a
+/// newer message. The tag spaces overlap almost completely, so it does not fail at the
 /// first byte — it fails somewhere inside, as a type mismatch or a trap. Adding a
 /// version field protects only the readers that ship after it.
 /// Which build of the pre-graph overlay a message belongs to.

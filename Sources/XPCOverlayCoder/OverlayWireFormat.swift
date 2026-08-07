@@ -23,10 +23,21 @@ import Foundation
 /// ## Provenance
 ///
 /// Every constant here was confirmed three ways: measured off a live
-/// `XPCSession.send` capture, read out of Hex-Rays pseudocode of the iOS 26
-/// `libswiftXPC`, and checked against the `__cstring` table of the shipping dylib.
-/// Where the first two disagreed, the measurement won — see the notes on
-/// ``OverlayEnvelope/body``.
+/// `XPCSession.send` capture, read out of Hex-Rays pseudocode in `xpcdump/`, and
+/// checked against the `__cstring` table of the shipping dylib. Where the first
+/// two disagreed, the measurement won — see the notes on ``OverlayEnvelope/body``.
+///
+/// The measurements were made on **macOS 27, build 26A5388g**, which is what this
+/// machine runs — not on the iOS build the pseudocode came from, whose version
+/// the dump does not record. The two are only assumed to agree.
+///
+/// Not assumed for long: the same envelope, decoded by Apple, was then checked in
+/// an **iOS 26.5** and an **iOS 27.0** simulator, through
+/// `XPCReceivedMessage.init(dictionary:)`. Scalars, nesting, arrays, absent
+/// optionals and an out-of-line `Data` all come back intact on both. So the
+/// format holds across three shipping builds and two platforms, which is the
+/// claim — `coderVersion` 1 is not a promise about any build that has not been
+/// run.
 public enum OverlayWireFormat {
 
     /// The only coder version this module understands.

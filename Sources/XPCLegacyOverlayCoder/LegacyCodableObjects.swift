@@ -10,15 +10,16 @@ extension CodingUserInfoKey {
     /// iOS 18 `XPCCodableObject.encode(to:)` reads `Encoder.userInfo`, projects
     /// `static CodingUserInfoKey.xpcCodable`, throws `CodingUserInfoKeyNotFound`
     /// if it is absent, appends to the array it finds, and writes the pre-append
-    /// count through a single-value container. The iOS 26 body is the same
-    /// sequence. Only the envelope key holding the array moved.
+    /// count through a single-value container. The newer generation's body is
+    /// the same sequence. Only the envelope key holding the array moved.
     ///
-    /// - Note: the raw value was measured off the *running* iOS 26 dylib by
-    ///   calling the static getter — at eleven characters it is a Swift small
-    ///   string, so it is in no string table, and Hex-Rays dropped the argument
-    ///   in both dumps. It is inherited here rather than measured: no iOS 18
-    ///   binary exists on a machine that can run one. Everything else about this
-    ///   file is read directly from the iOS 18 disassembly.
+    /// - Note: the raw value was first measured off this machine's running
+    ///   libswiftXPC — macOS 27, build 26A5388g — by calling the static getter;
+    ///   at eleven characters it is a Swift small string, so it is in no string
+    ///   table, and Hex-Rays dropped the argument in every dump. It was then
+    ///   confirmed for this generation too: Apple's iOS 18 encoder, run in an
+    ///   18.6 simulator, names `_XPCCodable` verbatim in the error it throws
+    ///   when the array is absent.
     public static let xpcLegacyCodableObjects = CodingUserInfoKey(rawValue: "_XPCCodable")!
 
     /// The same array, unwrapped. `XPCArray` is what Apple's code casts to, so the
