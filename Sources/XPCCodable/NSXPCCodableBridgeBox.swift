@@ -43,7 +43,16 @@ import CodableXPC
 /// - Note: Do not try to swap the decoded object for another type from
 ///   `awakeAfter(using:)`. It works under `NSKeyedUnarchiver`, but `NSXPCDecoder`
 ///   crashes with `EXC_BAD_ACCESS` inside `swift_retain`.
-@objc(NSXPCCodableBridgeBox)
+/// The Objective-C name is prefixed and deliberately does not match the Swift one.
+///
+/// `NS` is Apple's reserved prefix; registering a third-party class under it squats
+/// on their namespace and would collide outright if Apple ever shipped a class by
+/// this name. `CXPC` is this package's prefix.
+///
+/// The name is pinned rather than left to Swift's mangling because it is written
+/// into every archive the box appears in, and both peers of a connection have to
+/// agree on it. Changing it after anything ships makes old archives unreadable.
+@objc(CXPCCodableBridgeBox)
 public final class NSXPCCodableBridgeBox: NSObject, NSSecureCoding {
 
     /// What the box is holding, which depends on where it came from and where it

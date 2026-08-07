@@ -44,12 +44,15 @@ final class NSXPCCodableBridgeBoxTests: XCTestCase {
 
     // MARK: ObjC identity
 
-    func testObjCNameIsPinned() {
-        // Not the mangled Swift name. An archive embeds this string, so it has to
-        // survive a module rename -- and it can only be pinned because the class is
-        // not generic.
-        XCTAssertEqual(NSStringFromClass(NSXPCCodableBridgeBox.self), "NSXPCCodableBridgeBox")
-        XCTAssertTrue(NSXPCCodableBridgeBox.self === NSClassFromString("NSXPCCodableBridgeBox"))
+    func testObjCNameIsPinnedAndPrefixed() {
+        // Not the mangled Swift name, and deliberately not the Swift name either:
+        // NS is Apple's prefix and a third-party class must not register under it.
+        // An archive embeds this string, so it also has to survive a module rename,
+        // which is only possible because the class is not generic.
+        XCTAssertEqual(NSStringFromClass(NSXPCCodableBridgeBox.self), "CXPCCodableBridgeBox")
+        XCTAssertTrue(NSXPCCodableBridgeBox.self === NSClassFromString("CXPCCodableBridgeBox"))
+        XCTAssertNil(NSClassFromString("NSXPCCodableBridgeBox"),
+                     "the Swift name must not be what lands in the Objective-C runtime")
     }
 
     func testDefaultEncodingIsReproducible() throws {
@@ -93,7 +96,7 @@ final class NSXPCCodableBridgeBoxTests: XCTestCase {
             try PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any])
         let objects = try XCTUnwrap(plist["$objects"] as? [Any])
         let names = objects.compactMap { ($0 as? [String: Any])?["$classname"] as? String }
-        XCTAssertTrue(names.contains("NSXPCCodableBridgeBox"),
+        XCTAssertTrue(names.contains("CXPCCodableBridgeBox"),
                       "expected the pinned name in the archive, got \(names)")
     }
 }
