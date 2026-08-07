@@ -79,7 +79,7 @@ let package = Package(
         // floor above the package's own, so a 10.13 consumer can use it.
         .target(
             name: "XPCCodable",
-            dependencies: ["XPCCodableMacros"]),
+            dependencies: ["XPCCodableMacros", "CodableXPC"]),
         // The macro plugin. Runs in the compiler, never in a consumer binary, so it
         // carries no deployment floor of its own.
         .macro(
