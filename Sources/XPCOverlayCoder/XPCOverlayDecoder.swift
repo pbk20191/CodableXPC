@@ -22,6 +22,33 @@ public struct XPCOverlayDecoder {
 
     public init() {}
 
+    /// Decode a message whose envelope you have already taken apart.
+    ///
+    /// - Parameter coderVersion: the `_CodableCoderVersion` entry, or `nil` if the
+    ///   message had no such key. Passing it lets a mismatch be reported as one
+    ///   instead of surfacing as a parse failure deep in the stream.
+    ///
+    ///   An absent version is not a corrupt message — it is how the iOS 18-era
+    ///   overlay wrote every message. That build encoded a native `xpc_object_t`
+    ///   tree rather than this byte stream, so its `_CodableBody` is a dictionary
+    ///   and nothing here can read it.
+    public func decode<T: Decodable>(
+        _ type: T.Type = T.self,
+        from body: Data,
+        outOfLine: [Data] = [],
+        coderVersion: Int64?
+    ) throws -> T {
+        switch coderVersion {
+        case OverlayWireFormat.coderVersion:
+            break
+        case nil:
+            throw OverlayCoderError.missingEnvelopeKey(OverlayEnvelope.coderVersion)
+        case .some(let version):
+            throw OverlayCoderError.unsupportedCoderVersion(version)
+        }
+        return try decode(type, from: body, outOfLine: outOfLine)
+    }
+
     public func decode<T: Decodable>(
         _ type: T.Type = T.self,
         from body: Data,

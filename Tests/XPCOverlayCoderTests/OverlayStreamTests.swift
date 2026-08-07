@@ -95,3 +95,35 @@ final class OverlayStreamTests: XCTestCase {
         XCTAssertThrowsError(try OverlayStreamReader.parse(bytes("13 0a 0e 07 00")))
     }
 }
+
+/// The version gate. An absent `_CodableCoderVersion` is the signature of the
+/// iOS 18-era overlay, which wrote a native xpc tree rather than this byte stream —
+/// a different format entirely, not a corrupt one.
+final class OverlayVersionGateTests: XCTestCase {
+
+    private struct Empty: Codable {}
+
+    func testRejectsAMessageWithNoVersionKey() {
+        XCTAssertThrowsError(
+            try XPCOverlayDecoder().decode(Empty.self, from: Data([0x13, 0x0a]),
+                                           outOfLine: [], coderVersion: nil)
+        ) { error in
+            XCTAssertEqual(error as? OverlayCoderError,
+                           .missingEnvelopeKey("_CodableCoderVersion"))
+        }
+    }
+
+    func testRejectsAFutureVersion() {
+        XCTAssertThrowsError(
+            try XPCOverlayDecoder().decode(Empty.self, from: Data([0x13, 0x0a]),
+                                           outOfLine: [], coderVersion: 2)
+        ) { error in
+            XCTAssertEqual(error as? OverlayCoderError, .unsupportedCoderVersion(2))
+        }
+    }
+
+    func testAcceptsVersionOne() throws {
+        _ = try XPCOverlayDecoder().decode(Empty.self, from: Data([0x13, 0x0a]),
+                                           outOfLine: [], coderVersion: 1)
+    }
+}
