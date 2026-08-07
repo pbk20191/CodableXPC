@@ -14,11 +14,32 @@ import XPC
 ///
 /// ## Why the *encoder* is not here
 ///
-/// The symmetric entry point is `XPCReceivedMessage.encodeMessage(_:userInfo:isSync:)`,
-/// which builds the whole envelope in one call. It cannot be reached this way: it
-/// is an internal static helper and is exported under no name at all, so there is
-/// nothing for the linker to bind. ``OverlayEnvelope/message(_:isSync:)``
-/// reimplements it instead — five keys, verified against the disassembly.
+/// The symmetric entry point is `XPCReceivedMessage.encodeMessage`, which builds
+/// the whole envelope in one call. It cannot be reached this way, on any build:
+/// it is an internal static helper exported under no name at all — absent from
+/// the linker's `.tbd` and from the runtime export trie alike — so there is
+/// nothing to bind. ``OverlayEnvelope/message(_:isSync:)`` reimplements it
+/// instead, five keys, checked against the disassembly and then against real
+/// output.
+///
+/// It also changed shape, which is worth recording because it is the clearest
+/// statement of what each generation considered public:
+///
+///     // iOS 17 and iOS 18 — identical, register for register
+///     encodeMessage<A>(_:isSync:)
+///       (a1@X0 value, a2@W1 isSync, a3@X2 metadata, a4@X3 witness, a5@X8 sret)
+///
+///     // iOS 26+ — a parameter inserted, shifting everything along
+///     encodeMessage<A>(_:userInfo:isSync:)
+///       (X0 value, a1@X1 userInfo, a2@W2 isSync, a3@X3 metadata, a5@X8 sret)
+///
+/// The older pair take no `userInfo` because a caller had no way to supply one:
+/// their message layer exports no `send(_:userInfo:)`, no `reply(_:userInfo:)`
+/// and no `decode(as:userInfo:)` — zero of the three, against all three on the
+/// newer builds. `userInfo` was reachable there only through the byte-level
+/// `XPCEncoder`/`XPCDecoder`, which those builds export and the newer ones
+/// deleted. The two generations trade which layer is public, and this bridge
+/// exists because of which half is left.
 ///
 /// ## What it is for
 ///

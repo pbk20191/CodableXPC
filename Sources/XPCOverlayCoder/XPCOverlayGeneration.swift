@@ -29,6 +29,18 @@ import XPC
 /// builds dropped `XPCEncoder`/`XPCDecoder` and export
 /// `XPCReceivedMessage.init(dictionary:)` instead, which is the opposite half of
 /// the same trick — see ``AppleCoderBridge``.
+///
+/// ## Which layer is public moved with the rewrite
+///
+/// The older pair expose the coder and hide the message: `XPCEncoder`/`XPCDecoder`
+/// are exported and take `userInfo`, while `send`, `reply` and `decode(as:)` have
+/// no `userInfo` form at all. The newer builds do the reverse — the byte-level
+/// classes are gone and all three message entry points gained one, which is also
+/// when `encodeMessage` grew its `userInfo:` parameter.
+///
+/// `XPCReceivedMessage` differs with them. On ``iOS17`` and ``iOS18`` it carries
+/// an `XPCReceivedMessageMetadata`, a nested type the newer one does not have,
+/// and there is no `init(dictionary:)` to make one from a bare dictionary.
 public enum XPCOverlayGeneration: Sendable, Equatable, CaseIterable {
     /// macOS 14 / iOS 17.
     case iOS17
