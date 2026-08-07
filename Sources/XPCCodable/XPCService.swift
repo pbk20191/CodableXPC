@@ -242,6 +242,16 @@ public final class XPCProxyLifetime: @unchecked Sendable {
         for callback in callbacks { callback(error) }
     }
 
+    /// The failure already recorded, or `nil` while the connection stands.
+    ///
+    /// A synchronous read, for a caller with nowhere to put an asynchronous one --
+    /// a one-way method has no reply block and cannot throw.
+    public var recordedFailure: (any Error)? {
+        lock.lock()
+        defer { lock.unlock() }
+        return failure
+    }
+
     /// Registers `onFailure`, calling it immediately if the connection is already
     /// gone. Every call over the proxy registers, so an in-flight one is resolved
     /// rather than left waiting forever.

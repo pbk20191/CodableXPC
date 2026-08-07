@@ -85,7 +85,7 @@ final class ProxyOverTheWireTests: XCTestCase {
     }
 
     func testAnAsyncMethodWorksThroughAProxy() async throws {
-        let got = try await GaugeXPC.remote(connection).inspect(MeterXPCAdapter(MeterImpl()))
+        let got = try await GaugeXPC.remote(connection).inspect(MeterXPC.exported(MeterImpl()))
         XCTAssertEqual(got, 7, "the service should have called back into our object")
     }
 
@@ -96,7 +96,7 @@ final class ProxyOverTheWireTests: XCTestCase {
     /// argument has no such proxy, so the client waits — which is only safe
     /// because the lifetime unblocks it if the connection dies first.
     func testASynchronousMethodWorksThroughAProxy() async throws {
-        let got = try await GaugeXPC.remote(connection).inspectSynchronously(MeterXPCAdapter(MeterImpl()))
+        let got = try await GaugeXPC.remote(connection).inspectSynchronously(MeterXPC.exported(MeterImpl()))
         XCTAssertEqual(got, 7)
     }
 
@@ -113,7 +113,7 @@ final class ProxyOverTheWireTests: XCTestCase {
     /// with instead of waiting.
     func testAProxyFailsOnceItsConnectionIsGone() async throws {
         held.meter = nil
-        GaugeXPC.remote(connection).hold(MeterXPCAdapter(MeterImpl()))
+        GaugeXPC.remote(connection).hold(MeterXPC.exported(MeterImpl()))
         // hold() is one-way, so wait for it to have landed before tearing down.
         for _ in 0..<50 where held.meter == nil {
             try await Task.sleep(nanoseconds: 20_000_000)
@@ -136,7 +136,7 @@ final class ProxyOverTheWireTests: XCTestCase {
     /// thread. Same setup as above, through the synchronous path.
     func testABlockingCallOnADeadProxyUnblocksRatherThanHanging() async throws {
         held.meter = nil
-        GaugeXPC.remote(connection).hold(MeterXPCAdapter(MeterImpl()))
+        GaugeXPC.remote(connection).hold(MeterXPC.exported(MeterImpl()))
         for _ in 0..<50 where held.meter == nil {
             try await Task.sleep(nanoseconds: 20_000_000)
         }

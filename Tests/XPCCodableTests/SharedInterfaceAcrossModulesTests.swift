@@ -42,11 +42,11 @@ final class SharedInterfaceAcrossModulesTests: XCTestCase {
     }
 
     func testTheGeneratedAdapterIsReachable() {
-        let exported: NSObject = BillingXPC.exported(BillingService())
-        XCTAssertTrue(exported is BillingXPCAdapter)
+        let exported: any BillingXPCShim = BillingXPC.exported(BillingService())
+        XCTAssertTrue(exported is BillingXPCAdapter<BillingService>)
         // The adapter must satisfy the shim protocol, which is what NSXPCConnection
         // checks against the interface above.
-        XCTAssertTrue(exported.conforms(to: BillingXPC.interface.protocol))
+        XCTAssertTrue((exported as AnyObject).conforms(to: BillingXPC.interface.protocol))
     }
 
     func testTheGeneratedClientIsConstructibleAndTyped() {
@@ -87,8 +87,8 @@ final class ExplicitObjCNameTests: XCTestCase {
     }
 
     func testItStillBehavesLikeAnyOtherShim() {
-        let exported: NSObject = CourierXPC.exported(CourierService())
-        XCTAssertTrue(exported.conforms(to: CourierXPC.interface.protocol))
+        let exported: any CourierXPCShim = CourierXPC.exported(CourierService())
+        XCTAssertTrue((exported as AnyObject).conforms(to: CourierXPC.interface.protocol))
     }
 }
 

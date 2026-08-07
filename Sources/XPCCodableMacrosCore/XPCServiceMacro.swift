@@ -662,12 +662,28 @@ public struct XPCServiceMacro: PeerMacro {
                     }
                 """
             case .oneWay:
-                // No reply block, so nothing can report a failure. Encoding errors and
-                // a missing proxy are dropped, matching how NSXPC treats a one-way call.
+                // A one-way method has no reply block and cannot throw, so a failure
+                // here has nowhere to go but a trap. Returning quietly would let a
+                // call that never happened look like one that did.
+                let label = "\(name).\(method.name)"
                 return """
                     \(access)func \(method.name)\(signature) {
-                        guard let proxy = proxy(resumingOnFailure: { _ in }) else { return }
-                        try? proxy.\(method.name)(\(arguments.joined(separator: ", ")))
+                        precondition(deadPeer == nil,
+                            "\(label): one-way call on a dead peer -- \\(deadPeer!)")
+                        guard let proxy = proxy(resumingOnFailure: { _ in }) else {
+                            preconditionFailure(
+                                "\(label): one-way call with no proxy -- the connection's "
+                                + "remoteObjectInterface is unset or names another service")
+                        }
+                        \(method.hasBoxedParameter ? """
+                        do {
+                                    // The `try` belongs to the boxing in the arguments, not
+                                    // to the shim call, which cannot throw.
+                                    proxy.\(method.name)(\(arguments.joined(separator: ", ")))
+                                } catch {
+                                    preconditionFailure("\(label): one-way argument could not be encoded -- \\(error)")
+                                }
+                        """ : "proxy.\(method.name)(\(arguments.joined(separator: ", ")))")
                     }
                 """
             }
@@ -713,6 +729,18 @@ public struct XPCServiceMacro: PeerMacro {
                     lifetime.onFailure(onFailure)
                     return shim
                 }
+            }
+
+            /// Whether the peer is known to be gone, read synchronously.
+            ///
+            /// Only a proxy can answer: its lifetime was recorded by the adapter that
+            /// received it. A connection reports asynchronously, through the error
+            /// handler, and there is no public way to ask it now -- so a connection
+            /// that dies mid-call stays silent for a one-way method, which is what
+            /// NSXPC does with such messages anyway.
+            private var deadPeer: (any Error)? {
+                if case .proxy(_, let lifetime) = source { return lifetime.recordedFailure }
+                return nil
             }
 
             /// The failure channel to attach to a proxy that arrives in a *reply*.
@@ -819,9 +847,15 @@ public struct XPCServiceMacro: PeerMacro {
             case .oneWay:
                 return """
                     \(access)func \(method.name)(\(parameters.joined(separator: ", "))) {
-                        \(captureLifetime)// One-way: there is no reply block, so a decode failure has nowhere
-                        // to go. Dropping it matches NSXPC's own behaviour for such calls.
-                        try? implementation.\(method.name)(\(arguments))
+                        \(captureLifetime)\(method.hasBoxedParameter ? """
+                        // One-way: there is no reply block, so a decode failure has
+                                // nowhere to go. Dropping it matches NSXPC, and unlike the
+                                // client side a trap here would let any sender crash the
+                                // service by mangling one argument.
+                                do {
+                                    implementation.\(method.name)(\(arguments))
+                                } catch {}
+                        """ : "implementation.\(method.name)(\(arguments))")
                     }
                 """
             }
@@ -833,10 +867,10 @@ public struct XPCServiceMacro: PeerMacro {
         /// `@unchecked Sendable` because NSXPC delivers calls on arbitrary queues: the
         /// implementation must already tolerate that, which is a property of the service
         /// rather than of this wrapper.
-        \(access)final class \(name)XPCAdapter: NSObject, \(name)XPCShim, @unchecked Sendable {
-            private let implementation: any \(name)
+        \(access)final class \(name)XPCAdapter<T: \(name)>: \(name)XPCShim, @unchecked Sendable {
+            private let implementation: T
 
-            \(access)init(_ implementation: any \(name)) {
+            \(access)init(_ implementation: T) {
                 self.implementation = implementation
             }
 
@@ -914,7 +948,11 @@ public struct XPCServiceMacro: PeerMacro {
             }
 
             /// Wrap an implementation for `NSXPCConnection.exportedObject`.
-            \(access)static func exported(_ implementation: any \(name)) -> NSObject {
+            ///
+            /// Generic over the implementation, so the adapter holds it concretely
+            /// rather than boxed. An existential still works at the call site --
+            /// Swift opens it into `T` implicitly.
+            \(access)static func exported<T: \(name)>(_ implementation: T) -> any \(name)XPCShim {
                 \(name)XPCAdapter(implementation)
             }
         }

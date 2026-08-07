@@ -26,7 +26,15 @@ private final class AuditorImpl: Auditor, @unchecked Sendable {
         return try await peer.total()
     }
     func current() async throws -> XPCProxyMarker<AuditLedgerXPCShim> {
-        XPCProxyMarker(wrappedValue: AuditLedgerXPCAdapter(attached ?? LedgerImpl()))
+        // Through the facade, not the adapter's initialiser: `exported` is a
+        // generic *function*, so it opens the existential. A generic class's
+        // initialiser does not.
+        //
+        // Bound to a `let` first, because opening also does not happen through
+        // `??` -- the coalescing operator settles on `any AuditLedger` before the
+        // call is type-checked.
+        let peer: any AuditLedger = attached ?? LedgerImpl()
+        return XPCProxyMarker(wrappedValue: AuditLedgerXPC.exported(peer))
     }
 }
 
@@ -71,9 +79,9 @@ final class ProxyMarkerTests: XCTestCase {
     func testTheShimTakesThePeersObjcFaceNotTheSwiftProtocol() {
         // What the adapter must satisfy is Auditor's shim; what it hands the
         // implementation is a AuditLedger rebuilt from the peer's shim.
-        let exported: NSObject = AuditorXPC.exported(AuditorImpl())
-        XCTAssertTrue(exported.conforms(to: AuditorXPC.interface.protocol))
-        XCTAssertTrue(exported.responds(to: selector("attach:")))
+        let exported: any AuditorXPCShim = AuditorXPC.exported(AuditorImpl())
+        XCTAssertTrue((exported as AnyObject).conforms(to: AuditorXPC.interface.protocol))
+        XCTAssertTrue((exported as AnyObject).responds(to: selector("attach:")))
     }
 
     /// Both halves in-process: the adapter wraps an incoming shim back into the
@@ -84,7 +92,7 @@ final class ProxyMarkerTests: XCTestCase {
         let auditor = AuditorImpl()
 
         // Stand in for what NSXPC delivers: the peer's @objc face.
-        let asShim: any AuditLedgerXPCShim = AuditLedgerXPCAdapter(ledger)
+        let asShim: any AuditLedgerXPCShim = AuditLedgerXPC.exported(ledger)
         let rebuilt = AuditLedgerXPCClient(proxy: asShim)
 
         rebuilt.note("opening")
@@ -102,7 +110,7 @@ final class ProxyMarkerTests: XCTestCase {
     func testTheBareOverloadTakesTheProtocolItself() async throws {
         let auditor = AuditorImpl()
         let ledger = LedgerImpl()
-        let shim = AuditLedgerXPCAdapter(ledger)
+        let shim = AuditLedgerXPC.exported(ledger)
         auditor.attach(shim)                         // no XPCProxyMarker at the call site
         let total = try await auditor.reconcile(shim, label: "bare")
         XCTAssertEqual(total, 1)
