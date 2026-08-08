@@ -183,12 +183,32 @@ request body's `id`.
 exported | exportedRawValue | dynamic
 ```
 
-with a companion `WireCode` enum carrying the same three cases — so Apple's shipping build does
-use an explicit wire discriminator, as the previous design suspected. What that design got wrong
-are the case names: it used `type` / `name` / `dynamic`.
+`SharedActorKey.encode(to:)` was read from the decompilation and settles the shape. It takes one
+keyed container against `CodingKeys`, then switches on the case tag and opens a *nested* container
+against a per-case key type:
 
-⚠️ **Unverified:** `WireCode`'s raw values and whether the key is coded as the synthesized enum
-shape or as a `WireCode` + payload pair. Determine before implementing.
+| tag | outer key | nested keys | payload |
+|---|---|---|---|
+| 0 | `exported` | `ExportedCodingKeys` | a **`SwiftType`** — encoded generically, so `{ mangledTypeName: … }` |
+| 1 | `exportedRawValue` | `ExportedRawValueCodingKeys` | a **String** — the non-generic `encode(_:forKey:)` overload |
+| 2 | `dynamic` | `DynamicCodingKeys` | an **`ID64`** — encoded generically through ID64's own conformance |
+
+So this is Swift's synthesized enum coding, and the previous design's flat `{kind, type|name|id}`
+is wrong in both shape and case names (it used `type` / `name` / `dynamic`).
+
+`WireCode` carries the same three case names and is a separate `RawRepresentable` enum. It does
+**not** appear in `encode(to:)` — the tag there is the `CodingKeys` case index, not a `WireCode`
+raw value. `WireCode` is therefore internal, not peer-observable, and we need not reproduce it.
+
+Note the asymmetry worth preserving: `exported` carries a *type*, `exportedRawValue` a *string*.
+The previous design collapsed both into strings.
+
+⚠️ **Unverified:** the nested payload key name for these three cases. `_0` is the natural guess —
+it is what Swift synthesizes for an unlabelled associated value, and it is confirmed for
+`RemoteInvocationFailure`'s two cases. But a scan of all 106 descriptors found `_0` on *only*
+those two, and not on `SharedActorKey`'s per-case key types, so the guess is not evidence. The
+three per-case types are private and their names carry a discriminator hash, which is why the
+extractor could not resolve their field lists. Read them before implementing.
 
 Apple **refuses to forward a remote proxy**: `"API violation: Remote proxy cannot be shared!"` and
 `"Cannot send remote actor proxies over an session."` (their typo). The previous design allowed a
@@ -203,9 +223,15 @@ names. The `ActorID` wrapper is `{ rawActorID }`.
 The session-in-userInfo mechanism is also Apple's: `"Bug in XPCDistributed: Session required in
 user info dictionary"`. Our `SessionCoding` seam is compatible with it.
 
-⚠️ **Unverified:** whether `Local`'s two halves ever reach the wire. `ID64` has its own
-`CodingKeys`, which suggests it is encodable somewhere; the previous design asserted the halves
-are never transmitted. Determine — it changes whether `ActorID.encode` may stay as built.
+**`ID64` is on the wire** — resolved. `SharedActorKey.encode(to:)` encodes an `ID64` as the
+`dynamic` case's payload, through ID64's own `Codable` conformance. `ID64` is `{ value }`, a
+single field, so it codes as a keyed container `{ "value": <UInt64> }` rather than a bare integer.
+
+That is narrower than it first looks, and it does **not** overturn the previous design's rule.
+What crosses is the *dynamic sharing counter*, which is exactly the `SharedActorKey` payload — not
+`RawActorID.Local`'s `actorSystemID` / `instanceID`. Those two remain process-local, so
+`ActorID.encode` as built in Task 3 stands. What changes is only that our `.dynamic(UInt64)` must
+encode as an `ID64` struct, not a bare `uint64`.
 
 ## Other surface worth reproducing
 
@@ -243,14 +269,23 @@ are never transmitted. Determine — it changes whether `ActorID.encode` may sta
 
 ## Before any of this can claim byte fidelity
 
-Four things are named but not valued. Each needs to be read out of the decompiled encode/decode
-functions in `xpcDistributed/*.mm`, or observed empirically:
+Reading `SharedActorKey.encode(to:)` out of the decompilation resolved two of the original four —
+the key's coding shape, and the `ID64` question. Three remain, each of which needs the same
+treatment: find the `encode(to:)` or `init(from:)` in `xpcDistributed/*.mm` and read it.
 
-1. `protocolStub` — absent or null for a concrete-actor call?
-2. `InvocationContents.send` vs `.recv` — what distinguishes them, and each payload.
-3. `SharedActorKey.WireCode` — raw values, and the coding shape.
-4. `ID64` — does either half of a `Local` id ever reach the wire?
+1. `InvocationContents.send` vs `.recv` — what distinguishes them, and each payload. Start at
+   `XPCSystem.Session.RemoteInvocationRequest.encode`.
+2. The nested payload key name for `SharedActorKey`'s three cases — `_0` is likely but
+   unevidenced (see above).
+3. `protocolStub` — written as absent, or as null, for a concrete-actor call? Start at
+   `XPCSystem.InvocationEncoder.encode`.
 
-Until these are resolved, an implementation can match Apple's *key names* but cannot be claimed
-to interoperate. The honest test is a real one: stand up a peer against Apple's own
-`XPCDistributed` and exchange an invocation. Nothing short of that verifies this document.
+Until these are resolved an implementation can match Apple's *key names* but cannot be claimed to
+interoperate.
+
+And even then, the honest test is a real one: stand up a peer against Apple's own
+`XPCDistributed` and exchange an invocation. Nothing short of that verifies this document —
+everything here is read from metadata and decompiled code, which shows what the binary *contains*,
+not what two processes actually accept from each other. The previous design's tier-3 technique
+(an anonymous listener dialled from the same process) does not help, because both ends would be
+ours; this needs Apple's code on one side.
