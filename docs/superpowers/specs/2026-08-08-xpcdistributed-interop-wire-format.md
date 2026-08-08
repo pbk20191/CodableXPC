@@ -439,6 +439,61 @@ integer. As with `WireCode`, the raw values are the defaults in declaration orde
 So a full response is `[0, <result>]` or `[1, {"executionFailed": {"_0": "..."}}]`. There is no
 `_value` key and no response-level dictionary anywhere in that.
 
+### What fills `A` for a void return — `Ack`
+
+`Void` is not `Codable`, so a void-returning target still has to bind the response's generic
+parameter to something. Apple binds it to **`XPCDistributed.Ack`**, a field-less struct with
+synthesized `Codable`. Its encoded form is an empty keyed container, so a void success on the
+wire is
+
+```
+[0, {}]
+```
+
+— and the `{}` is `Ack`'s empty dictionary, not a sentinel anyone chose to mean "returned
+nothing".
+
+The chain, every link an annotated direct call or reflection metadata:
+`EncodedResultHandler.onReturnVoid()` (`0x2ad5036f4`) tail-calls `onReturn<A>` with `x1` set to
+the type metadata for `Ack` and both witness tables, and no value register because `Ack` is
+zero-sized; `onReturn` (`0x2ad503404`) stores `Result` case 0 and calls the sole `ReplyHandler`
+requirement; `encodeReply`'s success arm calls `encodeReturn` directly; `encodeReturn`
+(`0x2ad512298`) calls `RemoteInvocationResponse<A>.init(result:)`. `Ack.encode(to:)` opens a
+keyed container and encodes nothing, and the field descriptors show no fields and no
+`CodingKeys` cases. Corroborated independently by the in-process path:
+`ResultHandler.onReturnVoid()` (`0x2ad5051b4`) stores `.success(Ack())`.
+
+Not proven: nobody has driven a real peer to return `Void`. The reachable half is covered —
+Apple's decoder reads a `[0, {}]` we wrote, as an `Ack`.
+
+`RemoteInvocationResponse<Never>` is the **failure-only** instantiation. Its `Encodable` witness
+accessor (`0x2ad516ad8`) is reached from **seven** sites, every one of them a failure path:
+`encodeReturn`'s catch path, `encodeReply`'s failure arm, three in
+`Session.handleReceivedRequest`, and two more in its closures. Each of the five in
+`handleReceivedRequest` is an inlined `Payload(encoding: RemoteInvocationResponse<Never>(...))` —
+a `userInfo` dictionary literal, `XPCDictionary.init()`, the `<Never>` witness, then
+`XPCDictionary.encode(_:forKey: "payload", withUserInfo:)`. A `.result` is uninhabited in this
+instantiation, which is the point.
+
+> An earlier revision of this paragraph said the accessor is reached "only from `encodeReply`'s
+> failure arm and `encodeReturn`'s catch path." That was two of seven. The conclusion was
+> unaffected — every site is a failure path, so `<Never>` is *more* clearly failure-only than
+> claimed — but the exhaustiveness was asserted without the scan that would establish it, and it
+> reached this document rather than staying in a session note. Recorded because an unearned
+> "only" is the same defect this document keeps catching elsewhere.
+
+The last link is tighter than a call chain: `RemoteInvocationResponse.init(result:)`
+(`0x2ad50f7c4`) has **exactly one caller in the whole image**, `encodeReturn+0x234`, found by
+scanning every branch in `__text`. So "tag 0 on the wire comes from `encodeReturn`" is not an
+inference from the path taken; there is no other path.
+
+> This document had the answer and did not notice. `Ack` appears twice above as a *methodological
+> control* — the field-less struct that proves the field-descriptor extraction captures even a
+> trivial `CodingKeys`, and the keyed control in `verify-containers.py`. Meanwhile this section
+> carried an invented justification for `[0, {}]` ("so 'returned nothing' stays distinguishable
+> from 'carried no result'") through four rounds. The bytes were right and the reason was ours.
+> Worth remembering that a fact can be present in the toolkit and absent from the conclusions.
+
 Corroborating the direction, `RemoteInvocationResponse` has exactly three initializers:
 `init(result: A)`, `init(executionFailure: Swift.String)`, `init(resultPropagationFailure:
 Swift.String)`. Both failure payloads are **`String`** — which is the same fact as "Apple does

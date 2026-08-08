@@ -47,10 +47,10 @@ final class TransportTests: XCTestCase {
         // And either can immediately originate, with no ordering between the two
         // activations having mattered.
         server.inboundRequestHandler = { _, _, reply in
-            reply(try! Packet.Payload(encoding: Ping(value: 1)))
+            reply(try! Packet.Payload(encoding: Ping(value: 1), userInfo: [:]))
         }
         let outcome = await client.sendRequest(
-            seq: client.allocateSeq(), try Packet.Payload(encoding: Ping(value: 0))
+            seq: client.allocateSeq(), try Packet.Payload(encoding: Ping(value: 0), userInfo: [:])
         )
         guard case .reply = outcome else { return XCTFail("expected a reply") }
     }
@@ -59,10 +59,10 @@ final class TransportTests: XCTestCase {
         let (client, server) = try await makePair()
         server.inboundRequestHandler = { _, payload, reply in
             let ping = try! payload.decode(as: Ping.self)
-            reply(try! Packet.Payload(encoding: Ping(value: ping.value + 1)))
+            reply(try! Packet.Payload(encoding: Ping(value: ping.value + 1), userInfo: [:]))
         }
         let outcome = await client.sendRequest(
-            seq: client.allocateSeq(), try Packet.Payload(encoding: Ping(value: 1))
+            seq: client.allocateSeq(), try Packet.Payload(encoding: Ping(value: 1), userInfo: [:])
         )
         guard case .reply(let payload) = outcome else { return XCTFail("expected a reply") }
         XCTAssertEqual(try payload.decode(as: Ping.self), Ping(value: 2))
@@ -80,13 +80,13 @@ final class TransportTests: XCTestCase {
             // Answer by hand, so the assertion is about the id on the wire rather than
             // about our own reply path agreeing with our own send path.
             try? rawB.send(packet: Packet(header: .response(id),
-                                          payload: try! Packet.Payload(encoding: Ping(value: 9))))
+                                          payload: try! Packet.Payload(encoding: Ping(value: 9), userInfo: [:])))
         }
         try await client.activate()
         try rawB.activate()
 
         let seq = client.allocateSeq()
-        let outcome = await client.sendRequest(seq: seq, try Packet.Payload(encoding: Ping(value: 1)))
+        let outcome = await client.sendRequest(seq: seq, try Packet.Payload(encoding: Ping(value: 1), userInfo: [:]))
         XCTAssertEqual(seen.value, seq, "the request must go out under the allocated id")
         guard case .reply(let payload) = outcome else { return XCTFail("expected a reply") }
         XCTAssertEqual(try payload.decode(as: Ping.self), Ping(value: 9))
@@ -100,10 +100,10 @@ final class TransportTests: XCTestCase {
         let seen = SeqBox()
         server.inboundRequestHandler = { seq, _, reply in
             seen.value = seq
-            reply(try! Packet.Payload(encoding: Ping(value: 0)))
+            reply(try! Packet.Payload(encoding: Ping(value: 0), userInfo: [:]))
         }
         let seq = client.allocateSeq()
-        _ = await client.sendRequest(seq: seq, try Packet.Payload(encoding: Ping(value: 1)))
+        _ = await client.sendRequest(seq: seq, try Packet.Payload(encoding: Ping(value: 1), userInfo: [:]))
         XCTAssertEqual(seen.value, seq)
     }
 
@@ -124,7 +124,7 @@ final class TransportTests: XCTestCase {
         }
         let seq = client.allocateSeq()
         let first = Task {
-            await client.sendRequest(seq: seq, try! Packet.Payload(encoding: Ping(value: 1)))
+            await client.sendRequest(seq: seq, try! Packet.Payload(encoding: Ping(value: 1), userInfo: [:]))
         }
         while await client.pendingRequestCount == 0 { await Task.yield() }
 
@@ -133,7 +133,7 @@ final class TransportTests: XCTestCase {
         let box = RequestTableTests.OutcomeBox()
         let duplicateTask = Task {
             box.outcome = await client.sendRequest(
-                seq: seq, try! Packet.Payload(encoding: Ping(value: 2))
+                seq: seq, try! Packet.Payload(encoding: Ping(value: 2), userInfo: [:])
             )
         }
         guard await waitUntil({ box.outcome != nil }) else {
@@ -146,7 +146,7 @@ final class TransportTests: XCTestCase {
         XCTAssertTrue(message.contains("duplicate request seq \(seq)"), message)
 
         // The original is untouched and still completable.
-        gate.reply?(try Packet.Payload(encoding: Ping(value: 7)))
+        gate.reply?(try Packet.Payload(encoding: Ping(value: 7), userInfo: [:]))
         guard await waitUntil({ await client.pendingRequestCount == 0 }) else {
             return XCTFail("the original waiter was stranded -- nothing can resume it")
         }
@@ -160,10 +160,10 @@ final class TransportTests: XCTestCase {
         // This is the whole reason the XPC reply channel is unused.
         let (client, server) = try await makePair()
         client.inboundRequestHandler = { _, payload, reply in
-            reply(try! Packet.Payload(encoding: Ping(value: 99)))
+            reply(try! Packet.Payload(encoding: Ping(value: 99), userInfo: [:]))
         }
         let outcome = await server.sendRequest(
-            seq: server.allocateSeq(), try Packet.Payload(encoding: Ping(value: 0))
+            seq: server.allocateSeq(), try Packet.Payload(encoding: Ping(value: 0), userInfo: [:])
         )
         guard case .reply(let payload) = outcome else { return XCTFail("expected a reply") }
         XCTAssertEqual(try payload.decode(as: Ping.self), Ping(value: 99))
@@ -173,14 +173,14 @@ final class TransportTests: XCTestCase {
         let (client, server) = try await makePair()
         server.inboundRequestHandler = { _, payload, reply in
             let ping = try! payload.decode(as: Ping.self)
-            reply(try! Packet.Payload(encoding: Ping(value: ping.value * 10)))
+            reply(try! Packet.Payload(encoding: Ping(value: ping.value * 10), userInfo: [:]))
         }
         let results = await withTaskGroup(of: Int?.self) { group in
             for i in 1...20 {
                 group.addTask {
                     let outcome = await client.sendRequest(
                         seq: client.allocateSeq(),
-                        try! Packet.Payload(encoding: Ping(value: i))
+                        try! Packet.Payload(encoding: Ping(value: i), userInfo: [:])
                     )
                     guard case .reply(let p) = outcome else { return nil }
                     return try? p.decode(as: Ping.self).value
@@ -198,7 +198,7 @@ final class TransportTests: XCTestCase {
             XCTAssertEqual(try? payload.decode(as: Ping.self), Ping(value: 5))
             arrived.fulfill()
         }
-        try client.sendNotification(try Packet.Payload(encoding: Ping(value: 5)))
+        try client.sendNotification(try Packet.Payload(encoding: Ping(value: 5), userInfo: [:]))
         await fulfillment(of: [arrived], timeout: 2)
     }
 
@@ -213,7 +213,7 @@ final class TransportTests: XCTestCase {
         }
         try await client.activate()
         try rawB.activate()
-        try client.sendNotification(try Packet.Payload(encoding: Ping(value: 1)))
+        try client.sendNotification(try Packet.Payload(encoding: Ping(value: 1), userInfo: [:]))
         let arrived = await waitUntil({ seen.value != nil })
         XCTAssertTrue(arrived, "the notification never arrived")
         XCTAssertEqual(seen.value, 0, "a notification header has no id")
@@ -224,7 +224,7 @@ final class TransportTests: XCTestCase {
         server.inboundRequestHandler = { _, _, _ in }   // never replies
         let task = Task {
             await client.sendRequest(
-                seq: client.allocateSeq(), try! Packet.Payload(encoding: Ping(value: 1))
+                seq: client.allocateSeq(), try! Packet.Payload(encoding: Ping(value: 1), userInfo: [:])
             )
         }
         while await client.pendingRequestCount == 0 { await Task.yield() }
@@ -242,7 +242,7 @@ final class TransportTests: XCTestCase {
         server.inboundRequestHandler = { _, _, _ in }   // never replies
         let task = Task {
             await client.sendRequest(
-                seq: client.allocateSeq(), try! Packet.Payload(encoding: Ping(value: 1))
+                seq: client.allocateSeq(), try! Packet.Payload(encoding: Ping(value: 1), userInfo: [:])
             )
         }
         while await client.pendingRequestCount == 0 { await Task.yield() }
@@ -289,7 +289,7 @@ final class TransportTests: XCTestCase {
         server.inboundNotificationHandler = { _ in arrived.fulfill() }
         try await client.activate()
         try await server.activate()
-        try client.sendNotification(try Packet.Payload(encoding: Ping(value: 1)))
+        try client.sendNotification(try Packet.Payload(encoding: Ping(value: 1), userInfo: [:]))
         await fulfillment(of: [arrived], timeout: 2)
     }
 }

@@ -1,6 +1,4 @@
 import Foundation
-import XPC
-import CodableXPC
 
 // The invocation wire shapes, matched to Apple's shipping `XPCDistributed`.
 //
@@ -202,6 +200,51 @@ public struct InboundRequest: Decodable {
 
 // MARK: - the response
 
+/// `XPCDistributed.Ack` -- Apple's stand-in for `Void` on the return path.
+///
+/// A field-less struct with synthesized `Codable`, so it writes an empty keyed
+/// container: `{}`. That is the entire payload of a void reply, and the reason the
+/// wire has a payload there at all -- `Void` is not `Codable`, so something has to
+/// occupy the generic parameter.
+///
+/// **Resolved from the binary, not chosen.** `EncodedResultHandler.onReturnVoid()`
+/// (`0x2ad5036f4`) calls its own `onReturn<A>(value:)` with `A` bound to
+/// `XPCDistributed.Ack` -- the type metadata (`0x2d9b84470`) and both witness tables
+/// are loaded into the argument registers immediately before the tail call, and no
+/// value register is passed because `Ack` is zero-sized. `onReturn<A>` (`0x2ad503404`)
+/// builds a `Swift.Result` and stores case 0 -- `.success` -- with
+/// `swift_storeEnumTagMultiPayload`, then calls the one `ReplyHandler` requirement
+/// through its witness table; that call is indirect, so it is identified by signature
+/// rather than by symbol, and `encodeReply<A, B>(with: Result<A, B>) -> Payload` is the
+/// protocol's only method. `encodeReply`'s success arm then calls
+/// `encodeReturn<A>(value:)` as a *direct* call, and `encodeReturn` calls
+/// `RemoteInvocationResponse<A>.init(result:)` -- tag 0 -- and
+/// `Packet.Payload.init(encoding:userInfo:)`.
+///
+/// The in-process path agrees independently: `ResultHandler.onReturnVoid()`
+/// (`0x2ad5051b4`) stores `.success(Ack())` as an `any Decodable & Encodable` into
+/// `DirectResultHandler.capturedResult`. Two unrelated paths, one stand-in type.
+///
+/// Emptiness is from reflection metadata rather than inference:
+/// `field-descriptors.txt` lists `struct XPCDistributed.Ack` with no fields and
+/// `enum XPCDistributed.Ack..CodingKeys` with no cases, and `Ack.encode(to:)`
+/// (`0x2ad4ebb70`) opens `container(keyedBy:)` and makes no encode call.
+///
+/// Synthesized here on purpose. Apple's is synthesized -- it has a `CodingKeys` in the
+/// shipping reflection metadata -- so writing the conformance by hand could only
+/// diverge.
+@available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
+/// Its decode side accepts anything, and that is correct rather than a hole. Apple's
+/// `Ack.init(from:)` (`0x2ad4ebcdc`) opens no container at all -- it destroys the boxed
+/// decoder existential and returns -- so `[0, 7]`, `[0, "junk"]`, `[0, null]` and
+/// `[0, {"surprise": 1}]` all decode as a void success against a real peer. A synthesized
+/// conformance over no fields behaves identically, which is why this must stay synthesized:
+/// hand-writing it would be the one chance to accidentally start rejecting traffic Apple
+/// accepts.
+public struct Ack: Codable, Hashable, Sendable {
+    public init() {}
+}
+
 /// `Session.RemoteInvocationResponse` -- and there is no response dictionary.
 ///
 /// Apple's response struct has one stored field, `_value`, but `_value` is not a wire
@@ -212,14 +255,26 @@ public struct InboundRequest: Decodable {
 ///
 ///     [ <tag : UInt8>, <payload> ]   0 -> the result, 1 -> a failure
 ///
-/// The success payload is an `XPCNativeObject` rather than a generic parameter because
-/// our transport decodes the envelope before the call site's return type is in scope.
-/// Apple gets to be generic here because their `sendInvocation<A>` decodes at the call
-/// site; at this layer we do not have that.
+/// Generic over the success type, as Apple's `RemoteInvocationResponse<A>` is. It held
+/// an `XPCNativeObject` until R5, on the reasoning that the transport decodes an
+/// envelope before the call site's return type is in scope. That was sound against a
+/// native-xpc body and did not survive the body becoming an overlay byte stream: there
+/// is no live xpc object to hold, and `XPCNativeObject`'s conformance throws for every
+/// coder but `CodableXPC`'s native-xpc one, so a success response could not be encoded
+/// at all. Nothing in the transport ever needed the erasure -- `RequestTable.Outcome`
+/// is `.reply(Packet.Payload)`, an *undecoded* payload -- so the decode simply moves to
+/// whoever knows the return type, which is Apple's arrangement.
+///
+/// A failure carries no success value, so a failure-only response is spelled
+/// `RemoteInvocationResponse<Never>`, which is literally what Apple instantiates: the
+/// lazy `Encodable` witness accessor for `RemoteInvocationResponse<Swift.Never>` is a
+/// direct call in `encodeReply`'s failure arm (`0x2ad512738`) and in `encodeReturn`'s
+/// catch path (`0x2ad512298`). `<Never>` is not the void answer -- ``Ack`` is; a
+/// `<Never>` response cannot hold `.result` at all, which is the point of it.
 @available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
-public enum RemoteInvocationResponse: Equatable {
+public enum RemoteInvocationResponse<Success: Codable> {
 
-    case result(XPCNativeObject)
+    case result(Success)
     case failure(RemoteInvocationFailure)
 
     /// `Either.Case`, `RawRepresentable` over `UInt8` with the defaults in declaration
@@ -229,27 +284,11 @@ public enum RemoteInvocationResponse: Equatable {
         case failure = 1
     }
 
-    /// A Void success is `[0, {}]` -- an empty dictionary rather than an absent payload,
-    /// so "returned nothing" stays distinguishable from "carried no result at all".
-    public static var void: RemoteInvocationResponse {
-        .result(XPCNativeObject(xpc_dictionary_create(nil, nil, 0)))
-    }
-
-    /// `userInfo` is threaded through because a returned value may itself contain an
-    /// `ActorID`, which needs the owning session to code itself.
-    ///
-    /// Deliberately not defaulted. The value is encoded here and now, not at
-    /// `Payload(encoding:userInfo:)` time, so this `userInfo` is the only one it will
-    /// ever see -- and `ActorID.encode` traps rather than throws when the session is
-    /// missing. A default would make the process-trapping spelling the shortest one, on
-    /// a return path whose value shape is influenced by which `func` a peer chose to
-    /// invoke. Callers with genuinely no session pass `[:]` and say so.
-    public init<T: Encodable>(
-        result value: T, userInfo: [CodingUserInfoKey: Any]
-    ) throws {
-        var encoder = XPCEncoder()
-        encoder.userInfo = userInfo
-        self = .result(XPCNativeObject(try encoder.encode(value)))
+    /// Mirrors Apple's `init(result: A)` (`0x2ad50f7c4`), which has exactly one caller
+    /// in the whole image -- `encodeReturn+0x234`. Its value here is inference: a call
+    /// site writes `RemoteInvocationResponse(result: 42)` rather than naming `Success`.
+    public init(result value: Success) {
+        self = .result(value)
     }
 
     public init(executionFailure message: String) {
@@ -260,6 +299,21 @@ public enum RemoteInvocationResponse: Equatable {
         self = .failure(.resultPropagationFailed(message))
     }
 }
+
+/// The void reply: `[0, {}]`, tag zero over an ``Ack``.
+@available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
+extension RemoteInvocationResponse where Success == Ack {
+    public static var void: RemoteInvocationResponse<Ack> { .result(Ack()) }
+}
+
+@available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
+extension RemoteInvocationResponse: Equatable where Success: Equatable {}
+
+@available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
+extension RemoteInvocationResponse: Hashable where Success: Hashable {}
+
+@available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
+extension RemoteInvocationResponse: Sendable where Success: Sendable {}
 
 @available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
 extension RemoteInvocationResponse: Codable {
@@ -293,7 +347,7 @@ extension RemoteInvocationResponse: Codable {
         // traffic Apple accepts. Asymmetric with encode, which always writes two.
         switch tag {
         case .result:
-            self = .result(try container.decode(XPCNativeObject.self))
+            self = .result(try container.decode(Success.self))
         case .failure:
             self = .failure(try container.decode(RemoteInvocationFailure.self))
         }
