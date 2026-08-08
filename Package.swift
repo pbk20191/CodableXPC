@@ -52,9 +52,14 @@ let package = Package(
         .package(url: "https://github.com/swiftlang/swift-syntax.git", "600.0.0"..<"604.0.0"),
     ],
     targets: [
+        // One helper, shared by the two coders that both hand a Data to libxpc.
+        // A target of its own because neither coder should depend on the other.
+        .target(
+            name: "XPCDispatchDataBridge",
+            dependencies: []),
         .target(
             name: "CodableXPC",
-            dependencies: []),
+            dependencies: ["XPCDispatchDataBridge"]),
         .target(
             name: "XPCCompat",
             dependencies: ["CodableXPC"]),
@@ -83,7 +88,7 @@ let package = Package(
         // Separate from CodableXPC on purpose: that one builds a native xpc tree.
         .target(
             name: "XPCOverlayCoder",
-            dependencies: []),
+            dependencies: ["XPCDispatchDataBridge"]),
         // The macro plugin. Runs in the compiler, never in a consumer binary, so it
         // carries no deployment floor of its own.
         .macro(

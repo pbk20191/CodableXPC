@@ -6,6 +6,7 @@
 //
 
 import Foundation
+import XPCDispatchDataBridge
 #if canImport(XPC)
 import XPC
 

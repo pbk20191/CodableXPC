@@ -1,5 +1,6 @@
 import Foundation
 import XPC
+import XPCDispatchDataBridge
 
 extension LegacyOverlayEnvelope {
 
@@ -25,9 +26,7 @@ extension LegacyOverlayEnvelope {
                                isSync: Bool = false,
                                generation: LegacyOverlayGeneration = .iOS18) -> xpc_object_t {
         let message = xpc_dictionary_create(nil, nil, 0)
-        encoded.body.withUnsafeBytes {
-            xpc_dictionary_set_data(message, body, $0.baseAddress, $0.count)
-        }
+        xpc_dictionary_set_value(message, body, DispatchDataBridge.xpcData(for: encoded.body))
         xpc_dictionary_set_bool(message, isSyncKey, isSync)
 
         // iOS 17 writes two keys and stops -- its encodeMessage has no third.

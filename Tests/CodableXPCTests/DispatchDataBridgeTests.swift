@@ -3,6 +3,7 @@ import XCTest
 import XPC
 import MachO
 @testable import CodableXPC
+import XPCDispatchDataBridge
 
 /// `Data` is encoded by whichever of two copies is cheaper. Which one runs must
 /// not be observable in the result.

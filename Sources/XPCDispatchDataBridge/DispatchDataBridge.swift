@@ -11,6 +11,10 @@ private extension NSData {
 
 /// Builds the `xpc_data` for a `Data`, taking the cheaper of two copies.
 ///
+/// Its own target because two coders need it and neither should depend on the
+/// other: `CodableXPC` builds a native object graph, `XPCOverlayCoder`
+/// reproduces Apple's wire formats, and they are deliberately independent.
+///
 /// `xpc_data_create` copies the bytes itself. Handing libxpc a `dispatch_data_t`
 /// instead lets it take ownership of a buffer that was copied by dispatch, which
 /// is cheaper at size — measured on this machine, per call:
@@ -62,7 +66,7 @@ private extension NSData {
 /// goes away, ``isAvailable`` turns false and every call takes the plain path.
 /// The result is the same either way — the tests assert the two paths produce
 /// identical bytes — so losing this costs speed and nothing else.
-enum DispatchDataBridge {
+public enum DispatchDataBridge {
 
     private static let canReplaceSelector =
         NSSelectorFromString("_canReplaceWithDispatchDataForXPCCoder")
@@ -73,20 +77,20 @@ enum DispatchDataBridge {
     /// `@NSManaged` emits the call without checking anything, so a missing
     /// selector would be an unrecognised-selector crash rather than a fallback.
     /// This is what makes it a fallback.
-    static let isAvailable: Bool = {
+    public static let isAvailable: Bool = {
         let probe = NSData()
         return probe.responds(to: canReplaceSelector) && probe.responds(to: createSelector)
     }()
 
     /// The `xpc_data` for `data`, by whichever route is cheaper.
-    static func xpcData(for data: Data) -> xpc_object_t {
+    public static func xpcData(for data: Data) -> xpc_object_t {
         if let substituted = substituting(data) { return substituted }
         return data.withUnsafeBytes { xpc_data_create($0.baseAddress, $0.count) }
     }
 
     /// Internal rather than private so a test can observe which path ran, instead
     /// of inferring it from a timing.
-    static func substituting(_ data: Data) -> xpc_object_t? {
+    public static func substituting(_ data: Data) -> xpc_object_t? {
         guard isAvailable else { return nil }
         let bridged = data as NSData
         guard bridged._canReplaceWithDispatchDataForXPCCoder() else { return nil }
