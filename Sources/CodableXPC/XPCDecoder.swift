@@ -233,7 +233,16 @@ extension _XPCDecoderImp: SingleValueDecodingContainer {
         switch xpcType {
         case XPC_TYPE_DOUBLE:
             let rawValue = xpc_double_get_value(ref)
-            return rawValue.isSignalingNaN ? T.signalingNaN : .init(rawValue)
+            if rawValue.isSignalingNaN { return T.signalingNaN }
+            let converted = T(rawValue)
+            // Rounding is expected -- 0.1 is not representable as a Float either.
+            // Turning a finite number into an infinity is not rounding.
+            guard rawValue.isFinite == converted.isFinite else {
+                throw DecodingError.typeMismatch(type, DecodingError.Context(
+                    codingPath: codingPath,
+                    debugDescription: "\(rawValue) overflows \(type)"))
+            }
+            return converted
         case XPC_TYPE_INT64:
             let rawValue = xpc_int64_get_value(ref)
             if let realValue = T.init(exactly: rawValue) {
@@ -412,7 +421,14 @@ private struct _XPCUnKeyedDecodingContainer: UnkeyedDecodingContainer {
         switch xpcType {
         case XPC_TYPE_DOUBLE:
             let double = xpc_double_get_value(object)
-            value = double.isSignalingNaN ? T.signalingNaN : T.init(double)
+            if double.isSignalingNaN { value = T.signalingNaN } else {
+                let converted = T(double)
+                guard double.isFinite == converted.isFinite else {
+                    throw DecodingError.typeMismatch(type, DecodingError.Context(
+                        codingPath: currentPath, debugDescription: "\(double) overflows \(type)"))
+                }
+                value = converted
+            }
         case XPC_TYPE_INT64:
             let integer = xpc_int64_get_value(object)
             if let float = T(exactly: integer) {
@@ -670,7 +686,12 @@ private struct _XPCKeyedDecodingContainer<Key:CodingKey>: KeyedDecodingContainer
         switch xpcType {
         case XPC_TYPE_DOUBLE:
             let rawValue = xpc_double_get_value(object)
-            return .init(rawValue)
+            let converted = T(rawValue)
+            guard rawValue.isFinite == converted.isFinite else {
+                throw DecodingError.typeMismatch(type, DecodingError.Context(
+                    codingPath: currentPath, debugDescription: "\(rawValue) overflows \(type)"))
+            }
+            return converted
         case XPC_TYPE_UINT64:
             let rawValue = xpc_uint64_get_value(object)
             if let realValue = T.init(exactly: rawValue) {
