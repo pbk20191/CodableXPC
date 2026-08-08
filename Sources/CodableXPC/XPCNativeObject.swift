@@ -26,6 +26,25 @@ import XPC
 /// hidden behind a protocol conformance. Spelling `XPCNativeObject` in the type
 /// is the author saying they know.
 ///
+/// ## It is also the zero-copy route for a large payload
+///
+/// A `Data` field is copied, which is what a value type should do:
+/// `xpc_data_create` takes a pointer and a length, so it duplicates the bytes —
+/// 12 ms for 64 MiB, and twice the memory. `xpc_data_create_with_dispatch_data`
+/// takes ownership of the buffer instead and copies nothing.
+///
+///     let blob = xpc_data_create_with_dispatch_data(myDispatchData)
+///     let value = Payload(name: "big", blob: XPCNativeObject(blob))
+///
+/// Measured end to end through this coder: the pages that go in are the pages
+/// that come out.
+///
+/// This module will not make that object for you from a `Data`. Turning one into
+/// a `dispatch_data_t` means either copying — which is what you were avoiding —
+/// or promising the storage outlives the call, and `Data` makes no such promise;
+/// a small one lives inline in the struct. Whoever holds the `DispatchData`
+/// knows its lifetime, so the object is theirs to build.
+///
 /// ## Outside this coder it refuses
 ///
 /// `XPCEncoder` recognises the type and never calls ``encode(to:)``. Any other
