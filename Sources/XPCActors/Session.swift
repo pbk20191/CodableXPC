@@ -21,6 +21,17 @@ final class Session<Thunk>: SessionCoding, @unchecked Sendable {
     /// be told from another in a log.
     let id = ID64.next()
 
+    /// The system this session belongs to, by id.
+    ///
+    /// Apple's `Session` stores the `XPCSystem` itself (`+0x10`, a `let`, and the first
+    /// field), and `resolve` compares that pointer. We store its id instead -- see
+    /// ``SessionCoding/systemID`` for why, and for why this becomes `system.id` once the
+    /// session is handed a system rather than a registry.
+    ///
+    /// Nothing about the wire depends on it: it is never transmitted, and it exists so a
+    /// `.remote` id can be refused by a system that does not own the session it names.
+    let systemID: ID64
+
     /// Where a local id is turned into the instance behind it. Held strongly: the
     /// registry's entries are weak, so nothing else keeps it alive.
     private let registry: ActorRegistry<Thunk>
@@ -71,8 +82,9 @@ final class Session<Thunk>: SessionCoding, @unchecked Sendable {
 
     private var isCancelled = false
 
-    init(registry: ActorRegistry<Thunk>) {
+    init(registry: ActorRegistry<Thunk>, systemID: ID64) {
         self.registry = registry
+        self.systemID = systemID
     }
 
     /// How many actors this session currently exports.
@@ -164,6 +176,36 @@ final class Session<Thunk>: SessionCoding, @unchecked Sendable {
     /// in. It is simply not something the *decode* path may consult.
     func remoteID(for key: SharedActorKey) -> ActorID {
         ActorID(raw: .remote(.init(session: self, key: key)))
+    }
+
+    // MARK: - Inbound resolution
+
+    /// The actor a key the peer sent us names, or `nil`.
+    ///
+    /// **Inbound invocation targets resolve here, not through `ActorRegistry`**, which is
+    /// Apple's arrangement (`Session.resolveSharedActor(at:)`, read by
+    /// `handleReceivedRequest`'s `closure #2` and by `executeDirectInvocation` -- the
+    /// only two readers of `sharedActors`). It is also the only arrangement that makes
+    /// this table's strong hold mean anything: the registry is weak and drops an actor on
+    /// `resignID`, so resolving through it would make an actor unreachable to a peer that
+    /// holds its key *while this session is still keeping that actor alive*. We would be
+    /// paying for the strong hold and not getting it.
+    ///
+    /// The consequence, stated plainly because it is a real one: an actor that has
+    /// resigned can still be called by a peer that already holds its key, until the
+    /// session is cancelled. In practice that window is narrow -- the distributed actor
+    /// runtime resigns an id from `deinit`, and `deinit` cannot run while this table
+    /// holds the instance -- so it is reached by an explicit `resignID`, not by an actor
+    /// going away. `cancellationCompleted()` is what ends it.
+    ///
+    /// Scope is unchanged either way: only actors *this* session exported are reachable,
+    /// because only they have keys in this table.
+    ///
+    /// `AnyObject` rather than Apple's `any DistributedActor` because that is what the
+    /// table holds; this file does not import `Distributed`, and the caller that will
+    /// need the stronger type is the one that also needs the thunk.
+    func resolveSharedActor(at key: SharedActorKey) -> AnyObject? {
+        lock.withLock { byKey[key]?.instance }
     }
 
     // MARK: - Cancellation
