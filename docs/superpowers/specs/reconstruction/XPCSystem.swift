@@ -376,9 +376,16 @@ public class XPCSystem {
 ///       `InvocationEncoder = XPCSystem.InvocationEncoder`
 ///       `InvocationDecoder = XPCSystem.InvocationDecoder`   (not EncodedInvocationDecoder)
 ///       `ResultHandler = XPCSystem.ResultHandler`
-///       `SerializationRequirement = Codable`        [INFER] from `remoteCall`'s generic
-///           requirements `Res: Decodable, Res: Encodable` -- there is no witness symbol for a
-///           `SerializationRequirement` associated type because it is a same-type witness.
+///       `SerializationRequirement = any Decodable & Encodable`   [WITNESS] read, not inferred.
+///           A previous revision marked this [INFER] on the stated basis that "there is no witness
+///           symbol for a `SerializationRequirement` associated type because it is a same-type
+///           witness." There is one: `DistributedActorSystem`'s protocol descriptor has
+///           `NumRequirements=17`, `req[8]` is an `AssociatedTypeAccess` requirement for
+///           `SerializationRequirement`, and XPCSystem's witness-table slot for it holds the
+///           mangled name `Se_SEp` = `any Decodable & Encodable`. `METHOD.md` already records
+///           that mangling, so this was answerable with a documented tool. Spelled `Codable`
+///           below only because that is the Swift spelling of the same constraint -- note every
+///           *method* mangling in this file spells it as the two separate requirements.
 ///
 /// Note the asymmetry, which is Apple's and is read verbatim off the manglings: `resolve` and
 /// `remoteCall` use **typed throws**, `remoteCallVoid` uses plain `throws`.
@@ -452,7 +459,17 @@ extension XPCSystem: DistributedActorSystem {
 
     /// [SYM] `XPCSystem.invokeHandlerOnReturn(handler: XPCSystem.ResultHandler,
     ///       resultBuffer: Swift.UnsafeRawPointer, metatype: Any.Type) async throws -> ()`.
-    /// This is the eighth `DistributedActorSystem` witness. Its body was not disassembled.
+    /// This is the eighth `DistributedActorSystem` witness — and "eighth" is now a real
+    /// exhaustiveness result rather than a symbol count: `DistributedActorSystem`'s protocol
+    /// descriptor has `NumRequirements=17`, of which exactly **8** are method requirements, none
+    /// defaulted, and XPCSystem's witness table fills all 17 slots.
+    ///
+    /// Body resolved — by the Invocation agent, not here; see
+    /// `reconstruction/Invocation.swift`. `0x2ad51eef0` loads the protocol descriptors for
+    /// `Decodable` and `Encodable` and calls `dynamic_cast_existential_2_unconditional`
+    /// (`0x2ad51fd70`, two `swift_conformsToProtocol2` then `brk #1`) with **no branch testing the
+    /// result**, so a non-`Codable` return type **traps the callee here**. The continuation then
+    /// does `resultBuffer.load(as: A.self)` and calls `ResultHandler` vtable slot `0x80`.
     public func invokeHandlerOnReturn(
         handler: ResultHandler,
         resultBuffer: UnsafeRawPointer,
@@ -1061,11 +1078,6 @@ extension XPCSystem {
 //   is "hash the session's `Internal.Identifiable.id` and the key", and that is exactly the kind
 //   of guess this pass exists to avoid. Next step: disassemble both (216 and 168 bytes) and look
 //   for the `Identifiable.id.getter` witness dispatch. Not peer-observable either way.
-//
-// UNRESOLVED: `XPCSystem.invokeHandlerOnReturn(handler:resultBuffer:metatype:)` -- signature read
-//   from the symbol, body not disassembled. It is the bridge from the Swift runtime's raw result
-//   buffer to `ResultHandler`, so it belongs to whoever reconstructs `ResultHandler`. Next step:
-//   dump it and follow the `metatype`-driven dispatch into `ResultHandler.onReturn`.
 //
 // UNRESOLVED: the exact text `RawActorID.debugDescription` /
 //   `Local.debugDescription` / `Remote.debugDescription` produce. All three are

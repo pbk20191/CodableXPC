@@ -653,7 +653,13 @@ extension XPCSystem {
         /// mutated `argumentDecoder`.
         internal var currentArgumentIndex: Int = 0
 
-        internal let errorType: Any.Type?
+        /// The one exported member of this type — `property descriptor for …errorType`
+        /// (`0x2ad522c28`) and a `T`-linkage getter at `0x2ad500b04`, which is
+        /// `ldr x0,[x20,#0x20]; ret`, i.e. the stored property's getter rather than a separate
+        /// computed one. A previous revision declared it twice, once as this `internal let` and
+        /// once as a `public var { get }` built from that getter address; the duplicate would not
+        /// compile and hid the asymmetry that this is the only field the symbol table exports.
+        public let errorType: Any.Type?
         internal let returnType: Any.Type?
 
         /// Resolved: `0x2ad500b0c`, 16 bytes:
@@ -672,8 +678,8 @@ extension XPCSystem {
             returnType: Any.Type?
         )
 
-        /// Resolved: `0x2ad500b04`, 8 bytes — `ldr x0, [x20, #0x20]; ret`.
-        public var errorType: Any.Type? { get }
+        // `errorType` is declared above as the stored `public let` it is; `0x2ad500b04` is that
+        // property's getter, not a separate member.
 
         // --- DistributedTargetInvocationDecoder conformance -------------------------------
         // Conformance descriptor `0x2ad522b90`; witnesses 0x2ad500e1c, 0x2ad500e34,
@@ -702,12 +708,19 @@ extension XPCSystem {
         /// `swift_dynamicCast`'s behaviour turns on its flag argument, so the flag register was
         /// read: `mov w4, #6` at +0x100, and the code then tests the returned `Bool`
         /// (`tbz w0, #0, 0x2ad500d4c` at +0x108) and branches to the throw. The unconditional
-        /// form would neither return a testable `Bool` nor need that branch. A b/bl scan for
-        /// `swift_dynamicCast` finds exactly two call sites in the image: this one and one in
-        /// `Session.(executeDirectInvocation)`'s `(3) await resume partial function` at
-        /// `0x2ad51aa24`. So within this subsystem there is exactly one argument cast, and it is
-        /// the throwing kind — in contrast to the result-metatype cast in
-        /// `invokeHandlerOnReturn`, which traps (see the cross-references below).
+        /// form would neither return a testable `Bool` nor need that branch.
+        ///
+        /// Within this subsystem this is the only argument cast, and it is the throwing kind — in
+        /// contrast to the result-metatype cast in `invokeHandlerOnReturn`, which traps (see the
+        /// cross-references below).
+        ///
+        /// A previous revision added "a b/bl scan finds exactly two call sites in the image."
+        /// **That was false — there are twelve**, and the sibling `XPCSystem.swift` names three of
+        /// the ten it claimed did not exist. The subsystem-scoped claim above is what the evidence
+        /// carries; the image-wide count was an exhaustiveness assertion without the scan to
+        /// establish it, which is the defect `METHOD.md` exists to catch. Also note the rule: the
+        /// trapping bit is `0x1`, so 7 traps and 6 does not; `DynamicCastFlags` 4 is
+        /// `TakeOnSuccess` and no site in this image passes it.
         public mutating func decodeNextArgument<Argument: Decodable & Encodable>() throws -> Argument
 
         /// Resolved: `0x2ad500e0c`, 8 bytes — `ldr x0, [x20, #0x20]; ret`.
