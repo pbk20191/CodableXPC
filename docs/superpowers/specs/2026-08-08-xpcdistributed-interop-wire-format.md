@@ -78,16 +78,109 @@ ones are inline small strings, which is precisely what synthesized `stringValue`
 
 ## Envelope
 
-`Transport.Packet` is `{ header, payload }`; `Packet.Payload` wraps a single field, `dictionary`
-— and that dictionary has exactly one entry, `"payload"`, holding an overlay-encoded message.
-See *What actually carries an XPCDistributed body* below; that section is load-bearing for the
-transport work and supersedes any reading of this one that assumes native xpc structures.
-
-`Packet.Header` is a multi-payload enum:
+`Transport.Packet` is `{ header, payload }`, and **both halves are native entries of one xpc
+dictionary** — the message handed to `XPCSession.send(message:)`. The header is not `Codable`,
+does not go through the overlay byte stream, and is not nested under anything. The whole wire
+message is:
 
 ```
-request | response | notification
+xpc dictionary
+  "headerCategory" : xpc_uint64    0 = notification, 1 = request, 2 = response
+  "headerID"       : xpc_uint64    the ID64 -- present for request and response, ABSENT for notification
+  "payload"        : the overlay-encoded body   (see "What actually carries an XPCDistributed body")
 ```
+
+Every claim in that table is resolved from
+`Packet.(Header).write(to: inout XPC.XPCDictionary)` (`0x2ad4e134c`, 220 bytes) and its exact
+mirror `Packet.(Header).init(from: XPC.XPCDictionary)` (`0x2ad4e71c0`). `write(to:)` is a
+hand-written writer, not a `Codable` conformance: it makes two calls to
+`XPC.XPCDictionary.subscript.setter<A: UnsignedInteger>(String)`, one with the `UInt8` witness
+table and one with the `UInt64` witness table, and nothing else. Both key names are Swift small
+strings built from `movz`/`movk` immediates — which is why neither appears in any string table —
+and decoded from the immediates at their two call sites they are `"headerCategory"` (14 bytes,
+count byte `0xEE`) and `"headerID"` (8 bytes, count byte `0xE8`).
+
+`Packet.Header` is a multi-payload enum. Its cases, and the associated value of each, are read
+from the reflection field descriptor (`0x2ad52a334`), resolving each case's symbolic type
+reference through its indirect slot:
+
+```
+request(ID64) | response(ID64) | notification
+```
+
+`notification` has no payload record at all; both of the others point at
+`nominal type descriptor for XPCDistributed.ID64`. The enum tag is *not* the wire value —
+`write(to:)` renumbers:
+
+| case | enum tag | `headerCategory` | `headerID` |
+|---|---|---|---|
+| `request(ID64)`  | 0 | **1** | the id |
+| `response(ID64)` | 1 | **2** | the id |
+| `notification`   | 2 | **0** | not written |
+
+The tag-to-case assignment is resolved from four independent sites, not inferred from
+declaration order: `sendNotification(withPayload:)` (`0x2ad4e1000`) writes tag 2 with a zero
+payload word; the reply closure inside `handleReceivedPacket` (`0x2ad4dd1fc`) writes tag 1 with
+the captured id; the `perform` closure inside `sendRequest(id:payload:)` (`0x2ad4e0140`) writes
+tag 0 with the `id` argument; and on receive, `handleReceivedPacket` (`0x2ad4db994`) branches
+`tag == 0 -> inboundSession.handleReceivedRequest(_:replyUsing:)`,
+`tag == 1 -> requestManager`, `tag == 2 -> inboundSession.handleReceivedNotification(_:)`.
+
+**`Packet.rawValue.getter` does encode.** An earlier reading of it as "returns a stored
+dictionary" was wrong. It copies `payload.dictionary` into the return slot and then *tail-calls*
+`Header.write(to:)` on that copy (`0x2ad4dc824: b 0x2ad4e134c`). `XPCRawTransport.send(packet:)`
+(`0x2ad4db0c0`) does the same thing inline before calling `XPCSession.send(message:)`.
+`Packet.init(rawValue:)` is the inverse: `Header.init(from:)`, then
+`XPCDictionary.contains(key: "payload")`, and it returns nil if either fails.
+
+**The decoder is strict, and every rule is a rejection, not a default.** From
+`Header.init(from:)` and `Packet.init(rawValue:)`, in order: a missing `headerCategory` rejects
+the packet; `headerCategory == 0` yields `notification` and `headerID` is never even read;
+`headerCategory` of 1 or 2 requires `headerID`, and a missing one rejects the packet; any
+`headerCategory >= 3` rejects the packet; and all three kinds require `payload` to be present.
+Rejection means `Packet.init(rawValue:)` returns nil and the message is dropped.
+
+Three facts about the xpc encoding were **measured** rather than read, by compiling against the
+`XPC` overlay on this machine (the same `XPCDictionary` API the binary calls):
+
+- an `UnsignedInteger` written through that subscript becomes `xpc_uint64`, for `UInt8` as well
+  as for `UInt64` — so `headerCategory` is an `xpc_uint64` holding 0, 1, or 2, not a byte;
+- assigning `nil` leaves the key **absent**; it does not write a null. A notification therefore
+  has two top-level entries, a request or response three;
+- both getters the decoder uses accept `xpc_int64` as well as `xpc_uint64`, and return nil on
+  an out-of-range value. A peer would tolerate `xpc_int64` here, but we emit `xpc_uint64`.
+
+**Correlation lives in the envelope, not in XPC's message semantics.** The candidate reading that
+a request is an XPC message sent with a reply expectation and a response is that reply is
+**false**: `XPCRawTransport.send(packet:)` sends all three kinds through the one-way
+`XPCSession.send(message:) throws -> ()`, and `sendPacketWithProperQoS` (`0x2ad4dd5f0`) touches
+no dictionary and no key at all — it only picks a QoS and forwards. What matches a response to
+its request is `headerID`: the response branch of `handleReceivedPacket` hands the header's
+`ID64` to `Transport.requestManager` (a `RequestManager<ID64, Result<Packet.Payload,
+TransportError>>`, field offset `0x68`), which does a
+`__RawDictionaryStorage.find<ID64>` and completes that pending request with `.success(payload)`;
+an unmatched id is silently dropped. A reply re-uses the id it received: the reply closure
+stores the captured request id into the header it builds.
+
+So there are **two** id-like values in flight, and this document's *Request* section describes
+the other one. `RemoteInvocationRequest.id` is generated by `Session.idGenerator` — an inlined
+`ID64.Generator.next()`, a `cas` loop on `Session+0x20` that traps on overflow, so ids are
+monotonic from 1 — and that same value is what `RemoteNotification.invocationCancelled(id:)`
+later refers to. Whether the envelope's `headerID` carries that *same* number is **inference,
+not resolved**: `Transport.sendRequest(id:)` takes its id from the caller, and I did not follow
+the closure capture chain from `Session.sendInvocation` to the call. The inference rests on an
+exhaustive `cas`-instruction scan of `__text`, which finds exactly one `ID64.Generator.next()`
+inlining on the send path (the one above) and none against `Transport.(idGenerator)`
+(field offset `0x70`, apparently dead in this build); `ID64.Generator.next()` also has no `BL`
+callers anywhere. If only one id is ever minted per outgoing call, envelope and body must carry
+it twice. **For interop it does not matter**: a peer matches on `headerID` alone, so the two
+merely have to be internally consistent on our side.
+
+Nothing here is `Codable`, so `verify-containers.py` cannot speak to it. What resolved it was
+disassembling the two `Header` methods and decoding their `movz`/`movk` key literals; a probe
+that does that — dump a function live, annotate `BL` targets through `__auth_stubs`, and decode
+small strings per call site — would be worth keeping next to `verify-containers.py`, and is the
+tool to reach for the next time a key is suspected to be inline rather than in `__cstring`.
 
 **There is no version field and no handshake.** `hello` and `helloAck` do not exist in
 `XPCDistributed`. Our Phase A `ProtocolVersion`, `HelloBody`, `HelloAckBody`, and the negotiation
@@ -383,8 +476,9 @@ Failure strings: `"Failed to decode invocation response (error: "`,
 
 The field is **`id`**, not `requestSeq`. The previous design renamed it deliberately to keep the
 envelope's sequence distinguishable from the request being referred to; that rename is not
-interoperable. Apple has no envelope `seq` to collide with, because correlation lives in the
-request body's `id`.
+interoperable. Apple does have an envelope-level id — `headerID`, see *Envelope* — but a
+notification packet carries none, so there is nothing here for this `id` to collide with: it
+always names the earlier request being referred to.
 
 ## SharedActorKey — an unkeyed pair, not synthesized coding
 
@@ -513,7 +607,12 @@ misread shows up as the controls coming out wrong rather than as a silently plau
 
 All three remaining unknowns are resolved, from the extracted macOS 27 binary:
 `SharedActorKey`'s container and payloads, `protocolStub`'s absent-vs-null, and the request
-encoder's apparent conditional. Nothing in this document is now marked unverified.
+encoder's apparent conditional. The packet header, which this document previously did not
+account for at all, is resolved too — see *Envelope*.
+
+One thing is now marked unresolved, and it is deliberately not peer-observable: whether the
+envelope's `headerID` and the request body's `id` are the same number. See *Envelope* for what
+the inference rests on and why interop does not turn on it.
 
 The goal is **our own protocol matched to Apple's format**, not live interop with Apple's
 services — so the entitlement wall (`"Peer failed XPCSystem's entitlement check"`, enforced by
