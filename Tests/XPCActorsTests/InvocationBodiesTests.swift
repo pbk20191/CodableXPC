@@ -10,7 +10,7 @@ final class InvocationBodiesTests: XCTestCase {
 
     func testTheRequestBodyIsPinned() throws {
         let body = RequestBody(
-            actor: .name("primary"),
+            actor: .exportedRawValue("primary"),
             target: "$s4Test7GreeterC5greet4nameSSSS_tYaKFTE",
             generics: ["Si"],
             args: [7 as Int, "hi" as String],
@@ -20,7 +20,7 @@ final class InvocationBodiesTests: XCTestCase {
         )
         XCTAssertEqual(
             normalizedDescription(try XPCEncoder().encode(body)),
-            "{actor=dict{kind=uint64(1),name=string(primary)},"
+            "{actor=[uint64(1),string(primary)],"
             + "args=[int64(7),string(hi)],"
             + "basePriority=uint64(25),"
             + "errorType=string(Se),"
@@ -31,26 +31,27 @@ final class InvocationBodiesTests: XCTestCase {
     }
 
     func testAbsentOptionalsAreOmittedEntirely() throws {
-        let body = RequestBody(actor: .dynamic(3), target: "t", generics: [],
+        let body = RequestBody(actor: .dynamic(ID64(rawValue: 3)), target: "t", generics: [],
                                args: [], errorType: nil, returnType: nil, basePriority: nil)
         let object = try XPCEncoder().encode(body)
         XCTAssertNil(xpc_dictionary_get_value(object, "errorType"))
         XCTAssertNil(xpc_dictionary_get_value(object, "returnType"))
         XCTAssertNil(xpc_dictionary_get_value(object, "basePriority"))
         XCTAssertEqual(normalizedDescription(object),
-                       "{actor=dict{id=uint64(3),kind=uint64(2)},args=[],generics=[],target=string(t)}")
+                       "{actor=[uint64(2),dict{value=uint64(3)}],args=[],generics=[],target=string(t)}")
     }
 
     // MARK: inbound request keeps the argument container unconsumed
 
     func testAnInboundRequestReadsTheHeaderAndLeavesTheArgumentsAlone() throws {
-        let body = RequestBody(actor: .type("G"), target: "t", generics: ["Si"],
+        let body = RequestBody(actor: .exported(SwiftType(mangledTypeName: "G")), target: "t",
+                               generics: ["Si"],
                                args: [1 as Int, "two" as String], errorType: "Se",
                                returnType: "SS", basePriority: nil)
         let object = try XPCEncoder().encode(body)
 
         var inbound = try XPCDecoder().decode(InboundRequest.self, from: object)
-        XCTAssertEqual(inbound.actor, .type("G"))
+        XCTAssertEqual(inbound.actor, .exported(SwiftType(mangledTypeName: "G")))
         XCTAssertEqual(inbound.target, "t")
         XCTAssertEqual(inbound.generics, ["Si"])
         XCTAssertEqual(inbound.errorType, "Se")

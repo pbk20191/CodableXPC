@@ -15,7 +15,7 @@ private final class StubSession: SessionCoding, @unchecked Sendable {
         guard !refuseToShare else { return nil }
         shared.append(local)
         defer { nextDynamic += 1 }
-        return .dynamic(nextDynamic)
+        return .dynamic(ID64(rawValue: nextDynamic))
     }
 
     func remoteID(for key: SharedActorKey) -> ActorID {
@@ -48,7 +48,7 @@ final class ActorIDTests: XCTestCase {
 
         let object = try encoder.encode(ActorID(raw: .local(local)))
 
-        XCTAssertEqual(normalizedDescription(object), "{id=uint64(1),kind=uint64(2)}")
+        XCTAssertEqual(normalizedDescription(object), "[uint64(2),dict{value=uint64(1)}]")
         XCTAssertEqual(session.shared, [local])
     }
 
@@ -68,12 +68,12 @@ final class ActorIDTests: XCTestCase {
 
     func testARemoteIDEncodesItsOwnKey() throws {
         let session = StubSession()
-        let id = session.remoteID(for: .name("primary"))
+        let id = session.remoteID(for: .exportedRawValue("primary"))
         var encoder = XPCEncoder()
         encoder.userInfo = userInfo(session)
 
         XCTAssertEqual(normalizedDescription(try encoder.encode(id)),
-                       "{kind=uint64(1),name=string(primary)}")
+                       "[uint64(1),string(primary)]")
         XCTAssertTrue(session.shared.isEmpty, "a remote id has nothing to share")
     }
 
@@ -81,18 +81,18 @@ final class ActorIDTests: XCTestCase {
 
     func testDecodingProducesARemoteIDBoundToTheDecodingSession() throws {
         let session = StubSession()
-        let object = try XPCEncoder().encode(SharedActorKey.name("primary"))
+        let object = try XPCEncoder().encode(SharedActorKey.exportedRawValue("primary"))
         var decoder = XPCDecoder()
         decoder.userInfo = userInfo(session)
 
         let id = try decoder.decode(ActorID.self, from: object)
         guard case .remote(let remote) = id.raw else { return XCTFail("expected a remote id") }
-        XCTAssertEqual(remote.key, .name("primary"))
+        XCTAssertEqual(remote.key, .exportedRawValue("primary"))
         XCTAssertTrue(remote.session === session)
     }
 
     func testDecodingWithNoSessionThrows() throws {
-        let object = try XPCEncoder().encode(SharedActorKey.name("primary"))
+        let object = try XPCEncoder().encode(SharedActorKey.exportedRawValue("primary"))
         XCTAssertThrowsError(try XPCDecoder().decode(ActorID.self, from: object))
     }
 
@@ -109,14 +109,14 @@ final class ActorIDTests: XCTestCase {
 
     func testRemoteIdentityComparesTheSessionByIdentity() {
         let a = StubSession(), b = StubSession()
-        XCTAssertEqual(a.remoteID(for: .name("x")), a.remoteID(for: .name("x")))
-        XCTAssertNotEqual(a.remoteID(for: .name("x")), b.remoteID(for: .name("x")))
-        XCTAssertNotEqual(a.remoteID(for: .name("x")), a.remoteID(for: .name("y")))
+        XCTAssertEqual(a.remoteID(for: .exportedRawValue("x")), a.remoteID(for: .exportedRawValue("x")))
+        XCTAssertNotEqual(a.remoteID(for: .exportedRawValue("x")), b.remoteID(for: .exportedRawValue("x")))
+        XCTAssertNotEqual(a.remoteID(for: .exportedRawValue("x")), a.remoteID(for: .exportedRawValue("y")))
     }
 
     func testLocalAndRemoteAreNeverEqual() {
         let session = StubSession()
         let local = ActorID(raw: .local(.init(systemID: ID64(rawValue: 1), instanceID: ID64(rawValue: 2))))
-        XCTAssertNotEqual(local, session.remoteID(for: .dynamic(1)))
+        XCTAssertNotEqual(local, session.remoteID(for: .dynamic(ID64(rawValue: 1))))
     }
 }

@@ -11,49 +11,83 @@ final class SharedActorKeyTests: XCTestCase {
     }
 
     // MARK: tier 1 — golden fixtures
+    //
+    // Apple's shipping `SharedActorKey.encode(to:)` writes an *unkeyed* two-element
+    // container -- `[ <WireCode as UInt8>, <payload> ]` -- never a keyed dictionary.
+    // These pin that shape byte for byte; see the wire-format spec's "SharedActorKey --
+    // an unkeyed pair, not synthesized coding".
 
     func testTheEncodedFormIsPinned() throws {
-        XCTAssertEqual(try encoded(.type("Sample")), "{kind=uint64(0),type=string(Sample)}")
-        XCTAssertEqual(try encoded(.name("primary")), "{kind=uint64(1),name=string(primary)}")
-        XCTAssertEqual(try encoded(.dynamic(7)), "{id=uint64(7),kind=uint64(2)}")
+        XCTAssertEqual(
+            try encoded(.exported(SwiftType(mangledTypeName: "Sample"))),
+            "[uint64(0),dict{mangledTypeName=string(Sample)}]")
+        XCTAssertEqual(
+            try encoded(.exportedRawValue("primary")),
+            "[uint64(1),string(primary)]")
+        XCTAssertEqual(
+            try encoded(.dynamic(ID64(rawValue: 7))),
+            "[uint64(2),dict{value=uint64(7)}]")
     }
 
-    func testEachKindWritesOnlyItsOwnPayloadKey() throws {
-        let object = try XPCEncoder().encode(SharedActorKey.type("Sample"))
-        XCTAssertNil(xpc_dictionary_get_value(object, "name"))
-        XCTAssertNil(xpc_dictionary_get_value(object, "id"))
+    func testEachCaseEncodesExactlyTwoElements() throws {
+        for key in [
+            SharedActorKey.exported(SwiftType(mangledTypeName: "Sample")),
+            .exportedRawValue("primary"),
+            .dynamic(ID64(rawValue: 7)),
+        ] {
+            let object = try XPCEncoder().encode(key)
+            XCTAssertEqual(xpc_get_type(object), XPC_TYPE_ARRAY)
+            XCTAssertEqual(xpc_array_get_count(object), 2)
+        }
     }
 
     // MARK: round trip
 
     func testEveryKindRoundTrips() throws {
-        for key in [SharedActorKey.type("A"), .name("b"), .dynamic(.max)] {
+        for key in [
+            SharedActorKey.exported(SwiftType(mangledTypeName: "A")),
+            .exportedRawValue("b"),
+            .dynamic(ID64(rawValue: .max)),
+        ] {
             let object = try XPCEncoder().encode(key)
             XCTAssertEqual(try XPCDecoder().decode(SharedActorKey.self, from: object), key)
         }
     }
 
     // MARK: rejection
+    //
+    // The container is unkeyed, so there is no payload key for a decoder to fall back
+    // on -- these all still have to fail rather than guess.
 
-    func testAnUnknownKindIsRejected() throws {
-        let object = xpc_dictionary_create(nil, nil, 0)
-        xpc_dictionary_set_uint64(object, "kind", 99)
-        xpc_dictionary_set_string(object, "type", "Sample")
+    func testAnUnknownWireCodeIsRejected() throws {
+        let object = xpc_array_create(nil, 0)
+        xpc_array_append_value(object, xpc_uint64_create(99))
+        xpc_array_append_value(object, xpc_string_create("Sample"))
         XCTAssertThrowsError(try XPCDecoder().decode(SharedActorKey.self, from: object))
     }
 
-    func testAKindWithoutItsPayloadIsRejected() throws {
-        let object = xpc_dictionary_create(nil, nil, 0)
-        xpc_dictionary_set_uint64(object, "kind", 0)
+    func testATruncatedArrayIsRejected() throws {
+        // Just the wire code, no payload element behind it.
+        let object = xpc_array_create(nil, 0)
+        xpc_array_append_value(object, xpc_uint64_create(0))
         XCTAssertThrowsError(try XPCDecoder().decode(SharedActorKey.self, from: object))
     }
 
-    /// The discriminator decides, not the payload. A `kind` of 1 with only a `type`
-    /// key present must fail rather than quietly decoding as `.type`.
-    func testTheDiscriminatorIsAuthoritative() throws {
-        let object = xpc_dictionary_create(nil, nil, 0)
-        xpc_dictionary_set_uint64(object, "kind", 1)
-        xpc_dictionary_set_string(object, "type", "Sample")
+    func testAPayloadOfTheWrongTypeIsRejected() throws {
+        // Wire code 1 (`exportedRawValue`) promises a bare String payload; give it a
+        // uint64 instead of guessing which case was intended.
+        let object = xpc_array_create(nil, 0)
+        xpc_array_append_value(object, xpc_uint64_create(1))
+        xpc_array_append_value(object, xpc_uint64_create(42))
+        XCTAssertThrowsError(try XPCDecoder().decode(SharedActorKey.self, from: object))
+    }
+
+    func testADynamicPayloadThatIsNotAnID64DictionaryIsRejected() throws {
+        // Wire code 2 (`dynamic`) promises an ID64, `{ "value": <UInt64> }`; a bare
+        // uint64 (the old wire shape) must not decode as one.
+        let object = xpc_array_create(nil, 0)
+        xpc_array_append_value(object, xpc_uint64_create(2))
+        xpc_array_append_value(object, xpc_uint64_create(7))
         XCTAssertThrowsError(try XPCDecoder().decode(SharedActorKey.self, from: object))
     }
 }

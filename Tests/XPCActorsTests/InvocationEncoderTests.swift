@@ -18,8 +18,8 @@ final class InvocationEncoderTests: XCTestCase {
         try encoder.recordReturnType(String.self)
         try encoder.doneRecording()
 
-        let body = encoder.makeRequestBody(actor: .name("primary"), target: "t", basePriority: nil)
-        XCTAssertEqual(body.actor, .name("primary"))
+        let body = encoder.makeRequestBody(actor: .exportedRawValue("primary"), target: "t", basePriority: nil)
+        XCTAssertEqual(body.actor, .exportedRawValue("primary"))
         XCTAssertEqual(body.target, "t")
         XCTAssertEqual(body.generics, [try XCTUnwrap(TypeName.mangled(for: Int.self))])
         XCTAssertEqual(body.args.count, 2)
@@ -34,7 +34,7 @@ final class InvocationEncoderTests: XCTestCase {
         try encoder.recordArgument(RemoteCallArgument(label: "greeting", name: "g", value: "hi"))
         try encoder.doneRecording()
         let rendered = normalizedDescription(
-            try XPCEncoder().encode(encoder.makeRequestBody(actor: .dynamic(1), target: "t",
+            try XPCEncoder().encode(encoder.makeRequestBody(actor: .dynamic(ID64(rawValue: 1)), target: "t",
                                                             basePriority: nil)))
         XCTAssertFalse(rendered.contains("greeting"))
         XCTAssertTrue(rendered.contains("args=[string(hi)]"))
@@ -46,7 +46,7 @@ final class InvocationEncoderTests: XCTestCase {
             try encoder.recordArgument(RemoteCallArgument(label: nil, name: "", value: n))
         }
         try encoder.doneRecording()
-        let body = encoder.makeRequestBody(actor: .dynamic(1), target: "t", basePriority: nil)
+        let body = encoder.makeRequestBody(actor: .dynamic(ID64(rawValue: 1)), target: "t", basePriority: nil)
         XCTAssertEqual(normalizedDescription(try XPCEncoder().encode(body)).contains(
             "args=[int64(0),int64(1),int64(2),int64(3),int64(4)]"), true)
     }
@@ -54,14 +54,14 @@ final class InvocationEncoderTests: XCTestCase {
     func testNoErrorTypeMeansTheTargetDoesNotThrow() throws {
         var encoder = InvocationEncoder()
         try encoder.doneRecording()
-        XCTAssertNil(encoder.makeRequestBody(actor: .dynamic(1), target: "t",
+        XCTAssertNil(encoder.makeRequestBody(actor: .dynamic(ID64(rawValue: 1)), target: "t",
                                              basePriority: nil).errorType)
     }
 
     func testBasePriorityIsCarriedThrough() throws {
         var encoder = InvocationEncoder()
         try encoder.doneRecording()
-        let body = encoder.makeRequestBody(actor: .dynamic(1), target: "t",
+        let body = encoder.makeRequestBody(actor: .dynamic(ID64(rawValue: 1)), target: "t",
                                            basePriority: UInt64(TaskPriority.high.rawValue))
         XCTAssertEqual(body.basePriority, UInt64(TaskPriority.high.rawValue))
     }
