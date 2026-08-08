@@ -171,9 +171,18 @@ not resolved**: `Transport.sendRequest(id:)` takes its id from the caller, and I
 the closure capture chain from `Session.sendInvocation` to the call. The inference rests on an
 exhaustive `cas`-instruction scan of `__text`, which finds exactly one `ID64.Generator.next()`
 inlining on the send path (the one above) and none against `Transport.(idGenerator)`
-(field offset `0x70`, apparently dead in this build); `ID64.Generator.next()` also has no `BL`
-callers anywhere. If only one id is ever minted per outgoing call, envelope and body must carry
-it twice. **For interop it does not matter**: a peer matches on `headerID` alone, so the two
+(field offset `0x70`). If only one id is ever minted per outgoing call, envelope and body must
+carry it twice.
+
+An earlier revision added "`ID64.Generator.next()` also has no `BL` callers anywhere" as support.
+That sentence reads stronger than it is: a direct `BL`/`B` scan cannot see `blraa`, so zero direct
+callers establishes only that `next()` is always inlined — which is true and unsurprising, and
+says nothing about whether any particular field is used. Removed rather than softened. The
+`Transport.(idGenerator)` field being dead is separately well-supported: it has no accessor symbol
+where `Session.idGenerator.read` does exist, `Transport.init` zeroes `+0x70` in the same `stp`
+that stores `requestManager`, `deinit` skips it, and a `cas` scan over every
+`XPCSystem.Transport*` range finds compare-and-swap at exactly two sites, both the fuse at
+`+0x20`. **For interop it does not matter**: a peer matches on `headerID` alone, so the two
 merely have to be internally consistent on our side.
 
 Nothing here is `Codable`, so `verify-containers.py` cannot speak to it. What resolved it was
@@ -325,7 +334,8 @@ init(id: ID64, targetedSharedActor: SharedActorKey,
      remoteCallTarget: Distributed.RemoteCallTarget, invocation: InvocationEncoder)
 ```
 
-— note that `invocation` is the **encoder itself**, which is `Encodable`, and that there is no
+— note that `invocation` is the **encoder itself** — which has an `encode(to:)` method but does
+**not** conform to `Encodable`; see the correction below — and that there is no
 `basePriority` parameter. `basePriority` has a getter and no setter, so the init computes it.
 
 The name and type match Swift's `Task.basePriority: TaskPriority?` exactly, which was confirmed
@@ -468,7 +478,10 @@ requirement; `encodeReply`'s success arm calls `encodeReturn` directly; `encodeR
 (`0x2ad512298`) calls `RemoteInvocationResponse<A>.init(result:)`. `Ack.encode(to:)` opens a
 keyed container and encodes nothing, and the field descriptors show no fields and no
 `CodingKeys` cases. Corroborated independently by the in-process path:
-`ResultHandler.onReturnVoid()` (`0x2ad5051b4`) stores `.success(Ack())`.
+`ResultHandler.onReturnVoid()` stores `.success(Ack())` — precisely, `0x2ad5051b4` is only the
+async prologue; the wrapper dispatches on `mode`, and it is the **`.direct` arm**
+(`0x2ad5052f0`, `DirectResultHandler.onReturnVoid` inlined) that stores it, while the `.encoded`
+arm dispatches to `EncodedResultHandler`.
 
 Not proven: nobody has driven a real peer to return `Void`. The reachable half is covered —
 Apple's decoder reads a `[0, {}]` we wrote, as an `Ack`.
@@ -650,7 +663,15 @@ dictionary at `Session+0x38`.
 
 **`ActorReference` is not the actor table.** The field list `ActorReference { id, actor }` reads
 exactly like "the `ActorID` stored beside the instance", and it is not that. It is
-`ActorReference<A>`, a *generic* `Codable` class with `init<A1>(_: A1, as: A.Type)` and
+`ActorReference<A>` — where **`A` is a `Distributed._DistributedActorStub` with
+`A.ActorSystem == XPCSystem`**, not an actor. That constraint is invisible in every symbol,
+because a method of a generic type mangles only the requirements introduced at its own level, so
+`resolve() -> A` prints unconstrained; it lives in the nominal type descriptor
+(`0x2ad526f04`, `NumRequirements=2`). So this is a reference to an `@Resolvable` *protocol stub*,
+and `resolve()` hands back the stub-typed proxy. On the wire it is nothing special:
+`ActorReference.encode(to:)` is 32 bytes and tail-calls `ActorID.encode(to:)`, so an
+`ActorReference` **is a bare `SharedActorKey`** with nothing recording the stub type. A `Codable`
+class with `init<A1>(_: A1, as: A.Type)` and
 `resolve() -> A` — the user-facing transferable actor reference, a thing you put in a distributed
 func's signature. It is not consulted by the session at all. One more field list that looked like
 an answer.
@@ -809,7 +830,23 @@ asserting `returned.id == local.id` would fail against a real `XPCDistributed` p
 
 ### The DistributedActorSystem conformance
 
-All seven requirements are implemented on `XPCSystem` itself, not on `Session`.
+> **Correction: `InvocationEncoder` does not conform to `Encodable`.** It has an `encode(to:)`
+> method, and `InvocationContents`'s `Encodable` witness reaches it by direct call, but the
+> conformance does not exist. Established by walking `__TEXT,__swift5_proto` — 192 records, one
+> per conformance — rather than by a missing symbol name, so it is immune to the merged-accessor
+> problem: `InvocationEncoder` has exactly **one** record (`DistributedTargetInvocationEncoder`),
+> against positive controls of `Ack` 2, `SwiftType` 5, `SharedActorKey` 5. The same holds for
+> `InvocationDecoder`/`EncodedInvocationDecoder`: `init(from:)` is a plain initializer, not a
+> `Decodable` witness. **The wire outcome is unaffected** — the bytes are produced either way —
+> but the interface claim was wrong, and a section walk is now the settled way to ask whether a
+> conformance exists. See `xpcdump/macos27-XPCDistributed/METHOD.md`.
+
+**Eight** requirements are implemented on `XPCSystem` itself, not on `Session`. An earlier
+revision said seven and missed `invokeHandlerOnReturn(handler:resultBuffer:metatype:)`, which is
+the runtime's path for handing a returned value back through a `ResultHandler`. It casts the
+runtime's `metatype` to `(any Decodable & Encodable).Type` **unconditionally**
+(`dynamic_cast_existential_2_unconditional`, two `swift_conformsToProtocol2` then `brk #1`), so a
+non-`Codable` return type traps the *callee*.
 
 - **`assignID<A>(A.Type) -> ActorID`** (`0x2ad51e17c`) ignores its type argument entirely. It
   builds `Local(actorSystemID: self.id, instanceID: n)` and writes tag 0. `n` comes from a
