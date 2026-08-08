@@ -19,10 +19,16 @@ public enum TypeName {
         let key = ObjectIdentifier(type)
         if let hit = lock.withLock({ byType[key] }) { return hit }
         guard let name = _mangledTypeName(type) else { return nil }
-        lock.withLock {
-            byType[key] = name
-            byName[name] = type
-        }
+        // Only the forward direction is learned here. Writing `byName[name] = type`
+        // would assert an inverse that was never checked, and the assertion is not
+        // always true: a function-local type mangles to a name embedding a process
+        // address that `_typeByName` cannot resolve, and an ObjC class built at runtime
+        // over a Swift superclass mangles to the *superclass's* name. Caching either
+        // would make `type(for:)` answer from our own guess -- reporting success for a
+        // name no peer can resolve, or worse, returning the wrong type for a name that
+        // legitimately belongs to the superclass. `type(for:)` populates `byName` from
+        // a real `_typeByName`, which is the only source entitled to.
+        lock.withLock { byType[key] = name }
         return name
     }
 

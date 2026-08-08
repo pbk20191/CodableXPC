@@ -3,10 +3,13 @@ import XPC
 import CodableXPC
 @testable import XPCActors
 
+/// `internal`, not `private`: a `private` type's mangled name embeds a process address
+/// and does not resolve, which is exactly what `SwiftType(_:)` now refuses.
+struct SwiftTypeSample: Codable {}
+
 @available(macOS 14, *)
 final class SwiftTypeTests: XCTestCase {
 
-    private struct Sample: Codable {}
 
     // MARK: tier 1 — golden fixture
     //
@@ -42,8 +45,8 @@ final class SwiftTypeTests: XCTestCase {
     // MARK: resolution
 
     func testTypeResolvesAMangledNameToTheType() throws {
-        let wrapped = try XCTUnwrap(SwiftType(Sample.self))
-        XCTAssertTrue(wrapped.type == Sample.self)
+        let wrapped = try XCTUnwrap(SwiftType(SwiftTypeSample.self))
+        XCTAssertTrue(wrapped.type == SwiftTypeSample.self)
     }
 
     func testTypeIsNilForANameThatResolvesToNothing() {
@@ -63,7 +66,7 @@ final class SwiftTypeTests: XCTestCase {
     // MARK: identity
 
     func testEqualityIgnoresWhetherTheTypeHasBeenResolved() throws {
-        let resolved = try XCTUnwrap(SwiftType(Sample.self))
+        let resolved = try XCTUnwrap(SwiftType(SwiftTypeSample.self))
         let fromWire = SwiftType(mangledTypeName: resolved.mangledTypeName)
         XCTAssertEqual(resolved, fromWire)
         XCTAssertEqual(resolved.hashValue, fromWire.hashValue)
@@ -74,7 +77,7 @@ final class SwiftTypeTests: XCTestCase {
     }
 
     func testRoundTripPreservesTheName() throws {
-        let original = try XCTUnwrap(SwiftType(Sample.self))
+        let original = try XCTUnwrap(SwiftType(SwiftTypeSample.self))
         let object = try XPCEncoder().encode(original)
         XCTAssertEqual(try XPCDecoder().decode(SwiftType.self, from: object), original)
     }

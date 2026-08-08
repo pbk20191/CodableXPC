@@ -134,6 +134,27 @@ wire boundary.
 
 Failure string: `"Unable to resolve type: "`, and `"Failed to record generic substitution of type "`.
 
+**A non-nil mangled name is not a usable one.** `_mangledTypeName` succeeds for types whose names
+no peer can resolve, and for one category it succeeds with a name that is outright *wrong*:
+
+- **`private` and `fileprivate` types, and function-local types**, mangle with a
+  `$<process address>yXZ` discriminator. `_typeByName` returns nil for them, in this process and
+  any other. Measured: 26 ordinary constructions — structs, classes, enums, actors, generic
+  instantiations, nested types, stdlib and Foundation types, collections, optionals,
+  existentials — all round-trip; every `private`/`fileprivate`/local one fails.
+- **An ObjC class created at runtime over a Swift superclass** mangles to the *superclass's*
+  name — non-nil, resolvable, and a different type. `objc_allocateClassPair` copies the
+  superclass's metadata prefix, nominal type descriptor included.
+
+So the check that matters is `_typeByName(_mangledTypeName(t)) == t`, not a nil test. The
+practical consequence for callers: **a distributed func's signature may not use a `fileprivate`
+type**. That fails loudly at record time rather than as an unresolvable type in the peer's
+process.
+
+This also means a name→type cache must not be populated from the mangling direction. Doing so
+asserts an inverse that was never checked, and it makes any test of "does this name resolve"
+answer from the cache's own guess.
+
 ### protocolStub
 
 `protocolStub` carries the stub type used when a call goes through a **distributed protocol**
@@ -179,8 +200,21 @@ error, and a type with no mangled name is an error.
 
 Apple's own encoder *crashes* rather than serialise a non-empty `genericSubsitutions`. Two
 readings are possible — the array is drained into `protocolStub` and the check is defensive, or
-generic distributed funcs are simply unsupported — and they give the **same wire outcome**, which
-is what makes the conclusion safe: the key is present and its value is `[]`.
+generic distributed declarations are simply unsupported — and they give the **same wire
+outcome**, which is what makes the conclusion safe: the key is present and its value is `[]`.
+
+**What actually triggers it is wider than "a generic distributed func."** Observed by driving a
+real `DistributedActorSystem` with a logging encoder: a `distributed actor Foo<T>` records its
+own generic arguments on **every** call, including calls to entirely non-generic distributed
+funcs. So declaring the actor generic is by itself enough to make every remote call on it
+unrepresentable on this wire. A call through an `@Resolvable` protocol stub, by contrast, records
+exactly one substitution — the fully applied `$Greeter<System>` — and that one is the stub.
+
+Also observed from the same probe, and worth having written down because no fixture would
+otherwise pin it: for a plain `throws` distributed func the runtime records the **existential**,
+`any Error` (`s5Error_p`), not a concrete error type. A concrete one appears only under typed
+throws. And `recordErrorType` is not called at all for a non-throwing target, which is what makes
+the key's presence the signal.
 
 Note the strength of each claim here. The two string attributions and the `BRK` are resolved from
 the binary. "Therefore the array is always `[]`" is an inference *from* them — a robust one,
