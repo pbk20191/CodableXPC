@@ -17,16 +17,6 @@ import XPCOverlayCoder
 /// runs Apple's own decoder in-process against the bytes we produced. It is as close to
 /// a real peer as this repository can get.
 @available(macOS 14, *)
-private final class StubSession: SessionCoding, @unchecked Sendable {
-    func shareDynamically(_ local: RawActorID.Local) -> SharedActorKey? {
-        .dynamic(ID64(rawValue: 1))
-    }
-    func remoteID(for key: SharedActorKey) -> ActorID {
-        ActorID(raw: .remote(.init(session: self, key: key)))
-    }
-}
-
-@available(macOS 14, *)
 final class PacketBodyTests: XCTestCase {
 
     private static let request = RemoteInvocationRequest(
