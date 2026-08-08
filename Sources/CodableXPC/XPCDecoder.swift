@@ -158,6 +158,8 @@ extension _XPCDecoderImp: SingleValueDecodingContainer {
     func decode<T>(_ type: T.Type) throws -> T where T : Decodable {
         let xpcType = xpc_get_type(ref)
         switch type {
+        case is XPCNativeObject.Type:
+            return XPCNativeObject(ref) as! T
         case is UUID.Type:
             guard xpcType == XPC_TYPE_UUID else {
                 let context = DecodingError.Context(
@@ -348,6 +350,9 @@ private struct _XPCUnKeyedDecodingContainer: UnkeyedDecodingContainer {
         let xpcType = xpc_get_type(object)
         let value:T
         switch type {
+        case is XPCNativeObject.Type:
+            currentIndex += 1
+            return XPCNativeObject(object) as! T
         case is Data.Type:
             guard xpcType == XPC_TYPE_DATA else {
                 let context = DecodingError.Context(
@@ -806,6 +811,9 @@ private struct _XPCKeyedDecodingContainer<Key:CodingKey>: KeyedDecodingContainer
         let xpcType = xpc_get_type(object)
         // The types handled below are concrete, so for them null really is a
         // missing value rather than a representable one.
+        if type is XPCNativeObject.Type {
+            return XPCNativeObject(object) as! T
+        }
         if xpcType == XPC_TYPE_NULL, type is Data.Type || type is Date.Type || type is UUID.Type {
             throw DecodingError.valueNotFound(type, .init(
                 codingPath: currentPath,

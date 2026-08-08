@@ -164,6 +164,8 @@ private class _XPCEncoderImp: Encoder, SingleValueEncodingContainer {
     func encode<T>(_ value: T) throws where T : Encodable {
         assertCanEncodeNewValue()
         switch value {
+        case let native as XPCNativeObject:
+            xpc = native.object
         case let data as Data:
             xpc = data.xpcData
             break
@@ -250,6 +252,8 @@ private struct _XPCKeyedEncodingContainer<Key : CodingKey>: KeyedEncodingContain
     
     mutating func encode<T>(_ value: T, forKey key: Key) throws where T : Encodable {
         switch value {
+        case let native as XPCNativeObject:
+            xpc_dictionary_set_value(ref, key.stringValue, native.object)
         case let data as Data:
             xpc_dictionary_set_value(ref, key.stringValue, data.xpcData)
             break
@@ -406,6 +410,8 @@ private struct _XPCUnkeyedEncodingContainer: UnkeyedEncodingContainer {
     
     mutating func encode<T>(_ value: T) throws where T : Encodable {
         switch value {
+        case let native as XPCNativeObject:
+            xpc_array_append_value(ref, native.object)
         case let data as Data:
             xpc_array_append_value(ref, data.xpcData)
             break
