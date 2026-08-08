@@ -127,3 +127,66 @@ final class OverlayVersionGateTests: XCTestCase {
                                            outOfLine: [], coderVersion: 1)
     }
 }
+
+/// A primitive written through the *generic* `encode<T: Encodable>` overload.
+///
+/// That is what an existential reaches: opening `any Encodable` picks the generic
+/// witness, not `encode(Int)`. The value then lands as a nested single-value
+/// container node rather than as an inline value, and a decoder that reads only the
+/// inline form cannot read its own encoder's output.
+///
+/// Found by the XPCDistributed transport work, whose invocation arguments are
+/// `[any Codable]`. The corroboration that the *decoder* was the wrong half is in
+/// `XPCActorsTests.PacketBodyTests`: Apple's own decoder reads these same bytes and
+/// yields the same values.
+final class OverlayGenericPrimitiveTests: XCTestCase {
+
+    private struct Existential: Encodable {
+        let values: [any Encodable]
+        func encode(to encoder: any Encoder) throws {
+            var container = encoder.unkeyedContainer()
+            for value in values { try container.encode(value) }
+        }
+    }
+
+    private struct KeyedExistential: Encodable {
+        let value: any Encodable
+        enum Key: String, CodingKey { case value }
+        func encode(to encoder: any Encoder) throws {
+            var container = encoder.container(keyedBy: Key.self)
+            try container.encode(value, forKey: .value)
+        }
+    }
+
+    private struct Pair: Decodable, Equatable {
+        let number: Int
+        let text: String
+        init(number: Int, text: String) {
+            self.number = number
+            self.text = text
+        }
+        init(from decoder: any Decoder) throws {
+            var container = try decoder.unkeyedContainer()
+            number = try container.decode(Int.self)
+            text = try container.decode(String.self)
+        }
+    }
+
+    private struct Single: Decodable, Equatable {
+        let value: Int
+        init(value: Int) { self.value = value }
+    }
+
+    func testAnUnkeyedGenericPrimitiveRoundTrips() throws {
+        let encoded = try XPCOverlayEncoder().encode(
+            Existential(values: [7 as Int, "hi" as String]))
+        XCTAssertEqual(try XPCOverlayDecoder().decode(Pair.self, from: encoded.body),
+                       Pair(number: 7, text: "hi"))
+    }
+
+    func testAKeyedGenericPrimitiveRoundTrips() throws {
+        let encoded = try XPCOverlayEncoder().encode(KeyedExistential(value: 7 as Int))
+        XCTAssertEqual(try XPCOverlayDecoder().decode(Single.self, from: encoded.body),
+                       Single(value: 7))
+    }
+}

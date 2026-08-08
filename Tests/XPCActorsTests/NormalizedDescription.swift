@@ -38,6 +38,11 @@ func normalizedDescription(_ object: xpc_object_t, topLevel: Bool = true) -> Str
         return "double(\(xpc_double_get_value(object)))"
     case XPC_TYPE_NULL:
         return "null"
+    case XPC_TYPE_DATA:
+        // Length only. A body is an overlay byte stream now, and its bytes are pinned
+        // by `XPCOverlayCoderTests`; rendering them here would make every envelope
+        // fixture a hostage to the stream format.
+        return "data(\(xpc_data_get_length(object)))"
     default:
         return "other"
     }

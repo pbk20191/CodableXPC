@@ -44,9 +44,9 @@ final class XPCRawTransportTests: XCTestCase {
                 reply(body)
             }
             box.transport = transport
-            // A responder's activate() only brings the pipe up; it does not block
-            // on a peer. The accepted session is already live, so this is a no-op
-            // beyond installing the handler.
+            // activate() only brings the pipe up; it exchanges nothing and blocks on
+            // nothing. The accepted session is already live, so this is a no-op beyond
+            // installing the handler.
             Task { try? await transport.activate() }
             serverReady.fulfill()
             return decision
@@ -57,12 +57,17 @@ final class XPCRawTransportTests: XCTestCase {
         let client = Transport(debugName: "client", role: .initiator, rawTransport: clientRaw)
         try await client.activate()
 
-        await fulfillment(of: [serverReady], timeout: 5)
-        XCTAssertEqual(client.negotiatedVersion, .current, "hello must complete over real XPC")
+        // Send *before* waiting for the server, not after. With the handshake gone,
+        // `activate()` puts nothing on the wire, and an XPC session is not established
+        // until its first message -- so the listener does not learn of this peer until
+        // the request below is sent. Waiting for `serverReady` first would deadlock,
+        // and it did: that is what deleting the `hello` changed here.
+        let request = try Packet.Payload(encoding: Ping(value: 41))
+        async let pending = client.sendRequest(seq: client.allocateSeq(), request)
 
-        let outcome = await client.sendRequest(
-            seq: client.allocateSeq(), try Packet.Payload(encoding: Ping(value: 41))
-        )
+        await fulfillment(of: [serverReady], timeout: 5)
+
+        let outcome = await pending
         guard case .reply(let payload) = outcome else { return XCTFail("expected a reply") }
         XCTAssertEqual(try payload.decode(as: Ping.self), Ping(value: 42))
 

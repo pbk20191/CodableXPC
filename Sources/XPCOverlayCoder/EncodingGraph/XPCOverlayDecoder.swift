@@ -135,7 +135,7 @@ final class OverlayDecoderImpl: Decoder {
 
     func container<Key: CodingKey>(keyedBy type: Key.Type)
     throws -> KeyedDecodingContainer<Key> {
-        let node = try unwrapSingleValueWrapper(try node())
+        let node = try unwrappedContainerNode(try node())
         guard node.kind == .keyed else {
             throw DecodingError.dataCorrupted(.init(
                 codingPath: codingPath,
@@ -145,7 +145,7 @@ final class OverlayDecoderImpl: Decoder {
     }
 
     func unkeyedContainer() throws -> any UnkeyedDecodingContainer {
-        let node = try unwrapSingleValueWrapper(try node())
+        let node = try unwrappedContainerNode(try node())
         guard node.kind == .unkeyed else {
             throw DecodingError.dataCorrupted(.init(
                 codingPath: codingPath,
@@ -161,7 +161,7 @@ final class OverlayDecoderImpl: Decoder {
     /// Every nested `Encodable` is wrapped in a single-value container by the
     /// encoder, so a request for a keyed or unkeyed container has to see through
     /// one level of that. Apple's containers do the same unwrap in their `init`.
-    private func unwrapSingleValueWrapper(_ node: OverlayNode) throws -> OverlayNode {
+    private func unwrappedContainerNode(_ node: OverlayNode) throws -> OverlayNode {
         guard node.kind == .singleValue, node.elements.count == 1,
               case .container(let inner) = node.elements[0] else { return node }
         return inner
@@ -177,10 +177,39 @@ final class OverlayDecoderImpl: Decoder {
     // MARK: primitive extraction
 
     func unwrap<T>(_ value: OverlayValue, as type: T.Type, at path: [any CodingKey]) throws -> T {
-        if let extracted = Self.extract(value) as? T { return extracted }
+        if let extracted = Self.extract(Self.unwrappedValue(value)) as? T {
+            return extracted
+        }
         throw DecodingError.typeMismatch(type, .init(
             codingPath: path,
             debugDescription: "expected \(type), found \(Self.describe(value))"))
+    }
+
+    /// See through one level of the encoder's single-value wrapper.
+    ///
+    /// A primitive written through the *generic* `encode<T: Encodable>` overload —
+    /// which is what an existential argument reaches, since opening it picks the
+    /// generic witness rather than the `encode(Int)` one — becomes a nested
+    /// single-value container node rather than an inline value. The same `Int`
+    /// written through the concrete overload is inline. Both are legal, and a
+    /// decoder that accepts only the second cannot read its own encoder's output.
+    ///
+    /// Which half was wrong was settled against Apple, not argued: Apple's own encoder
+    /// emits **byte-identical** output to this package's for both spellings — keyed and
+    /// unkeyed, existential and concrete — so the encoder was right and this path was
+    /// the one that could not read it. `AppleEncoderParityTests` pins that equality, and
+    /// `AppleDecodesOurInvocationArgumentsTests` drives Apple's decoder through an
+    /// arguments array that actually reaches this unwrap.
+    ///
+    /// A previous revision of this comment cited a test that does not cover the claim:
+    /// `InboundInvocation` retains its arguments container unconsumed by design, so
+    /// decoding one never asks for a primitive here. Left recorded because citing
+    /// evidence one does not have is the failure this project is organised against.
+    static func unwrappedValue(_ value: OverlayValue) -> OverlayValue {
+        guard case .container(let node) = value,
+              node.kind == .singleValue, node.elements.count == 1
+        else { return value }
+        return node.elements[0]
     }
 
     /// Exact widths only, deliberately. See the note on ``XPCOverlayDecoder``.

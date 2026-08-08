@@ -79,28 +79,6 @@ final class AppleRoundTripTests: XCTestCase {
     }
 
     /// Sends `value` and returns the entire envelope Apple built for it.
-    private func captureEnvelope(_ value: some Encodable) throws -> xpc_object_t {
-        let received = XCTestExpectation(description: "message arrives")
-        let box = CaptureBox()
-
-        let listener = XPCListener(targetQueue: nil, options: .inactive) { request in
-            request.accept { (message: XPCDictionary) -> XPCDictionary? in
-                message.withUnsafeUnderlyingDictionary { box.envelope = xpc_copy($0) }
-                received.fulfill()
-                return nil
-            }
-        }
-        try listener.activate()
-        defer { listener.cancel() }
-
-        let session = try XPCSession(endpoint: listener.endpoint, options: .inactive)
-        try session.activate()
-        defer { session.cancel(reason: "captured") }
-        try session.send(value)
-
-        wait(for: [received], timeout: 10)
-        return try XCTUnwrap(box.envelope)
-    }
 
     /// Every key in `message`, with the xpc type of its value.
     private func shape(_ message: xpc_object_t) -> [String: xpc_type_t] {
@@ -119,7 +97,7 @@ final class AppleRoundTripTests: XCTestCase {
     /// thing rather than against a reading of the disassembly.
     func testOurEnvelopeHasTheSameShapeAsApples() throws {
         let value = Scalars(flag: true, small: -3, wide: 70_000, name: "overlay", ratio: 0.5)
-        let theirs = try captureEnvelope(value)
+        let theirs = try captureAppleEnvelope(value)
         let ours = try XPCOverlayEncoder().message(value)
 
         XCTAssertEqual(shape(ours), shape(theirs))
@@ -136,7 +114,7 @@ final class AppleRoundTripTests: XCTestCase {
     /// and any disagreement about the stream shows up here.
     func testOurBodyIsByteIdenticalToApples() throws {
         let value = Outer(inner: Inner(value: 9), list: [1, 2, 3], optional: "here")
-        let theirs = try captureEnvelope(value)
+        let theirs = try captureAppleEnvelope(value)
         let ours = try XPCOverlayEncoder().encode(value)
 
         let raw = try XCTUnwrap(xpc_dictionary_get_value(theirs, OverlayEnvelope.body))

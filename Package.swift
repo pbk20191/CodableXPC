@@ -72,9 +72,13 @@ let package = Package(
         // which is macOS 13+ and in no back-deployment set -- the same trap
         // `import System` set for CodableXPC. A 10.15 consumer links CodableXPC
         // and never loads it.
+        // `XPCOverlayCoder` is not an optional extra here: a packet body is whatever
+        // `XPCDictionary.encode(_:forKey:withUserInfo:)` produces, which is an overlay
+        // byte stream rather than a native xpc tree. `CodableXPC` remains for the
+        // native-xpc values that never cross this wire.
         .target(
             name: "XPCActors",
-            dependencies: ["CodableXPC"]),
+            dependencies: ["CodableXPC", "XPCOverlayCoder"]),
         // Carrying Codable values over NSXPC, which can only move NSSecureCoding
         // objects. Foundation only -- no dependency on CodableXPC, and no platform
         // floor above the package's own, so a 10.13 consumer can use it.
@@ -118,9 +122,12 @@ let package = Package(
         .testTarget(
             name: "XPCCompatSystemTests",
             dependencies: ["XPCCompatSystem"]),
+        // `XPCOverlayCoder` is named explicitly rather than picked up transitively:
+        // the interop tests reach for `AppleCoderBridge` and `OverlayEnvelope`
+        // directly, and a transitive import is not a dependency anyone declared.
         .testTarget(
             name: "XPCActorsTests",
-            dependencies: ["XPCActors"]),
+            dependencies: ["XPCActors", "XPCOverlayCoder"]),
         .testTarget(
             name: "XPCOverlayCoderTests",
             dependencies: ["XPCOverlayCoder"]),
