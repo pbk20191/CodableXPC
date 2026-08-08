@@ -19,7 +19,9 @@ public enum SharedActorKey: Hashable, Sendable {
     /// the builtin overload, no witness-table call, per the disassembly.
     case exportedRawValue(String)
     /// An actor that crossed the wire as a value during a call. Payload is an `ID64`,
-    /// coded through its own conformance -- `{ "value": <UInt64> }`, not a bare integer.
+    /// coded through its own conformance -- which is single-value, so this lands as a
+    /// bare `UInt64`. Going through the witness table decides which `encode` runs; it
+    /// does not add a level of nesting.
     case dynamic(ID64)
 }
 

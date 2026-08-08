@@ -436,6 +436,35 @@ disassembly, and string tables. The strongest available check is internal consis
 why the `.mm`-versus-binary disagreement above matters so much: it is the one case where two
 sources could be compared, and they disagreed. Treat single-sourced claims accordingly.
 
+### Open, and single-sourced — resolve these before building on them
+
+Both surfaced during R2's review. Neither blocks R2; both block the task that touches them.
+
+**1. `Packet.Payload` cannot carry a response, and nothing here says what does.** A response
+provably encodes to an unkeyed *array* (`RemoteInvocationResponse.encode(to:)` →
+`singleValueContainer()` around `Either.encode(to:)` → `unkeyedContainer()`). But Apple's
+`Payload` is not `Codable` — it stores an `XPCDictionary`:
+
+```
+Packet.Payload.dictionary.getter : XPC.XPCDictionary
+Packet.Payload.init(from: XPC.XPCDictionary) -> Packet.Payload?
+Packet.Payload.init<A: Encodable>(encoding: A, userInfo: …) throws -> Packet.Payload
+```
+
+So something wraps that array somewhere this document does not describe. Our own
+`Payload.swift` throws `bodyIsNotADictionary`, so the collision is guaranteed to surface in the
+transport task. **Resolve `Packet.Payload.init<A>(encoding:)` and the overlay coder's handling of
+a non-dictionary root first.** The *Envelope* section above says "`Packet.Payload` wraps a single
+field, `dictionary`" and stops — a field-list statement with no container resolved, which is
+precisely the shape of the two errors below.
+
+**2. Every discriminator rests on XPC integer typing, unverified.** Our decoder requires xpc type
+`uint64` for the response tag, `SharedActorKey.WireCode`, `basePriority`, and `priority`, and
+rejects an `int64`-typed one. That assumes Apple's XPC overlay coder writes a small `UInt8` as
+`xpc_uint64` rather than `xpc_int64`. Nothing here establishes that. If it is wrong, every
+discriminator fails to decode from a real peer at once — a loud failure rather than a silent
+corruption, which is the only good news about it.
+
 That warning has already been earned once. The `ID64` and `SwiftType` container claims were
 originally written as inferences from a field list, and both were wrong — they had silently
 reproduced the older `.mm` build's shape. `verify-containers.py` now resolves them; anything else
