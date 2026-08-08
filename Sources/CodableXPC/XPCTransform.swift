@@ -59,7 +59,13 @@ internal extension String {
     /// everything after it, which is worse than refusing.
     @usableFromInline
     func xpcString(at path: [any CodingKey]) throws -> xpc_object_t {
-        guard !utf8.contains(0) else {
+        // memchr rather than `utf8.contains(0)`: the scan is unavoidable, but the
+        // element-by-element version dominated string encoding -- 18x the cost of
+        // xpc_string_create itself, and far worse without optimisation.
+        let hasNul = utf8.withContiguousStorageIfAvailable {
+            memchr($0.baseAddress, 0, $0.count) != nil
+        } ?? utf8.contains(0)
+        guard !hasNul else {
             throw EncodingError.invalidValue(self, .init(
                 codingPath: path,
                 debugDescription: "an xpc string cannot carry an embedded NUL; "

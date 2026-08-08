@@ -100,11 +100,14 @@ extension _XPCDecoderImp: SingleValueDecodingContainer {
             throw DecodingError.typeMismatch(type, context)
         }
 
-        let buffer = UnsafeBufferPointer(
-            start: xpc_string_get_string_ptr(ref),
-            count: xpc_string_get_length(ref) + 1
-        ).map{ $0 }
-        return String(cString: buffer)
+        // `String(cString:)` reads the NUL-terminated buffer straight from libxpc.
+        // Copying it into a Swift array first, which is what `.map { $0 }` did,
+        // cost more than every other part of decoding a string put together.
+        guard let cString = xpc_string_get_string_ptr(ref) else {
+            throw DecodingError.dataCorrupted(.init(
+                codingPath: codingPath, debugDescription: "xpc string with no bytes"))
+        }
+        return String(cString: cString)
     }
     
     func decode(_ type: Double.Type) throws -> Double {
@@ -284,12 +287,12 @@ private struct _XPCUnKeyedDecodingContainer: UnkeyedDecodingContainer {
             let context = DecodingError.Context(codingPath: currentPath, debugDescription: "Expected String but found \(xpcTypeName(xpcType)) instead")
             throw DecodingError.typeMismatch(type, context)
         }
-        let buffer = UnsafeBufferPointer(
-            start: xpc_string_get_string_ptr(object),
-            count: xpc_string_get_length(object) + 1
-        ).map{ $0 }
+        guard let cString = xpc_string_get_string_ptr(object) else {
+            throw DecodingError.dataCorrupted(.init(
+                codingPath: currentPath, debugDescription: "xpc string with no bytes"))
+        }
         currentIndex += 1
-        return String(cString: buffer)
+        return String(cString: cString)
     }
     
     mutating func decode(_ type: Double.Type) throws -> Double {
@@ -677,11 +680,14 @@ private struct _XPCKeyedDecodingContainer<Key:CodingKey>: KeyedDecodingContainer
             let context = DecodingError.Context.init(codingPath: currentPath, debugDescription: "Expected \(type) but find \(xpcTypeName(xpcType)) instead")
             throw DecodingError.typeMismatch(type, context)
         }
-        let buffer = UnsafeBufferPointer(
-            start: xpc_string_get_string_ptr(object),
-            count: xpc_string_get_length(object) + 1
-        ).map{ $0 }
-        return String(cString: buffer)
+        // `String(cString:)` reads the NUL-terminated buffer straight from libxpc.
+        // Copying it into a Swift array first, which is what `.map { $0 }` did,
+        // cost more than every other part of decoding a string put together.
+        guard let cString = xpc_string_get_string_ptr(object) else {
+            throw DecodingError.dataCorrupted(.init(
+                codingPath: codingPath, debugDescription: "xpc string with no bytes"))
+        }
+        return String(cString: cString)
     }
     
     func decodeBinaryFloatingPoint<T:BinaryFloatingPoint>(_ type: T.Type, forKey key:Key) throws -> T {
