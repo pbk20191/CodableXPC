@@ -316,7 +316,7 @@ Note the strength of each claim here. The two string attributions and the `BRK` 
 the binary. "Therefore the array is always `[]`" is an inference *from* them — a robust one,
 because both available readings agree, but an inference. It has not been observed on a wire.
 
-### basePriority is derived, not passed
+### basePriority is derived, not passed — now resolved
 
 `RemoteInvocationRequest`'s real initializer is
 
@@ -331,8 +331,15 @@ init(id: ID64, targetedSharedActor: SharedActorKey,
 The name and type match Swift's `Task.basePriority: TaskPriority?` exactly, which was confirmed
 to exist and to be optional by compiling against it. That is the obvious source, and it fits the
 protocol's shape: the receiver executes at the caller's priority, and `invocationEscalated` /
-`responseEscalated` exist to raise it afterwards. **Marked as inference** — the getter-only
-property and the name match are facts; that the init reads `Task.basePriority` is not resolved.
+`responseEscalated` exist to raise it afterwards.
+
+> This was **marked as inference** and is now **resolved**. `RemoteInvocationRequest.init` is
+> inlined into `Session.sendInvocation`, and the inlined body is visible there: the `cas` that
+> mints the request id, `outlined copy of SharedActorKey`, `outlined init with copy of
+> InvocationEncoder`, `RemoteCallTarget.identifier.getter`, `swift_storeEnumTagMultiPayload` for
+> the `InvocationContents` tag, and then a direct call to
+> `static Swift.Task<Never, Never>.basePriority.getter : TaskPriority?`. The init reads
+> `Task.basePriority`. See *The session layer* for how that region was read.
 
 ### basePriority and priority
 
@@ -467,20 +474,27 @@ Not proven: nobody has driven a real peer to return `Void`. The reachable half i
 Apple's decoder reads a `[0, {}]` we wrote, as an `Ack`.
 
 `RemoteInvocationResponse<Never>` is the **failure-only** instantiation. Its `Encodable` witness
-accessor (`0x2ad516ad8`) is reached from **seven** sites, every one of them a failure path:
+accessor (`0x2ad516ad8`) is reached from **eight** sites, every one of them a failure path:
 `encodeReturn`'s catch path, `encodeReply`'s failure arm, three in
-`Session.handleReceivedRequest`, and two more in its closures. Each of the five in
+`Session.handleReceivedRequest`, and three more in its closures. Each of the six in
 `handleReceivedRequest` is an inlined `Payload(encoding: RemoteInvocationResponse<Never>(...))` —
 a `userInfo` dictionary literal, `XPCDictionary.init()`, the `<Never>` witness, then
 `XPCDictionary.encode(_:forKey: "payload", withUserInfo:)`. A `.result` is uninhabited in this
 instantiation, which is the point.
 
 > An earlier revision of this paragraph said the accessor is reached "only from `encodeReply`'s
-> failure arm and `encodeReturn`'s catch path." That was two of seven. The conclusion was
+> failure arm and `encodeReturn`'s catch path." That was two of eight. The conclusion was
 > unaffected — every site is a failure path, so `<Never>` is *more* clearly failure-only than
 > claimed — but the exhaustiveness was asserted without the scan that would establish it, and it
 > reached this document rather than staying in a session note. Recorded because an unearned
 > "only" is the same defect this document keeps catching elsewhere.
+>
+> The revision after that said **seven**, "two more in its closures." It is **three** in the
+> closures, so eight in total: `closure #2`, `closure #3`, and the `(3) suspend resume partial
+> function for closure #4`, all nested in `closure #2 () async -> ()`. Corrected from an
+> exhaustive direct-branch scan of `__text` for the accessor's address, listed site by site.
+> Same conclusion for the third time; third wrong count. The count only ever mattered as a
+> demonstration that the scan was run, which is exactly why getting it wrong matters.
 
 The last link is tighter than a call chain: `RemoteInvocationResponse.init(result:)`
 (`0x2ad50f7c4`) has **exactly one caller in the whole image**, `encodeReturn+0x234`, found by
@@ -599,6 +613,440 @@ What crosses is the *dynamic sharing counter*, which is exactly the `SharedActor
 `.dynamic(UInt64)` payload is already wire-correct as written — it just has to go through
 `ID64`'s conformance for the types to line up.
 
+## The session layer
+
+Everything in this section was read from the shipping macOS 27 image by disassembling named
+functions and by two scans over `__text`. The tooling is the `dump-function.py` probe plus two new
+ones described under *Two more probes worth keeping*. Where a claim rests on a scan, the scan is
+named; where it rests on a name or a field list, it says so and is marked as inference.
+
+Field offsets quoted for `Session` are the live values of its `direct field offset` variables,
+read out of the loaded image rather than guessed from declaration order:
+
+```
++0x10  actorSystem                            +0x58  unownedLocalInterfaceActivationEvent
++0x18  id                                     +0x70  isBidirectional
++0x20  idGenerator                            +0x78  ownedLocalInterfaceActivationEvent
++0x28  kind                                   +0x99  activationFuse
++0x30  sharedActors                           +0xa0  pendingInvocationExecutionTasks
++0x40  cancellationEvent
+```
+
+That table is what lets the byte tests in the disassembly be read at all. Two of them matter a
+lot below: `ldrb w8, [session, #0x70]` is `isBidirectional`, and `add x0, session, #0x30` takes
+the `sharedActors` lock.
+
+### The storage, and one thing the field lists got wrong
+
+```
+XPCSystem.(actorTable)  : Synchronization.Mutex<[RawActorID.Local : WeakActorRef]>
+Session.(sharedActors)  : Synchronization.Mutex<[SharedActorKey  : any DistributedActor]>
+WeakActorRef            : { ref : (any DistributedActor)? }      -- a weak box
+```
+
+`sharedActors` is **one direction only: key → actor**. There is no actor→key map, and no
+`ActorID` is stored beside the instance. The mutex's lock word is at `Session+0x30` and the
+dictionary at `Session+0x38`.
+
+**`ActorReference` is not the actor table.** The field list `ActorReference { id, actor }` reads
+exactly like "the `ActorID` stored beside the instance", and it is not that. It is
+`ActorReference<A>`, a *generic* `Codable` class with `init<A1>(_: A1, as: A.Type)` and
+`resolve() -> A` — the user-facing transferable actor reference, a thing you put in a distributed
+func's signature. It is not consulted by the session at all. One more field list that looked like
+an answer.
+
+### Where a SharedActorKey is minted, and by which generator
+
+Four functions mint keys, covering the three `WireCode` cases, and all four funnel into one
+private writer:
+
+| function | key produced |
+|---|---|
+| `Session.shareActor(RawActorID.Local)` (`0x2ad508e04`) | `.dynamic(ID64)` |
+| `Session.handleActorShared(RawActorID.Local)` (`0x2ad5167dc`) | `.dynamic(ID64)` |
+| `LocalInterface.export(_:asDefaultActorFor: B.Type) where B: _DistributedActorStub` (`0x2ad509790`) | `.exported(SwiftType)` |
+| `LocalInterface.export(_:asServerActorFor: String)` (`0x2ad509878`) | `.exportedRawValue(String)` |
+
+`shareActor` and `handleActorShared` are byte-identical clones, 96 bytes each: load
+`Session+0x20`, `adds #1`, `b.hs` to a `brk` on overflow, `cas` loop, then build the key. So the
+`dynamic` counter is **`Session.idGenerator`** — a per-session `ID64.Generator`, ids monotonic
+from 1, an overflow traps. This is the same inlining shape the *Envelope* section describes for
+the request id, on a different field.
+
+The two `export` overloads each read `actor.id` through `Identifiable.id.getter`, trap if it is
+`.remote`, and then build their key — `SwiftType.init(B.Type)` for the stub type, or the caller's
+string. That settles which `WireCode` each case comes from, which the *SharedActorKey* section
+above could only guess at from the payload types.
+
+`Session.(addSharedActor)(_: RawActorID.Local, at: SharedActorKey)` (`0x2ad508d08`) is the only
+writer:
+
+1. asserts `isBidirectional` — `"API violation: Session must be bidirectional to share actor
+   references"`, `Session.swift:263`;
+2. locks `sharedActors`;
+3. calls `XPCSystem.resolve(id: RawActorID.Local) -> (any DistributedActor)?` on
+   `session.actorSystem` — an `actorTable` lookup;
+4. `sharedActors[key] = thatOptional`.
+
+Step 4 is a `Dictionary.subscript.setter` taking an **optional**, so a local id that is not in
+`actorTable` does not store a placeholder — it *removes* the key. And note what is absent: no
+lookup before minting. **Sharing the same actor twice mints two different keys**, both mapping to
+the same instance. There is no reverse map with which to dedupe.
+
+`Session.resolveSharedActor(at: SharedActorKey) -> (any DistributedActor)?` (`0x2ad507dc8`) is the
+only reader. An exhaustive direct-branch scan of `__text` finds exactly **two** callers, both on
+the inbound execution path: `handleReceivedRequest`'s `closure #2`, and `executeDirectInvocation`.
+It is not called from any decode path.
+
+### An incoming SharedActorKey becomes an ActorID — and Apple does not recognise its own keys
+
+This is the defect an earlier review of our own design found and carried forward as a note. Apple
+has it too. Resolved, not inferred, and worth stating in full because the conclusion is a decision
+rather than a bug report.
+
+**`ActorID` on the wire is a bare `SharedActorKey`.** Both halves open a single-value container.
+
+`ActorID.encode(to:)` (`0x2ad4f6c34`):
+
+- `ldrb w8, [id, #0x40]; cmp w8, #1; b.eq` → **trap** if the id is `.remote`, with
+  `"Cannot send remote actor proxies over an session."` (`ActorID.swift:111` — Apple's typo, not
+  this document's);
+- otherwise read `encoder.userInfo`, `swift_dynamicCast` the value to an existential, and call the
+  witness at witness-table slot `+0x20` with the `Local`, taking back a `SharedActorKey`.
+
+  That slot is **`InboundSessionProtocol.handleActorShared(_:)`**, resolved from the method
+  descriptors rather than guessed from the signature. Requirement indices are
+  `(descriptor - requirementsBase) / 8`, and for `InboundSessionProtocol` (base `0x2ad527ccc`)
+  they run: 1 base conformance to `Internal.Identifiable`, 2 `handleReceivedRequest`,
+  3 `handleReceivedNotification`, **4 `handleActorShared`**, 5 `handleTransportCancellation`,
+  6 `actorSystem`, 7 `isBidirectional`. Slot `+0x20` is index 4. The same arithmetic checks out
+  independently on `OutboundSessionProtocol` (base `0x2ad527d58`: 1 base conformance,
+  2 `sendInvocation`, 3 `actorSystem`), where slot `+0x18` is index 3 — which is the slot
+  `belongsTo` and `resolve` call below;
+- `singleValueContainer()`, then `SingleValueEncodingContainer.encode<A>` with the
+  `SharedActorKey : Encodable` witness table.
+
+`ActorID.init(from:)` (`0x2ad4f702c`) is the mirror, and the important thing about it is what it
+does *not* do:
+
+- read `decoder.userInfo`, `swift_dynamicCast` to an existential;
+- `singleValueContainer().decode(SharedActorKey.self)`;
+- `mov w8, #1; sturb w8, …; strb w8, [out, #0x40]` — store enum tag **1** and return
+  `.remote(session, key)`. Unconditionally.
+
+**No table is consulted.** That is an absence claim, so here is the scan that earns it: the
+function's complete annotated call list — every `BL`/`B` target in all 1060 bytes, not a truncated
+view — is 20 distinct targets, and the only `__RawDictionaryStorage.find` among them is
+specialised over `Swift.CodingUserInfoKey`. There is no `os_unfair_lock_lock`, no
+`find<SharedActorKey>`, and no call to `resolveSharedActor`. All four indirect `blraa` in the
+function are `CodingUserInfoKey` value-witness and metadata calls (allocate / init-with-copy /
+destroy / size), not dispatch to anything that could reach `sharedActors`.
+
+**The recognition is not deferred to `resolve` either.** `XPCSystem.resolve(id:as:)`
+(`0x2ad51e064`, 280 bytes) branches on the same tag byte:
+
+| id | what `resolve` does |
+|---|---|
+| `.local` (tag 0) | private `resolve(id: RawActorID.Local, as:)` — `actorTable` lookup, `swift_unknownObjectWeakLoadStrong`, conditional `swift_dynamicCast` to `A`, else throw `SetupError` |
+| `.remote` (tag 1), session's actor system **is** self | **return nil** — which is Swift's instruction to synthesise a remote proxy |
+| `.remote` (tag 1), session's actor system is **not** self | throw `SetupError("Remote actor does not belong to the actor system.")` |
+
+The middle test is `RawActorID.Remote.belongsTo(actorSystem:)` (`0x2ad4f7a9c`) inlined: project
+the `OutboundSessionProtocol` existential from `Remote+0x00`, call witness-table slot `+0x18`
+(the `actorSystem` getter), `swift_release`, compare against the `XPCSystem`. The two functions'
+instruction sequences are identical, which is how the inlining was identified rather than
+assumed.
+
+So a key we minted, sent, and got back becomes a **proxy**, and `returned.id == local.id` is
+false. Apple's answer to "does it recognise a key it minted itself" is no.
+
+The tag-to-case assignment that all of the above rests on is resolved from two independent sites,
+not from declaration order: `assignID` writes tag **0** immediately after storing a
+`Local(actorSystemID:instanceID:)`, and `TestHook.mapToLocalActorID` traps on tag `!= 1` with the
+message `"Local actor ID passed to a function that expects a remote actor ID"`. `local` is 0,
+`remote` is 1.
+
+### Apple wrote the fix and shipped it as a test hook
+
+`TestHook.mapToLocalActorID(_: ActorID, session: Session) -> ActorID?` (`0x2ad50b6a0`, 460 bytes)
+is precisely the operation our review said belongs in `Session`:
+
+1. precondition the id is `.remote` (else the assertion above, `Session.swift:667`);
+2. return nil unless `session.isBidirectional`;
+3. lock `sharedActors`, `find<SharedActorKey>`, retain the found actor, unlock;
+4. **get that actor's id through the existential**: `swift_getObjectType`, then
+   `swift_getAssociatedTypeWitness` for `ID` and `swift_getAssociatedConformanceWitness`, then the
+   `Swift.Identifiable.id.getter` dispatch thunk, then `swift_dynamicCast` to
+   `XPCSystem.ActorID` (flags 6/7 — conditional).
+
+An exhaustive direct-branch scan of `__text` finds **zero** call sites. It is a `static` func on
+a non-generic type, so there is no indirect path it could be reached by. Apple built the mapping,
+exposed it to its own tests, and does not use it in the protocol.
+
+Step 4 answers the blocker in our own note directly. Our note said the fix "needs the `ActorID`
+stored beside the instance, since `.id` is not reachable through `any DistributedActor`." **It is
+reachable** — dynamically, through the associated-type and associated-conformance witnesses, which
+is what Apple does. No extra storage is required, and Apple keeps none.
+
+### What that means for us
+
+Our version of this defect and Apple's differ, and Apple's is worse. Ours returns
+`.remote(self, key)` — a proxy that would loop back into our own process. Apple's returns
+`.remote(theirSession, key)` and would send the key **to the peer**, whose `sharedActors` is a
+different key space with an independently seeded `idGenerator`. In ordinary operation that never
+collides, because a key is always interpreted in the map of the side that minted it and each side
+only ever receives the other side's keys. The reflect-back case is the one that breaks the
+invariant, and there the key either misses or hits an unrelated actor.
+
+**None of this is peer-observable.** A `SharedActorKey` on the wire is the same bytes whichever
+way we resolve it locally. So consulting the local table in `remoteID(for:)` is a strict
+improvement that costs no compatibility, and `TestHook.mapToLocalActorID` is the shape to copy —
+including the `isBidirectional` guard and the dynamic `.id` read, which removes the reason we
+thought we needed to store an `ActorID` next to each shared instance.
+
+That is a decision, so record it as one: **we intend to diverge from Apple here**, and a test
+asserting `returned.id == local.id` would fail against a real `XPCDistributed` peer.
+
+### The DistributedActorSystem conformance
+
+All seven requirements are implemented on `XPCSystem` itself, not on `Session`.
+
+- **`assignID<A>(A.Type) -> ActorID`** (`0x2ad51e17c`) ignores its type argument entirely. It
+  builds `Local(actorSystemID: self.id, instanceID: n)` and writes tag 0. `n` comes from a
+  `cas` loop on a **process-global** `ID64.Generator` behind a `swift_once` — not from any
+  per-`XPCSystem` field. So `instanceID` is unique per process, and `actorSystemID` is what
+  distinguishes two `XPCSystem`s in one process.
+- **`actorReady<A>(A)`** (`0x2ad51e20c`) reads `actor.id` through `Identifiable.id.getter`, traps
+  if `.remote`, locks `actorTable`, and stores `WeakActorRef(actor)` — **weakly**, so the table
+  never keeps an actor alive.
+- **`resignID(ActorID)`** (`0x2ad51e4a8`) traps on `.remote` (a bare `brk`, no message) and does
+  `actorTable[local] = nil`.
+- **`resolve(id:as:)`** — the table above.
+- **`makeInvocationEncoder()`** (`0x2ad51e524`) is 40 bytes with no calls: zero an 88-byte struct
+  and plant the empty-array singleton at `+0x18` and `+0x20`. That is an independent
+  corroboration of the encoder's stored properties and their order —
+  `protocolStub: SwiftType?` (3 words), `genericSubsitutions: [SwiftType]`, `arguments`,
+  `errorType: SwiftType?`, `returnType: SwiftType?` = `0x58` exactly. It also confirms
+  `SwiftType` is two words of `String` plus one `Any.Type`, as the *SwiftType* section says.
+- **`remoteCall` / `remoteCallVoid`** (`0x2ad51e9d8`, `0x2ad51ec44`) both funnel into a private
+  `(remoteCall)<A, B>(actor:target:invocation:result:)` (`0x2ad51e54c`), which reads `actor.id`,
+  calls `(extension in XPCDistributed) DistributedActor.session.getter`
+  (`0x2ad4f8b34` — requires tag 1, returns the `Remote`'s session, nil for a local id), throws
+  `RemoteInvocationCancellationError` if that is nil, and otherwise dispatches
+  `OutboundSessionProtocol.sendInvocation`. The two `swift_conformsToProtocol` calls in the public
+  `remoteCall` are the serialization-requirement checks the compiler emits for the witness.
+
+  **`remoteCallVoid` binds the result type to `Ack`.** Both `Ack : Decodable` and `Ack : Encodable`
+  witness-table accessors are called at the tail call into the private `remoteCall`. That is a
+  second, caller-side source for the `[0, {}]` finding under *What fills `A` for a void return*,
+  which until now rested only on the reply-handler chain.
+
+The two session protocols, read from their method descriptors:
+
+```
+InboundSessionProtocol  : Internal.Identifiable
+    actorSystem, isBidirectional, handleActorShared, handleReceivedRequest,
+    handleReceivedNotification, handleTransportCancellation
+OutboundSessionProtocol : Internal.Identifiable
+    actorSystem, sendInvocation
+```
+
+### The inbound path
+
+**The userInfo dictionary, resolved exactly.** `handleReceivedRequest` builds a two-entry
+dictionary literal:
+
+```
+[ CodingUserInfoKey("com.apple.xpc.distributed/Session") : session,
+  Distributed.CodingUserInfoKey.actorSystemKey            : session.actorSystem ]
+```
+
+The first key is a lazily-initialised global (`swift_once` at `0x2ad50b2fc`) built by
+`CodingUserInfoKey.init(rawValue:)` from the 33-byte string at `0x2ad526030`, read out of the
+image: `"com.apple.xpc.distributed/Session"`. The second is the *standard* Swift key from
+`libswiftDistributed`. The values were read from the `Any` existential boxes the literal is built
+into: `session` at `Session` itself, and `session.actorSystem` loaded from `Session+0x10` with
+`type metadata accessor for XPCSystem` as its metadata. `Session.sendInvocation` builds the same
+dictionary on the way out.
+
+This closes the *Identity* section's "session-in-userInfo mechanism is also Apple's" from a
+failure string into a concrete contract. Both `ActorID.encode(to:)` and `ActorID.init(from:)`
+look up the first key and `swift_dynamicCast` the value; the mangled cast targets both end in
+`_p`, so both cast to a **protocol existential**, and the two are different protocols. Which
+protocol each one names is *inferred*, from the field type and the failure strings, not read out
+of the descriptors: encode needs `handleActorShared`, so `any InboundSessionProtocol`; decode
+stores into `Remote.session : OutboundSessionProtocol`, so `any OutboundSessionProtocol`. Both
+sites carry the same two messages, `"Bug in XPCDistributed: Session required in user info
+dictionary"` for a missing key and `"Bug in XPCDistributed: Session conforms to inbound session"`
+for a failed cast.
+
+**`Session.handleReceivedRequest(_:replyUsing:)`** (`0x2ad512a04`) is 7060 bytes of synchronous
+prologue. In order: build the userInfo; `XPCDictionary.decode(as: RemoteInvocationRequest.self,
+forKey: "payload", withUserInfo:)`; `Session.remoteSatisfiesActorSystemRequirement()`;
+`Session.cancel(because:)` on one failure arm; `RemoteCallTarget.init(_:)` from
+`remoteCallIdentifier`; a priority clamp against `Task.currentPriority` and
+`TaskPriority.userInitiated` via `Comparable.<`; then
+`Task.immediate(name:priority:executorPreference:operation:)` to spawn the execution task, and
+`Session.addPendingInvocationExecutionTask(_:withID:)` to register it.
+
+**The success path** is `closure #2 () async -> ()` (`0x2ad514598`):
+
+1. `os_transaction_create` with a name built from the target;
+2. `withUnsafeCurrentTask { … }`, which stashes the task for later escalation;
+3. **`Session.waitForLocalInterfaceActivation()`** — inbound execution blocks until the session's
+   local interface has been activated. This is where the `ActivationToken` machinery touches the
+   request path;
+4. `Task.isCancelled`;
+5. `Session.resolveSharedActor(at: key)` — the target actor;
+6. `swift_conformsToProtocol2` against the protocol descriptor at `0x2ad527dd8`, which is
+   `XPCSystem.RestrictedAccessDistributedActor : DistributedActor` with one requirement,
+   `peerRequirement.getter : XPCPeerRequirement`. If the resolved actor conforms, the path reads
+   `Session.RemoteInterface.auditToken` and calls
+   `audit_token_t.satisfies(requirement:)` — **a per-actor peer entitlement check**, separate
+   from `XPCSystem.peerRequirement`;
+7. `swift_getEnumCaseMultiPayload` on the `InvocationContents`;
+8. `DistributedActorSystem.executeDistributedTarget(on:target:invocationDecoder:handler:)`;
+9. reply through `Session.replyToPendingInvocation(withID:replyBlock:)`.
+
+**`EncodedInvocationDecoder`'s role** is to be the `invocationDecoder` of step 8.
+`XPCSystem.InvocationDecoder` is `{ mode: encoded | direct }` and is the conformance's
+`InvocationDecoder`, so what `executeDistributedTarget` receives is
+`InvocationDecoder(mode: .encoded(EncodedInvocationDecoder))`, built by
+`InvocationContents.init(from:)` as the *Request* section describes.
+`EncodedInvocationDecoder` carries the four `DistributedTargetInvocationDecoder` witnesses, and
+its private helper is spelled
+`static EncodedInvocationDecoder.(_decodeErrorType)(from: KeyedDecodingContainer<InvocationCodingKeys>)`
+— which independently confirms that the decoder reads the `InvocationCodingKeys` container
+directly, with the misspelling and all.
+
+**`pendingInvocationExecutionTasks` is `[ID64 : Task<(), Never>]`, keyed by the request body's
+`id`** — the same `ID64` that `RemoteNotification.invocationCancelled(id:)` names, not the
+envelope's `headerID`. The five accessors are named in the symbol table and leave nothing to
+infer:
+
+```
+addPendingInvocationExecutionTask(_: Task<(), Never>, withID: ID64)
+escalatePendingInvocationExecution(withID: ID64, to: TaskPriority)
+cancelPendingInvocationExecutionTask(withID: ID64)
+cancelAllPendingInvocationExecutionTasks()
+replyToPendingInvocation(withID: ID64, replyBlock: () -> ()) async
+```
+
+**How `invocationCancelled` reaches it.** `Session.handleReceivedNotification(_:)`
+(`0x2ad516268`) decodes a `RemoteNotification` from `"payload"`, calls
+`swift_getEnumCaseMultiPayload`, and dispatches on the tag:
+
+| tag | case | handler |
+|---|---|---|
+| 0 | `invocationCancelled` | `cancelPendingInvocationExecutionTask(withID:)` |
+| 1 | `invocationEscalated` | `escalatePendingInvocationExecution(withID:to:)` |
+| 2 | `responseEscalated` | `Session.verifyEscalatedInvocationResponse(withID:to:)` |
+
+That also confirms the case order the *Notification* section lists, from the branch targets
+rather than from declaration order.
+
+### Kind, LocalInterface, and ActivationToken
+
+Less was resolved here, and the parts that were not are marked.
+
+`Session.Kind` is a multi-payload enum with cases `xpc` and `local`. `Session` has exactly two
+initialisers —
+
+```
+init(actorSystem: XPCSystem, transport: Transport,           options: InitializationOptions) throws(SetupError)
+init(actorSystem: XPCSystem, local:     LocalSessionState,   options: InitializationOptions)
+```
+
+— so `xpc` carrying the `Transport` and `local` carrying the
+`LocalSessionState { label, peerSession, cancellationFuse }` is the obvious reading. **Marked as
+inference**: the two initialisers and the two payload types are facts; the case-to-payload
+assignment was not read out of `Kind`'s field descriptor payload records.
+
+`InitializationOptions` is `{ rawValue }`, an OptionSet. **Its members were not resolved.**
+
+`isBidirectional` is a plain stored `Bool` at `Session+0x70`, also an `InboundSessionProtocol`
+requirement. It gates the entire shared-actor mechanism: `addSharedActor` asserts it, and
+`TestHook.mapToLocalActorID` returns nil without it. **Where it is set was not resolved** — the
+obvious candidate is `InitializationOptions`, which is exactly the kind of guess this document
+does not make.
+
+**`ActivationToken` does not cross the wire.** It has `CodingKeys { id }` and a real `Codable`
+conformance, and the conformance is never used to build a packet. The scan that establishes this
+is the one that enumerates *every* way a Swift value becomes a packet body: for each direct
+`BL`/`B` in `__text`, resolve the target through `__auth_stubs` → `__auth_got` → `dladdr` and keep
+the ones landing on `XPC.XPCDictionary.encode(_:forKey:withUserInfo:)` — the single libswiftXPC
+call that `Packet.Payload.init(encoding:userInfo:)` is built from. There are **eleven**, and every
+one is accounted for:
+
+| sites | function | body |
+|---|---|---|
+| 1 | `Payload.init<A>(encoding:userInfo:)` | the generic helper itself |
+| 1 | `RemoteInvocationReplyEncoder.encodeReturn<A>(value:)` | `RemoteInvocationResponse<A>` |
+| 1 | `RemoteInvocationReplyEncoder.encodeReply<A,B>(with:)` | `RemoteInvocationResponse<A>` |
+| 6 | `Session.handleReceivedRequest` and its closures | `RemoteInvocationResponse<Never>` |
+| 1 | `Session.sendNotification(_:)` | `RemoteNotification` |
+| 1 | `Session.sendInvocation` | `RemoteInvocationRequest` |
+
+So there are three body types and no fourth, `ActivationToken` is not among them, and the
+*Envelope* section's three packet kinds are complete on the producing side as well as the
+consuming side.
+
+What `ActivationToken` actually is, on the evidence of its uses: an in-process handoff receipt.
+`TransportReceiver.(peerHandler)` is
+`@Sendable (LocalInterface) async -> (result: (), token: ActivationToken)`;
+`Session.(ownedLocalInterfaceActivationEvent)` is `OwnedAwaitableEvent<ActivationToken>?`; and
+`EphemeralService.Receiver.listen(forPeersSatisfying:executingForEachPeer:)` takes the same
+closure type. The token is what a peer-handling closure returns to prove it ran, and
+`waitForLocalInterfaceActivation` (step 3 of the inbound path) is what waits on it. Whether some
+*other* framework encodes an `ActivationToken` is not a question this image can answer, so
+**the purpose of its `Codable` conformance is unresolved.** It is not part of this protocol.
+
+### Merged witness-table accessors do not name their type
+
+A new rule for the *Verifying a container choice* discipline, earned during this round.
+
+Symbols of the form `merged lazy protocol witness table accessor for type X and conformance
+X : P` name **one** of several types whose accessor bodies were folded together. These accessors
+are parameterised helpers: the caller loads the cache variable, the instantiation function, and
+the **conformance descriptor** into `x0`/`x1`/`x2` and then branches to the shared body. The type
+therefore lives in the caller's constants, not in the callee's symbol name.
+
+This cost a wrong attribution mid-investigation. The payload encode in `Session.sendInvocation` is
+preceded by a call annotated `merged lazy protocol witness table accessor … RemoteNotification :
+Encodable`, which reads as though the outbound request path encodes a notification. The
+conformance descriptor it is handed is `0x2ad523900`, and that address is
+`protocol conformance descriptor for Session.RemoteInvocationRequest : Swift.Encodable`. Resolve
+the descriptor, not the symbol.
+
+The corollary is the sharper half: **the absence of a named witness-table accessor proves
+nothing**, because the accessor may exist under another type's name. An earlier draft of this
+section concluded "`ActivationToken` is never encoded" from exactly that non-evidence. The claim
+survived only because it was re-established by the eleven-site payload scan above, which reasons
+about call sites rather than about symbol names.
+
+### Two more probes worth keeping
+
+Neither needs an extracted binary; both read the live image, like `verify-containers.py`.
+
+- **A callers-of scan over `__text`.** Given a target, walk every 4-byte word in the range
+  spanned by the `T`/`t` symbols, decode `BL`/`B`, and report the enclosing symbol of each site.
+  Three claims in this section are absence or exhaustiveness claims and none of them could have
+  been made without it: zero callers of `TestHook.mapToLocalActorID`, exactly two of
+  `resolveSharedActor`, eight of the `<Never>` accessor. A variant that resolves each target
+  through `__auth_stubs` → `__auth_got` → `dladdr` and groups by demangled name is what produced
+  the eleven-site payload table, and is the general form — it answers "who calls this" for
+  cross-image targets too, where a raw address comparison cannot, because the slide differs per
+  process.
+- **A live reader for `direct field offset` variables.** Four instruction-level readings in this
+  section turn on knowing that `+0x70` is `isBidirectional` and `+0x30` is `sharedActors`. The
+  offsets are not declaration order — `activationFuse` sits at `+0x99`, unaligned, between two
+  8-aligned fields — so they cannot be derived from the field descriptor list.
+
+They live in this round's scratch directory and are **not** committed. If they are worth keeping
+they belong next to `dump-function.py` in `xpcdump/macos27-XPCDistributed/`, with known-answer
+controls in the style `verify-containers.py` uses — for the callers-of scan, a target whose call
+count is independently known.
+
 ## Verifying a container choice
 
 Three claims in this document turn on *which* container a hand-written `Codable` conformance
@@ -639,8 +1087,9 @@ misread shows up as the controls coming out wrong rather than as a silently plau
 - `Transport.TransportError { transportCancelled, taskCancelled }` and
   `RawTransportError { rawTransportCancelled }` — our Phase A already matches these names.
 - `Service { isMach, name }`, `EphemeralService { debugName, endpoint }`, service prefixes
-  `com.apple.XPCDistributed.Service.` and `com.apple.XPCDistributed.EphemeralService.`,
-  session label `com.apple.xpc.distributed/Session`.
+  `com.apple.XPCDistributed.Service.` and `com.apple.XPCDistributed.EphemeralService.`.
+  `com.apple.xpc.distributed/Session` was listed here as a "session label". **It is not a label
+  — it is a `CodingUserInfoKey` raw value**, and it is load-bearing; see *The session layer*.
 - `XPCSYSTEM_PRESERVE_SELFIPC`, an environment variable gating `preserveSelfIPC`.
 - `ServiceRegistry` and `InProcessRawTransport` both exist in Apple's build. The previous design
   omitted `ServiceRegistry` as unnecessary; that remains our choice, since a registry is not
@@ -657,6 +1106,8 @@ misread shows up as the controls coming out wrong rather than as a silently plau
 | 5 — invocation bodies | **Rewrite.** Wrong keys, wrong envelope, wrong error model. |
 | 6 — InvocationEncoder | **Rewrite.** Must produce `protocolStub`/`genericSubsitutions`/`arguments`/`errorType`/`returnType`. |
 | Phase A handshake | **Delete from the interop path.** `ProtocolVersion`, `HelloBody`, `HelloAckBody`, and negotiation are not interoperable. |
+| `Session.remoteID(for:)` | **Fix, and diverge on purpose.** Consult the locally shared table first, in the shape of `TestHook.mapToLocalActorID`. Apple returns a proxy here; the divergence is not peer-observable. See *The session layer*. |
+| the `ActorID` beside each shared instance | **Not needed.** Read `.id` off `any DistributedActor` through the associated-type/conformance witnesses, as Apple's own test hook does. |
 
 ## Status
 
@@ -667,7 +1118,19 @@ account for at all, is resolved too — see *Envelope*.
 
 One thing is now marked unresolved, and it is deliberately not peer-observable: whether the
 envelope's `headerID` and the request body's `id` are the same number. See *Envelope* for what
-the inference rests on and why interop does not turn on it.
+the inference rests on and why interop does not turn on it. The inference is now a little
+narrower: a callers-of scan over `__text` finds that `Transport.sendRequest(id:payload:)` has
+**exactly one** call site in the whole image, `closure #1` in `Session.sendInvocation` — so there
+is only one place an outgoing `headerID` can come from, and only one `cas` on that path mints an
+id. Following the closure's capture chain to the store would close it; that was not done.
+
+`Session` and the `DistributedActorSystem` conformance are covered by *The session layer*. What
+that round left unresolved, listed so it is not mistaken for settled: the case-to-payload
+assignment of `Session.Kind`; the members of `Session.InitializationOptions`; where
+`isBidirectional` is written; which protocol existential each of `ActorID`'s two coding methods
+casts the userInfo value to (inferred from the field type and the failure strings, not read from
+the descriptors); and the purpose of `ActivationToken`'s `Codable` conformance, which is not
+exercised by any packet path in this image.
 
 The goal is **our own protocol matched to Apple's format**, not live interop with Apple's
 services — so the entitlement wall (`"Peer failed XPCSystem's entitlement check"`, enforced by
