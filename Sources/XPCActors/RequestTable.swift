@@ -18,6 +18,25 @@ public actor RequestTable {
 
     private var waiters: [UInt64: CheckedContinuation<Outcome, Never>] = [:]
 
+    /// Set by ``failAll(with:)`` and never cleared: the transport is gone and is not
+    /// coming back, so every later caller gets this instead of a waiter.
+    ///
+    /// Without it, a caller that entered *after* `failAll` registered into a table
+    /// nothing would ever complete — and this protocol has no timeout, so that is a
+    /// permanent hang rather than a slow failure. The bug was real and was masked:
+    /// `Transport.cancel` cancels the raw transport before failing the table, so the
+    /// later `send()` threw and the catch path resumed the caller. Its only guard was
+    /// an ordering in a different type, with nothing pinning it.
+    ///
+    /// Apple has the same problem and solves it in the same shape.
+    /// `RequestManager.Request.State` is
+    /// `initial -> (active(handler) | cancelled(B?)) -> completed`, and `cancelled`
+    /// *stores* an outcome that arrived before any reply handler was installed;
+    /// installing one then delivers it immediately and reports `false`. Theirs is
+    /// per-request and ours is per-table, which is the right granularity for the one
+    /// event we have: the transport dying takes every request with it.
+    private var terminalFailure: TransportError?
+
     public init() {}
 
     public var pendingCount: Int { waiters.count }
@@ -39,6 +58,13 @@ public actor RequestTable {
         seq: UInt64,
         sending send: () throws(RawTransportError) -> Void
     ) async -> Outcome {
+        // Checked first: once the transport is gone there is nothing to send on, and
+        // registering a waiter would be a hang. Deliberately *before* `send` runs, so
+        // this does not depend on the raw transport reporting the failure a second
+        // time — it usually does, which is what hid this.
+        if let terminalFailure {
+            return .failed(terminalFailure)
+        }
         // Checked before installing the cancellation handler, so the early return
         // cannot let `onCancel` complete the *other* caller's waiter.
         guard waiters[seq] == nil else {
@@ -74,8 +100,10 @@ public actor RequestTable {
         continuation.resume(returning: outcome)
     }
 
-    /// Fail every outstanding request. Used when the transport dies.
+    /// Fail every outstanding request, and every future one. Used when the transport
+    /// dies, which is not a state anything recovers from — see ``terminalFailure``.
     public func failAll(with error: TransportError) {
+        terminalFailure = error
         let outstanding = waiters
         waiters.removeAll()
         for (_, continuation) in outstanding {
