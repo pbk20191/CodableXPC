@@ -78,7 +78,10 @@ ones are inline small strings, which is precisely what synthesized `stringValue`
 
 ## Envelope
 
-`Transport.Packet` is `{ header, payload }`; `Packet.Payload` wraps a single field, `dictionary`.
+`Transport.Packet` is `{ header, payload }`; `Packet.Payload` wraps a single field, `dictionary`
+— and that dictionary has exactly one entry, `"payload"`, holding an overlay-encoded message.
+See *What actually carries an XPCDistributed body* below; that section is load-bearing for the
+transport work and supersedes any reading of this one that assumes native xpc structures.
 
 `Packet.Header` is a multi-payload enum:
 
@@ -523,34 +526,51 @@ disassembly, and string tables. The strongest available check is internal consis
 why the `.mm`-versus-binary disagreement above matters so much: it is the one case where two
 sources could be compared, and they disagreed. Treat single-sourced claims accordingly.
 
-### Open, and single-sourced — resolve these before building on them
+### What actually carries an XPCDistributed body — resolved, and it changes the plan
 
-Both surfaced during R2's review. Neither blocks R2; both block the task that touches them.
+Both items previously open here are closed, and closing them turned up something larger.
 
-**1. `Packet.Payload` cannot carry a response, and nothing here says what does.** A response
-provably encodes to an unkeyed *array* (`RemoteInvocationResponse.encode(to:)` →
-`singleValueContainer()` around `Either.encode(to:)` → `unkeyedContainer()`). But Apple's
-`Payload` is not `Codable` — it stores an `XPCDictionary`:
+**`Packet.Payload` is `{ "payload": <body> }`.** `Payload.init<A>(encoding:userInfo:)`
+(`0x2ad4e1488`) creates an empty `XPCDictionary` and calls
+`XPCDictionary.encode(value, forKey:, withUserInfo:)`. The key is a Swift small string built
+from immediates rather than a `__cstring`, which is why it does not appear in the string tables;
+decoded from the `movz`/`movk` pair it is **`"payload"`**. `Payload.init(from: XPC.XPCDictionary)`
+(`0x2ad4e1668`) reads the same key. So there is no conflict between an array-shaped response and
+a dictionary-shaped payload: the payload is a dictionary with one entry, and the entry is the
+body, whatever shape it has.
+
+**But the body is not a native xpc structure at all.**
+`XPCDictionary.encode(_:forKey:withUserInfo:)` in `libswiftXPC` calls
+`XPCReceivedMessage.encodeMessage(_:userInfo:)` and stores its result under the key. That is the
+XPC overlay's Codable coder, and its output is an **envelope whose `_CodableBody` is one
+`xpc_data` byte stream** — not a dictionary of named xpc entries. Measured, not inferred: an
+overlay-encoded message's body is `XPC_TYPE_DATA` and none of the value's fields appear as xpc
+entries (`AppleDecoderIntegerToleranceTests`).
+
+So an XPCDistributed request on the wire is:
 
 ```
-Packet.Payload.dictionary.getter : XPC.XPCDictionary
-Packet.Payload.init(from: XPC.XPCDictionary) -> Packet.Payload?
-Packet.Payload.init<A: Encodable>(encoding: A, userInfo: …) throws -> Packet.Payload
+Packet.Payload  ->  { "payload": { "_CodableBody": <byte stream>, "_CodableCoderVersion": 1, ... } }
 ```
 
-So something wraps that array somewhere this document does not describe. Our own
-`Payload.swift` throws `bodyIsNotADictionary`, so the collision is guaranteed to surface in the
-transport task. **Resolve `Packet.Payload.init<A>(encoding:)` and the overlay coder's handling of
-a non-dictionary root first.** The *Envelope* section above says "`Packet.Payload` wraps a single
-field, `dictionary`" and stops — a field-list statement with no container resolved, which is
-precisely the shape of the two errors below.
+and every key name in this document — `genericSubsitutions`, `targetedSharedActor`, the
+`WireCode` discriminator, `_0` — lives *inside that stream*, encoded by the overlay's own
+tagging, not as xpc dictionary keys.
 
-**2. Every discriminator rests on XPC integer typing, unverified.** Our decoder requires xpc type
-`uint64` for the response tag, `SharedActorKey.WireCode`, `basePriority`, and `priority`, and
-rejects an `int64`-typed one. That assumes Apple's XPC overlay coder writes a small `UInt8` as
-`xpc_uint64` rather than `xpc_int64`. Nothing here establishes that. If it is wrong, every
-discriminator fails to decode from a real peer at once — a loud failure rather than a silent
-corruption, which is the only good news about it.
+**What this does and does not invalidate.** Everything this document establishes about the
+*Codable* level stands unchanged: the types, the `CodingKeys` and their exact spellings, which
+containers each conformance opens, which optionals are omitted, the unkeyed pairs and their tag
+values. Those are properties of the `Encodable` conformances and are independent of which
+`Encoder` runs. What changes is which encoder must run at the transport boundary: **the overlay
+coder (`XPCOverlayCoder`, the iOS 26 generation), not a native-xpc `Encoder`.** Fixtures pinned
+through a native-xpc encoder pin the shape correctly and are not the wire.
+
+The repo's overlay coder is already interop-capable in the direction that matters: a message it
+encodes decodes in Apple's own coder in-process, verified by `AppleCoderBridge`.
+
+**The signedness question was the wrong question.** Whether a small `UInt8` becomes `xpc_int64`
+or `xpc_uint64` cannot arise, because no field of the body becomes an xpc integer. Signedness is
+the byte stream's business, and `XPCOverlayCoder`'s generation table documents it there.
 
 That warning has already been earned once. The `ID64` and `SwiftType` container claims were
 originally written as inferences from a field list, and both were wrong — they had silently
