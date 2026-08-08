@@ -151,6 +151,59 @@ this is either an explicit `if let` or an inlined `encodeIfPresent`; both omit t
 The same holds for the other optionals — `errorType`, `returnType`, `basePriority`. A nil
 optional means **the key is not written**, never a null value.
 
+### How protocolStub is recorded, and why genericSubsitutions is always empty
+
+`DistributedTargetInvocationEncoder` has no `recordProtocolStub`, and Apple did not add one —
+`InvocationEncoder`'s only protocol witnesses are the four `record*` methods plus
+`doneRecording`. The stub is captured inside **`recordGenericSubstitution`**. Both of its error
+strings resolve to that one function (`0x2ad4ff6e4`, 340 bytes):
+
+```
+0x2ad4ff750   "Encoding second _DistributedActorStub "
+0x2ad4ff788   "Failed to record generic substitution of type "
+```
+
+It branches early on the recorded type, calls `SwiftType.init<A>(A.Type)`, and reaches for
+`Distributed.DistributedActorCodingError`'s witness table — so both failures are thrown, not
+trapped. A type conforming to `_DistributedActorStub` goes to `protocolStub`, a second one is an
+error, and a type with no mangled name is an error.
+
+**`genericSubsitutions` is always empty on the wire.** `InvocationEncoder.encode(to:)`
+(`0x2ad4ffb38`) ends with
+
+```
++0x308   "Bug in XPCDistributed: Found generic substitutions during encoding."
++0x34c   BL   <fatal-error reporter>
++0x354   BRK        <-- trap, not a throw
+```
+
+Apple's own encoder *crashes* rather than serialise a non-empty `genericSubsitutions`. Two
+readings are possible — the array is drained into `protocolStub` and the check is defensive, or
+generic distributed funcs are simply unsupported — and they give the **same wire outcome**, which
+is what makes the conclusion safe: the key is present and its value is `[]`.
+
+Note the strength of each claim here. The two string attributions and the `BRK` are resolved from
+the binary. "Therefore the array is always `[]`" is an inference *from* them — a robust one,
+because both available readings agree, but an inference. It has not been observed on a wire.
+
+### basePriority is derived, not passed
+
+`RemoteInvocationRequest`'s real initializer is
+
+```
+init(id: ID64, targetedSharedActor: SharedActorKey,
+     remoteCallTarget: Distributed.RemoteCallTarget, invocation: InvocationEncoder)
+```
+
+— note that `invocation` is the **encoder itself**, which is `Encodable`, and that there is no
+`basePriority` parameter. `basePriority` has a getter and no setter, so the init computes it.
+
+The name and type match Swift's `Task.basePriority: TaskPriority?` exactly, which was confirmed
+to exist and to be optional by compiling against it. That is the obvious source, and it fits the
+protocol's shape: the receiver executes at the caller's priority, and `invocationEscalated` /
+`responseEscalated` exist to raise it afterwards. **Marked as inference** — the getter-only
+property and the name match are facts; that the init reads `Task.basePriority` is not resolved.
+
 ### basePriority and priority
 
 `TaskPriority`, and it reaches the wire as a **bare `UInt8`** — not `{"rawValue": n}`. The
