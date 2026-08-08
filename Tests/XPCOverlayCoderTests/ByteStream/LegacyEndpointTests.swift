@@ -35,6 +35,27 @@ final class LegacyEndpointTests: XCTestCase {
         return target.endpoint
     }
 
+    /// An `iOS17` coder cannot carry one, and says so rather than writing a
+    /// message the peer would misread.
+    ///
+    /// Nothing was lost by that: `XPCEndpoint` is macOS 15 / macCatalyst 18, so
+    /// it shipped *with* the generation this module calls `.iOS18`, alongside the
+    /// `XPCCodableObject` machinery that carries it. The iOS 17 binary mentions
+    /// neither — 0 references against 20 and 259 — because in that release there
+    /// was nothing to carry.
+    func testTheOlderGenerationCannotCarryAnEndpoint() throws {
+        let referral = Referral(label: "forwarding", endpoint: try liveEndpoint())
+
+        XCTAssertThrowsError(
+            try XPCLegacyOverlayEncoder(generation: .iOS17).encode(referral),
+            "an iOS 17 message has no side array for an endpoint to go in")
+
+        // And the generation that introduced it handles it fine.
+        XCTAssertEqual(
+            try XPCLegacyOverlayEncoder(generation: .iOS18).encode(referral)
+                .outOfLineObjects.count, 1)
+    }
+
     func testTheKeyMatchesApples() {
         // Equality is by rawValue, so a key built from the same string is their key.
         XCTAssertEqual(CodingUserInfoKey.xpcLegacyCodableObjects.rawValue, "_XPCCodable")
