@@ -20,7 +20,7 @@ extension CodingUserInfoKey {
     ///   confirmed for this generation too: Apple's iOS 18 encoder, run in an
     ///   18.6 simulator, names `_XPCCodable` verbatim in the error it throws
     ///   when the array is absent.
-    public static let xpcLegacyCodableObjects = CodingUserInfoKey(rawValue: "_XPCCodable")!
+    static let xpcLegacyCodableObjects = CodingUserInfoKey(rawValue: "_XPCCodable")!
 
     /// The same array, unwrapped. `XPCArray` is what Apple's code casts to, so the
     /// key above has to hold one — but that type carries an OS floor this module
