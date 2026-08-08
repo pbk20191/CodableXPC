@@ -141,11 +141,26 @@ That makes **`ID64` the wire representation of every identifier in this protocol
 id here, and the `dynamic` shared-actor key. Anywhere our design writes a bare `uint64`, Apple
 writes a one-field dictionary.
 
-`InvocationContents` is an enum: `send | recv`. This is the `contents` nesting the previous design
-flattened away, and it is load-bearing.
+### InvocationContents is not a wire discriminator — resolved
 
-⚠️ **Unverified:** what distinguishes `send` from `recv`, and the payload of each. Read
-`XPCSystem.Session.RemoteInvocationRequest.InvocationContents`'s own `encode(to:)`.
+`InvocationContents` is an enum `send | recv`, and the obvious reading — that the wire carries a
+`send`/`recv` tag — is **wrong**. Disassembling `InvocationContents.init(from:)` settles it: the
+function never opens a keyed container and never looks for a case name. It calls
+`EncodedInvocationDecoder.init(from:)` directly on the incoming decoder, then injects an enum tag
+(0 or 1) into the local value.
+
+So `send` versus `recv` is an **in-memory** distinction — which direction this process holds the
+invocation in, an encoder it is about to send versus a decoder it just received — not something a
+peer observes. On the wire, `contents` is simply the encoded invocation: the
+`InvocationCodingKeys` dictionary described above.
+
+This matters for our implementation in the good direction: `contents` needs no wrapper enum, just
+the invocation dictionary. It is also a warning about reading field lists alone — the name
+`InvocationContents` with two cases looks exactly like a wire tag, and is not one.
+
+Apple's decoder type here is `EncodedInvocationDecoder`, distinct from `InvocationDecoder`; it
+carries the `DistributedTargetInvocationDecoder` conformance
+(`decodeGenericSubstitutions`, `decodeNextArgument`, `decodeErrorType`, `decodeReturnType`).
 
 ⚠️ **Unverified:** `encode(to:)` guards everything after `id` behind a condition. Either a group
 of keys is genuinely conditional, or the decompiler mis-structured the control flow. Resolve it —
@@ -283,16 +298,23 @@ encode as an `ID64` struct, not a bare `uint64`.
 
 ## Before any of this can claim byte fidelity
 
-Reading `SharedActorKey.encode(to:)` out of the decompilation resolved two of the original four —
-the key's coding shape, and the `ID64` question. Three remain, each of which needs the same
-treatment: find the `encode(to:)` or `init(from:)` in `xpcDistributed/*.mm` and read it.
+Three of the original unknowns are resolved: the key's coding shape and the `ID64` question from
+`SharedActorKey.encode(to:)`, and `InvocationContents` from its `init(from:)`. Three remain.
 
-1. `InvocationContents.send` vs `.recv` — what distinguishes them, and each payload. Start at
-   `XPCSystem.Session.RemoteInvocationRequest.encode`.
-2. The nested payload key name for `SharedActorKey`'s three cases — `_0` is likely but
-   unevidenced (see above).
-3. `protocolStub` — written as absent, or as null, for a concrete-actor call? Start at
+The framework has since been extracted from the shared cache
+(`dyld_shared_cache_arm64e.67`, image header at file offset `0x50bb000`) with
+`/usr/lib/dsc_extractor.bundle`, so the remaining work is ordinary disassembly against a real
+Mach-O with a full 5705-entry symbol table — including the private discriminator types the
+`.mm` dump omits entirely. The demangled symbol map is checked in as
+`xpcdump/macos27-XPCDistributed/symbols-demangled.txt`; the binary itself is deliberately not
+committed.
+
+1. The nested payload key name for `SharedActorKey`'s three cases — `_0` is likely but
+   unevidenced (see above). Disassemble the `stringValue` getter of
+   `SharedActorKey.ExportedCodingKeys`.
+2. `protocolStub` — written as absent, or as null, for a concrete-actor call? Start at
    `XPCSystem.InvocationEncoder.encode`.
+3. The conditional in `RemoteInvocationRequest.encode(to:)` (see Request, above).
 
 Until these are resolved an implementation can match Apple's *key names* but cannot be claimed to
 interoperate.
