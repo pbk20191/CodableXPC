@@ -18,6 +18,13 @@ from `__TEXT,__swift5_fieldmd`, with type names resolved through their context d
 
 Extraction script and output: `xpcdump/macos27-XPCDistributed/`.
 
+The framework was subsequently also extracted from the shared cache (`dyld_shared_cache_arm64e.67`,
+image header at file offset `0x50bb000`) with `/usr/lib/dsc_extractor.bundle`, giving a real Mach-O
+with a full 5705-entry symbol table — including the private discriminator types the `.mm` dump omits
+entirely. The demangled symbol map is checked in as `symbols-demangled.txt`; the binary itself is
+deliberately not committed. Addresses quoted below are unslid addresses from that map, which
+`verify-containers.py` re-slides against the live image.
+
 This supersedes `xpcDistributed/*.mm`, a decompilation which preserved symbol names but not
 string literals — it contains 40 quoted literals in 729 KB and not one coding key. Every claim
 below is from the shipping binary. Where something could not be read, it says so.
@@ -114,8 +121,12 @@ it is invisible to a peer.
 
 ### SwiftType
 
-Type names are not bare strings. `SwiftType` is `{ mangledTypeName, type }` — only
-`mangledTypeName` is encoded; `type` is the resolved `Any.Type`, cached.
+`SwiftType` is `{ mangledTypeName, type }` in memory — `type` is the resolved `Any.Type`, cached —
+but **on the wire it is a bare String**. `SwiftType.encode(to:)` (`0x2ad4f5940`) opens a
+`singleValueContainer()` and calls the `SingleValueEncodingContainer.encode(Swift.String)`
+thunk; `init(from:)` (`0x2ad4f59dc`) is its mirror. There is no `SwiftType.CodingKeys` in this
+build, so a keyed container is impossible. Verified mechanically — see *Verifying a container
+choice* below.
 
 `SwiftTypeCache` holds `State { nameToType, typeToName }` — the same bidirectional cache our
 Task 1 built, which stands unchanged except that it must now be wrapped by `SwiftType` at every
@@ -193,8 +204,14 @@ Failure strings: `"Failed to encode invocation request (error: "`,
 
 ## Response
 
-`Session.RemoteInvocationResponse` is `{ _value }`. The `_value` is a success payload or a
-`RemoteInvocationFailure`, a multi-payload enum coded in the synthesized shape:
+`Session.RemoteInvocationResponse` has one stored field, `_value` — but **`_value` is not a wire
+key.** The struct has no `CodingKeys`, and `encode(to:)` (`0x2ad50f8e0`) / `init(from:)`
+(`0x2ad50fa28`) both open a `singleValueContainer()`. So the response *is* its payload,
+unwrapped; there is no envelope around it. Resolved with `verify-containers.py`, which carries
+this method for exactly this reason — the field name reads like a key and is not one.
+
+The `_value` is a success payload or a `RemoteInvocationFailure`, a multi-payload enum coded in
+the synthesized shape:
 
 ```
 { "executionFailed":         { "_0": <payload> } }
@@ -243,9 +260,12 @@ of the three branches performs exactly two encodes: a `WireCode`, then the paylo
 
 | `WireCode` | payload |
 |---|---|
-| `exported` | a **`SwiftType`** — so `{ mangledTypeName: … }` |
+| `exported` | a **`SwiftType`** — which is itself a bare String |
 | `exportedRawValue` | a **String** (no witness-table call; the builtin overload) |
-| `dynamic` | an **`ID64`** — so `{ value: <UInt64> }` |
+| `dynamic` | an **`ID64`** — which is itself a bare `UInt64` |
+
+The two exported cases are therefore structurally identical on the wire (array of two, second
+element a string). That is not a problem — it is why the `WireCode` discriminator has to exist.
 
 The container is **unkeyed**. That is not an inference from the instruction sequence alone: the
 type has no `CodingKeys` of any kind in this build, so a keyed container is impossible, and each
@@ -269,14 +289,50 @@ The session-in-userInfo mechanism is also Apple's: `"Bug in XPCDistributed: Sess
 user info dictionary"`. Our `SessionCoding` seam is compatible with it.
 
 **`ID64` is on the wire** — resolved. `SharedActorKey.encode(to:)` encodes an `ID64` as the
-`dynamic` case's payload, through ID64's own `Codable` conformance. `ID64` is `{ value }`, a
-single field, so it codes as a keyed container `{ "value": <UInt64> }` rather than a bare integer.
+`dynamic` case's payload, through ID64's own `Codable` conformance. That conformance is
+hand-written and **single-value**: `ID64.encode(to:)` (`0x2ad4ef3ac`) opens a
+`singleValueContainer()` and calls the `encode(Swift.UInt64)` thunk; `init(from:)`
+(`0x2ad4ef440`) opens a `singleValueContainer()` and calls `decode(UInt64.self)`. So an `ID64`
+is a **bare `UInt64`** on the wire, not `{ "value": … }`.
+
+> An earlier revision of this document claimed `{ "value": <UInt64> }`, reasoning that a
+> single-field struct codes as a keyed container. That was an inference from the field list, not
+> disassembly, and it was wrong — it contradicted this document's own rule two sections up
+> (no `CodingKeys` ⇒ no keyed container). The `{ value: }` shape belongs to the older `.mm` dump
+> build (`xpcDistributed/XPCDistributed_01.mm:8141`), which does have an `ID64.CodingKeys`;
+> macOS 27 does not.
 
 That is narrower than it first looks, and it does **not** overturn the previous design's rule.
 What crosses is the *dynamic sharing counter*, which is exactly the `SharedActorKey` payload — not
 `RawActorID.Local`'s `actorSystemID` / `instanceID`. Those two remain process-local, so
-`ActorID.encode` as built in Task 3 stands. What changes is only that our `.dynamic(UInt64)` must
-encode as an `ID64` struct, not a bare `uint64`.
+`ActorID.encode` as built in Task 3 stands. And because `ID64` is a bare `UInt64`, our
+`.dynamic(UInt64)` payload is already wire-correct as written — it just has to go through
+`ID64`'s conformance for the types to line up.
+
+## Verifying a container choice
+
+Three claims in this document turn on *which* container a hand-written `Codable` conformance
+opens. That is checkable mechanically, and single-sourced inference has already been wrong once
+here, so the rule is: **do not infer a container from a field list — resolve the call.**
+
+Two checks, cheapest first.
+
+1. **Reflection metadata.** Swift's synthesized `Codable` always emits a `CodingKeys` enum, and
+   `field-descriptors.txt` captures them (all 13 in this build, including one on the field-less
+   `struct Ack`). A type with no `CodingKeys` there has a hand-written conformance and *cannot*
+   be using a keyed container. `ID64`, `SwiftType`, `XPCSystem.ActorID`, `SharedActorKey`, and
+   `SharedActorKey.WireCode` all lack one.
+2. **Resolve the branch.** `dlopen` the framework, take `_dyld_get_image_vmaddr_slide`, decode
+   the `BL`s in the function body at its address from `symbols-demangled.txt`, follow each into
+   `__auth_stubs` (`adrp`/`add`/`ldr x16`), read the `__auth_got` slot, mask off the PAC bits,
+   and compare against `dlsym` of the `…Tj` dispatch-thunk manglings. Get those manglings by
+   `nm -u` on a two-line Swift file that calls `singleValueContainer()` / `unkeyedContainer()`
+   — do not hand-mangle them, the names are easy to get subtly wrong.
+
+`xpcdump/macos27-XPCDistributed/verify-containers.py` does step 2 and prints the resolved thunk
+for every call in the coding methods. It needs no extracted Mach-O — it reads the live image.
+`SharedActorKey` (unkeyed) and `Ack` (keyed) are in its output as labelled controls, so a
+misread shows up as the controls coming out wrong rather than as a silently plausible answer.
 
 ## Other surface worth reproducing
 
@@ -306,7 +362,7 @@ encode as an `ID64` struct, not a bare `uint64`.
 |---|---|
 | 1 — TypeName cache | **Keep.** Matches `SwiftTypeCache.State`. Needs a `SwiftType` wrapper added at the wire boundary. |
 | 2 — SharedActorKey | **Rewrite.** Explicit discriminator was right; case names, payload types, and container (unkeyed pair, not a keyed dict) all wrong. |
-| 3 — ActorID | **Keep**, pending the `ID64`-on-the-wire question. Field names already match. |
+| 3 — ActorID | **Keep.** Field names already match. `ID64` needs a hand-written single-value `Codable` conformance so it lands on the wire as a bare `UInt64`; the synthesized one emits `{"rawValue": …}`. |
 | 4 — ActorRegistry | **Keep.** Not peer-observable. |
 | 5 — invocation bodies | **Rewrite.** Wrong keys, wrong envelope, wrong error model. |
 | 6 — InvocationEncoder | **Rewrite.** Must produce `protocolStub`/`genericSubsitutions`/`arguments`/`errorType`/`returnType`. |
@@ -329,43 +385,8 @@ disassembly, and string tables. The strongest available check is internal consis
 why the `.mm`-versus-binary disagreement above matters so much: it is the one case where two
 sources could be compared, and they disagreed. Treat single-sourced claims accordingly.
 
-## What this costs the existing implementation
-| Task | Status |
-|---|---|
-| 1 — TypeName cache | **Keep.** Matches `SwiftTypeCache.State`. Needs a `SwiftType` wrapper added at the wire boundary. |
-| 2 — SharedActorKey | **Rewrite.** Explicit discriminator was right; case names, payload types, and container (unkeyed pair, not a keyed dict) all wrong. |
-| 3 — ActorID | **Keep**, pending the `ID64`-on-the-wire question. Field names already match. |
-| 4 — ActorRegistry | **Keep.** Not peer-observable. |
-| 5 — invocation bodies | **Rewrite.** Wrong keys, wrong envelope, wrong error model. |
-| 6 — InvocationEncoder | **Rewrite.** Must produce `protocolStub`/`genericSubsitutions`/`arguments`/`errorType`/`returnType`. |
-| Phase A handshake | **Delete from the interop path.** `ProtocolVersion`, `HelloBody`, `HelloAckBody`, and negotiation are not interoperable. |
-
-## Before any of this can claim byte fidelity
-
-Three of the original unknowns are resolved: the key's coding shape and the `ID64` question from
-`SharedActorKey.encode(to:)`, and `InvocationContents` from its `init(from:)`. Three remain.
-
-The framework has since been extracted from the shared cache
-(`dyld_shared_cache_arm64e.67`, image header at file offset `0x50bb000`) with
-`/usr/lib/dsc_extractor.bundle`, so the remaining work is ordinary disassembly against a real
-Mach-O with a full 5705-entry symbol table — including the private discriminator types the
-`.mm` dump omits entirely. The demangled symbol map is checked in as
-`xpcdump/macos27-XPCDistributed/symbols-demangled.txt`; the binary itself is deliberately not
-committed.
-
-1. The nested payload key name for `SharedActorKey`'s three cases — `_0` is likely but
-   unevidenced (see above). Disassemble the `stringValue` getter of
-   `SharedActorKey.ExportedCodingKeys`.
-2. `protocolStub` — written as absent, or as null, for a concrete-actor call? Start at
-   `XPCSystem.InvocationEncoder.encode`.
-3. The conditional in `RemoteInvocationRequest.encode(to:)` (see Request, above).
-
-Until these are resolved an implementation can match Apple's *key names* but cannot be claimed to
-interoperate.
-
-And even then, the honest test is a real one: stand up a peer against Apple's own
-`XPCDistributed` and exchange an invocation. Nothing short of that verifies this document —
-everything here is read from metadata and decompiled code, which shows what the binary *contains*,
-not what two processes actually accept from each other. The previous design's tier-3 technique
-(an anonymous listener dialled from the same process) does not help, because both ends would be
-ours; this needs Apple's code on one side.
+That warning has already been earned once. The `ID64` and `SwiftType` container claims were
+originally written as inferences from a field list, and both were wrong — they had silently
+reproduced the older `.mm` build's shape. `verify-containers.py` now resolves them; anything else
+in this document that turns on a container choice should be resolved the same way before an
+implementer builds against it.
