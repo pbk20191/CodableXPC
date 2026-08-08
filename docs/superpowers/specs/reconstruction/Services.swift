@@ -369,18 +369,45 @@ extension XPCDistributed.XPCSystem {
         //      and it is therefore only codable by an XPC-aware coder, because XPCEndpoint
         //      has to round-trip an `xpc_endpoint_t`.
         //
-        // It is NOT a fourth top-level payload kind. The load-bearing evidence:
-        //   * [sym] The symbol table contains no `lazy protocol witness table
-        //     accessor`/`cache variable` for `EphemeralService : Encodable` or
-        //     `: Decodable`, though it contains them for `EphemeralService`'s `Hashable`
-        //     and `Equatable` conformances (0x2d70d76f8, 0x2d70d76f0) and for
-        //     `XPC.XPCEndpoint : Encodable`/`Decodable` (0x2d58d44a8, 0x2d58d44b8). No
-        //     `protocol witness table for …EphemeralService : Swift.Encodable` symbol
-        //     exists either: every Codable conformance in this module is instantiated at
-        //     runtime through its conformance descriptor. To use such a conformance
-        //     generically, Swift code in this module must first obtain the witness table,
-        //     and that emits the lazy accessor. Nothing here does. So no code in
-        //     XPCDistributed encodes or decodes an `EphemeralService`.
+        // It is NOT a fourth top-level payload kind. Two things carry that, and an
+        // earlier revision rested it on a third that the project has since retired.
+        //
+        //   * [DECISIVE] `Packet.(Header)` has exactly three case records, and
+        //     `Header.init(from:)` **rejects any `headerCategory >= 3`** (see the
+        //     wire-format spec's Envelope section, resolved from the decoder itself).
+        //     A fourth top-level payload kind is therefore unrepresentable, whatever any
+        //     scan says. This alone settles the question and the earlier revision did not
+        //     cite it.
+        //
+        //   * [CACHE-VAR] Cache variables, not accessor *names*. A
+        //     `lazy protocol witness table cache variable` is a per-conformance `__DATA`
+        //     slot; unlike accessor symbols it cannot fold with another type's, so its
+        //     absence is readable. The module has them for `Ack`, `ID64`, `SwiftType`,
+        //     `SharedActorKey`, `RemoteInvocationRequest`, `InvocationContents`,
+        //     `RemoteNotification`, `RemoteInvocationResponse<Never>`, `TaskPriority` and
+        //     `XPC.XPCEndpoint` — a positive-control family in the same image — and has
+        //     **none** for `EphemeralService` or `ListeningToken`, while having them for
+        //     those two types' `Equatable`/`Hashable`.
+        //
+        //     Note the exact scope, which is narrower than "nothing codes it":
+        //     **XPCDistributed itself never codes one generically.** A client can still
+        //     pass one as a distributed-func argument — that call opens an existential
+        //     whose witness table comes from the *client's* module, so it would leave no
+        //     cache variable here. That is precisely the path described below, so the two
+        //     findings agree rather than compete.
+        //
+        //     (Their `CodingKeys` types *do* have cache variables, for `CodingKey` and the
+        //     description protocols. That is the synthesized `encode(to:)` body fetching
+        //     its own key witness for `container(keyedBy:)`. The body is emitted whether or
+        //     not anything calls it, so it says nothing about use.)
+        //
+        //   * [RETIRED] The earlier revision argued from the absence of a
+        //     `lazy protocol witness table accessor`. Accessors **merge**, and a merged one
+        //     names only one of the folded types — this very file records hitting that,
+        //     with an accessor mis-annotated as an unrelated Dispatch type and identified
+        //     only by matching its target against a cache-variable address. Absence of an
+        //     accessor name is not evidence. The cache-variable form above is what that
+        //     argument was reaching for.
         //   * This is NOT supported by the caller scan: `encode(to:)`/`init(from:)` are
         //     reached through witness tables, i.e. indirectly, so a direct-branch scan
         //     could not see such a call even if one existed. Stated because the scan result
