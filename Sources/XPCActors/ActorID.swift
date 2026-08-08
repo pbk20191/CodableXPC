@@ -136,10 +136,35 @@ extension ActorID: Codable {
         }
         let key: SharedActorKey
         switch raw {
-        case .remote(let remote):
-            // Send the peer's own key back. Sharing it into this session would mint a
-            // second name for an actor that already has one.
-            key = remote.key
+        case .remote:
+            // A proxy cannot be sent. This is Apple's rule -- `ActorID.encode(to:)`
+            // in the shipping `XPCDistributed` traps here with "Cannot send remote
+            // actor proxies over an session." -- and it is the rule that makes the
+            // whole scheme sound, so we keep it.
+            //
+            // Why it has to be a rule and not a convenience: a `SharedActorKey` is
+            // only meaningful in the key space of the side that minted it, and a
+            // session's `dynamic` counter starts at 1 on *both* ends, so `.dynamic(1)`
+            // names a different actor on each side with nothing on the wire to tell
+            // them apart. Writing a proxy's key into any session therefore lies about
+            // which actor it names -- whether that session is the one the key came
+            // from (the peer would receive its own key back and resolve one of its own
+            // actors) or a different one (the first session's key lands in the
+            // second's namespace).
+            //
+            // We throw where Apple traps. This is reachable from a value shape a peer
+            // influenced, and a `preconditionFailure` would kill whichever process
+            // happens to be holding the proxy rather than reporting a bad call.
+            //
+            // The cost is real, and it is Apple's cost too: an actor reference
+            // obtained from a peer cannot be handed back to that peer, nor forwarded
+            // to a third. Lifting that is a feature with a prerequisite -- the two
+            // `dynamic` key spaces must first be made attributable, by seeding each
+            // session's generator randomly or partitioning it by role -- and not a
+            // repair to this line.
+            throw EncodingError.invalidValue(self, .init(
+                codingPath: encoder.codingPath,
+                debugDescription: "cannot send a remote actor proxy over a session"))
         case .local(let local):
             guard let shared = session.shareDynamically(local) else {
                 throw EncodingError.invalidValue(self, .init(

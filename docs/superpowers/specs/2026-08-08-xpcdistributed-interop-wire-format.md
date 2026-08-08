@@ -820,24 +820,43 @@ is what Apple does. No extra storage is required, and Apple keeps none.
 
 ### What that means for us
 
-Our version of this defect and Apple's differ, and Apple's is worse. Ours returns
-`.remote(self, key)` — a proxy that would loop back into our own process. Apple's returns
-`.remote(theirSession, key)` and would send the key **to the peer**, whose `sharedActors` is a
-different key space with an independently seeded `idGenerator`. In ordinary operation that never
-collides, because a key is always interpreted in the map of the side that minted it and each side
-only ever receives the other side's keys. The reflect-back case is the one that breaks the
-invariant, and there the key either misses or hits an unrelated actor.
+**Correction — Apple does not have this defect, and the framing above is wrong.** Two paragraphs
+up, this document records that `ActorID.encode(to:)` **traps** on a `.remote` id
+(`"Cannot send remote actor proxies over an session."`). So under Apple's protocol a peer
+*cannot* send our key back to us: every `SharedActorKey` reaching `ActorID.init(from:)` was minted
+by the sender, and returning `.remote(session, key)` unconditionally is **correct by
+construction**, not an oversight. `TestHook.mapToLocalActorID` having zero callers is consistent
+with that — it is unnecessary, not forgotten.
 
-**None of this is peer-observable.** A `SharedActorKey` on the wire is the same bytes whichever
-way we resolve it locally. So consulting the local table in `remoteID(for:)` is a strict
-improvement that costs no compatibility, and `TestHook.mapToLocalActorID` is the shape to copy —
-including the `isBidirectional` guard and the dynamic `.id` read, which removes the reason we
-thought we needed to store an `ActorID` next to each shared instance.
+The defect is **ours alone**, and we create it: our `ActorID.encode` echoes `remote.key` where
+Apple traps. That divergence is what makes the reflect-back case reachable at all. It also lets a
+proxy obtained through session S1 be encoded into session S2, sending S1's key into S2's
+namespace, which is the same root cause.
 
-That is a decision, so record it as one: **we intend to diverge from Apple here**, and a test
-asserting `returned.id == local.id` would fail against a real `XPCDistributed` peer.
+And the obvious repair — consult our own table in `remoteID(for:)` — is **worse than the disease**.
+`dynamic` keys come from a *per-session* generator that both sides zero at init, so both ends mint
+`.dynamic(1)` first and the two key spaces are numerically identical with nothing on the wire to
+tell them apart. Consulting our table first therefore resolves *the peer's* actor as our own the
+moment both sides share an actor — silently, and under peer control, since the peer chooses the
+bytes. The invariant that keeps this sound is the one stated below: **a key is only ever
+interpreted in the map of the side that minted it.** The fix belongs on the encode side, matching
+Apple, and then that invariant holds by construction.
 
-### The DistributedActorSystem conformance
+**None of this is peer-observable**, which is what made the wrong repair look free. A
+`SharedActorKey` on the wire is the same bytes whichever way we resolve it locally — but "costs no
+compatibility" is not "is correct", and consulting the local table is incorrect for the reason
+above.
+
+**The decision, corrected.** We match Apple on the encode side: **refuse to encode a `.remote`
+`ActorID`**. Ours throws where Apple traps — a peer sending us an unencodable value should get a
+decodable error, not a crash in whichever process happened to hold the proxy — but the rule is the
+same, and it is the rule that makes `remoteID(for:)`'s unconditional `.remote` correct.
+
+The cost is real and is Apple's too: **a proxy cannot be passed on.** An actor reference obtained
+from a peer cannot be handed back to that peer, nor forwarded to a third. If we ever want that, it
+is a *new feature* with a *new prerequisite* — the two `dynamic` key spaces must first be made
+attributable, by seeding each session's generator randomly or partitioning it by role — and not a
+defect repair. `TestHook.mapToLocalActorID` is the shape to copy only in that world.
 
 > **Correction: `InvocationEncoder` does not conform to `Encodable`.** It has an `encode(to:)`
 > method, and `InvocationContents`'s `Encodable` witness reaches it by direct call, but the
