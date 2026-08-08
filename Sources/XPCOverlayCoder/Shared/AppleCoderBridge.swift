@@ -17,11 +17,17 @@ import XPC
 ///
 /// iOS 18 has the same initialiser under the same mangled name as a **local**
 /// symbol, so `dlsym` returns nil and ``isAvailable`` reports `false`. That is
-/// linkage, not absence: sliding to it from an exported neighbour by the delta
-/// the symbol table records produces a working `XPCReceivedMessage` that decodes
-/// a real message. This does not do that — the delta belongs to one build — and
-/// the older builds need no bridge anyway, since they export the byte-level
-/// `XPCEncoder`/`XPCDecoder` outright.
+/// linkage, not absence — the code is there and runs — but no shippable code can
+/// reach it. `dlsym` sees only exports and `@_silgen_name` needs the `.tbd`,
+/// which leaves the address, and the address cannot be discovered in process:
+/// on a device `libswiftXPC` lives in the dyld shared cache with no on-disk file
+/// and no local symbol table mapped. It was callable here only because the
+/// *simulator* ships a real dylib that `nm` can read offline, and the offset
+/// that came from belongs to that one build.
+///
+/// None of which costs anything, because the older builds need no bridge: they
+/// export the byte-level `XPCEncoder`/`XPCDecoder` outright, which is a
+/// name-resolvable route and what the iOS 18 harness uses.
 ///
 /// iOS 17 is unverified either way. Only a decompile is to hand, and that same
 /// tool reports no such initialiser for iOS 18, where the binary demonstrably
