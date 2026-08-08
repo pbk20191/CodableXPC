@@ -31,11 +31,23 @@ public struct ID64: Hashable, Sendable, Codable, CustomStringConvertible {
     public let rawValue: UInt64
     public init(rawValue: UInt64) { self.rawValue = rawValue }
 
-    /// Apple's own `ID64` names its stored field `value` on the wire; ours is spelled
-    /// `rawValue` in Swift, so the wire key is remapped rather than the property --
-    /// renaming the property would ripple through every call site for no wire benefit.
-    private enum CodingKeys: String, CodingKey {
-        case rawValue = "value"
+    // A bare `UInt64` on the wire -- not `{ "value": n }`, and not the `{ "rawValue": n }`
+    // the synthesized conformance would emit. Apple's `ID64.encode(to:)` opens a
+    // `singleValueContainer()` and calls the `encode(Swift.UInt64)` thunk; there is no
+    // `ID64.CodingKeys` in the shipping binary, so no key name is transmitted at all and
+    // the Swift spelling of the property is free to differ. Reproduce with
+    // `xpcdump/macos27-XPCDistributed/verify-containers.py`.
+    //
+    // Written by hand rather than synthesized precisely so that renaming the property
+    // can never silently change the wire.
+
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    public init(from decoder: any Decoder) throws {
+        self.rawValue = try decoder.singleValueContainer().decode(UInt64.self)
     }
 
     private static let counter = ManagedAtomicCounter()

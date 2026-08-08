@@ -28,11 +28,22 @@ public struct SwiftType: Sendable {
         self.mangledTypeName = mangledTypeName
     }
 
-    /// Convenience for the common case of already holding the concrete type. Falls back
-    /// to `String(reflecting:)` when the runtime cannot mangle it, matching
-    /// `InvocationEncoder.recordErrorType`'s tier-3 degradation rather than failing.
-    public init(_ type: Any.Type) {
-        self.mangledTypeName = TypeName.mangled(for: type) ?? String(reflecting: type)
+    /// Convenience for the common case of already holding the concrete type.
+    ///
+    /// Fails rather than degrading. An unmangleable type has no name a peer could feed
+    /// back to `_typeByName`, so a fallback like `String(reflecting:)` would put a
+    /// string on the wire that is guaranteed not to resolve on the other side, and the
+    /// failure would surface there -- far from here, as an unresolvable type with no
+    /// indication of where it came from.
+    ///
+    /// Degradation is still legitimate in one place: `errorType`'s *presence* is what
+    /// tells the receiver the target can throw, so dropping the field changes the
+    /// meaning of the call and a useless name beats no name. That trade belongs at the
+    /// call site, spelled out -- `SwiftType(E.self) ?? SwiftType(mangledTypeName: "\(E.self)")`
+    /// -- not hidden in an initializer that every other caller also goes through.
+    public init?(_ type: Any.Type) {
+        guard let mangled = TypeName.mangled(for: type) else { return nil }
+        self.mangledTypeName = mangled
     }
 }
 
@@ -52,17 +63,19 @@ extension SwiftType: Hashable {
 @available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
 extension SwiftType: Codable {
 
-    private enum CodingKeys: String, CodingKey {
-        case mangledTypeName
-    }
+    // A bare String on the wire, not `{ mangledTypeName: ... }`. The struct has two
+    // stored fields, but only the name is transmitted and Apple does not wrap it:
+    // `SwiftType.encode(to:)` opens a `singleValueContainer()` and calls the
+    // `encode(Swift.String)` thunk, and there is no `SwiftType.CodingKeys` anywhere in
+    // the shipping binary, so a keyed container is not even available to it.
+    // Reproduce with `xpcdump/macos27-XPCDistributed/verify-containers.py`.
 
     public func encode(to encoder: any Encoder) throws {
-        var container = encoder.container(keyedBy: CodingKeys.self)
-        try container.encode(mangledTypeName, forKey: .mangledTypeName)
+        var container = encoder.singleValueContainer()
+        try container.encode(mangledTypeName)
     }
 
     public init(from decoder: any Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        self.mangledTypeName = try container.decode(String.self, forKey: .mangledTypeName)
+        self.mangledTypeName = try decoder.singleValueContainer().decode(String.self)
     }
 }

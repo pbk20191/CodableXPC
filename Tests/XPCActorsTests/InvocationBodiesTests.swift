@@ -38,7 +38,7 @@ final class InvocationBodiesTests: XCTestCase {
         XCTAssertNil(xpc_dictionary_get_value(object, "returnType"))
         XCTAssertNil(xpc_dictionary_get_value(object, "basePriority"))
         XCTAssertEqual(normalizedDescription(object),
-                       "{actor=[uint64(2),dict{value=uint64(3)}],args=[],generics=[],target=string(t)}")
+                       "{actor=[uint64(2),uint64(3)],args=[],generics=[],target=string(t)}")
     }
 
     // MARK: inbound request keeps the argument container unconsumed

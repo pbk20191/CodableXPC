@@ -60,6 +60,11 @@ extension SharedActorKey: Codable {
         // The discriminator decides which decode runs next. There is no payload key to
         // consult instead -- the container is unkeyed -- so a payload of the wrong
         // shape for this code fails the decode of that element, not a fallback guess.
+        //
+        // Two reads, no count check: a peer sending a longer array has its trailing
+        // elements ignored rather than rejected. That is deliberate -- Apple's decoder
+        // is two reads as well, and rejecting here would refuse traffic Apple accepts.
+        // Note it is asymmetric with encode, which always writes exactly two.
         switch code {
         case .exported:
             self = .exported(try container.decode(SwiftType.self))
