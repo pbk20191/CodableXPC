@@ -2,21 +2,28 @@ import XCTest
 import XPC
 @testable import XPCActors
 
+/// Read the marker back out of a real body, so this tier still exercises encoding
+/// rather than handing an opaque object across.
+///
+/// A free function, not a method: it is called from `@Sendable` packet handlers, which
+/// must not capture the `XCTestCase`.
+@available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
+private func marker(of packet: Packet) -> UInt64? {
+    try? packet.payload.decode(as: UInt64.self)
+}
+
 @available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
 final class InProcessRawTransportTests: XCTestCase {
 
     private func notification(_ marker: UInt64) throws -> Packet {
-        let header = try XCTUnwrap(PacketHeader(version: .v1, kind: .notification, seq: nil))
-        let body = xpc_dictionary_create(nil, nil, 0)
-        xpc_dictionary_set_uint64(body, "marker", marker)
-        return Packet(header: header, payload: Packet.Payload(unchecked: body))
+        Packet(header: .notification, payload: try Packet.Payload(encoding: marker))
     }
 
     func testPacketCrossesToTheOtherEnd() throws {
         let (a, b) = InProcessRawTransport.makePair(debugName: "test")
         let received = expectation(description: "b receives")
         b.setPacketHandler { packet in
-            XCTAssertEqual(Packet.uint64(packet.payload.object, "marker"), 99)
+            XCTAssertEqual(marker(of: packet), 99)
             received.fulfill()
         }
         try a.activate()
@@ -48,7 +55,7 @@ final class InProcessRawTransportTests: XCTestCase {
             try? b?.send(packet: replyPacket)
         }
         a.setPacketHandler { packet in
-            XCTAssertEqual(Packet.uint64(packet.payload.object, "marker"), 2)
+            XCTAssertEqual(marker(of: packet), 2)
             done.fulfill()
         }
         try a.activate()

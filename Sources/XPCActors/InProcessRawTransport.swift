@@ -4,7 +4,7 @@ import XPC
 /// Two transports wired to each other in one process.
 ///
 /// Header framing is skipped -- the `Packet` value is handed across directly --
-/// but the payload is a real encoded xpc dictionary, so serialization bugs still
+/// but the payload is a real overlay-encoded body, so serialization bugs still
 /// surface on this path. That is what makes it a legitimate test substrate rather
 /// than a mock.
 @available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)

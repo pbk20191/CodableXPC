@@ -14,7 +14,8 @@ final class TransportTests: XCTestCase {
         var reply: (@Sendable (Packet.Payload) -> Void)?
     }
 
-    /// A negotiated pair, ready for traffic.
+    /// A live pair. `activate()` exchanges nothing now, so there is no state either end
+    /// has to reach before traffic flows.
     private func makePair() async throws -> (Transport, Transport) {
         let (rawA, rawB) = InProcessRawTransport.makePair(debugName: "transport")
         let client = Transport(debugName: "client", role: .initiator, rawTransport: rawA)
@@ -24,10 +25,34 @@ final class TransportTests: XCTestCase {
         return (client, server)
     }
 
-    func testNegotiationAgreesOnCurrentVersion() async throws {
+    /// The point of deleting the handshake: an initiator that sent a `hello` would put a
+    /// packet category on the wire that no real peer has a case for, and would then wait
+    /// forever for an answer nobody sends. Activation must complete on its own.
+    func testActivateSendsNothingAndBlocksOnNothing() async throws {
+        let (rawA, rawB) = InProcessRawTransport.makePair(debugName: "silent-activate")
+        let client = Transport(debugName: "client", role: .initiator, rawTransport: rawA)
+        // The far end is never activated and never handles a packet, so a client that
+        // waited for a peer would hang here rather than return.
+        let server = Transport(debugName: "server", role: .responder, rawTransport: rawB)
+        server.inboundRequestHandler = { _, _, _ in XCTFail("nothing is sent on activate") }
+        server.inboundNotificationHandler = { _ in XCTFail("nothing is sent on activate") }
+        try await client.activate()
+        try await server.activate()
+    }
+
+    func testBothRolesActivateTheSameWay() async throws {
         let (client, server) = try await makePair()
-        XCTAssertEqual(client.negotiatedVersion, .current)
-        XCTAssertEqual(server.negotiatedVersion, .current)
+        XCTAssertEqual(client.role, .initiator)
+        XCTAssertEqual(server.role, .responder)
+        // And either can immediately originate, with no ordering between the two
+        // activations having mattered.
+        server.inboundRequestHandler = { _, _, reply in
+            reply(try! Packet.Payload(encoding: Ping(value: 1)))
+        }
+        let outcome = await client.sendRequest(
+            seq: client.allocateSeq(), try Packet.Payload(encoding: Ping(value: 0))
+        )
+        guard case .reply = outcome else { return XCTFail("expected a reply") }
     }
 
     func testRequestGetsItsReply() async throws {
@@ -43,10 +68,34 @@ final class TransportTests: XCTestCase {
         XCTAssertEqual(try payload.decode(as: Ping.self), Ping(value: 2))
     }
 
-    func testInboundRequestHandlerSeesTheRequestSeq() async throws {
-        // Phase B's cancellation is a notification naming a requestSeq, so a receiver
-        // has to be able to map an inbound cancellation onto the execution it started.
-        // That is only possible if the handler is told which seq it is serving.
+    /// A response re-uses the request's `headerID`, which is the only thing correlating
+    /// the two: both travel one-way and XPC's own reply channel is unused.
+    func testAReplyCarriesTheRequestsHeaderID() async throws {
+        let (rawA, rawB) = InProcessRawTransport.makePair(debugName: "header-id")
+        let client = Transport(debugName: "client", role: .initiator, rawTransport: rawA)
+        let seen = SeqBox()
+        rawB.setPacketHandler { packet in
+            guard case .request(let id) = packet.header else { return }
+            seen.value = id.rawValue
+            // Answer by hand, so the assertion is about the id on the wire rather than
+            // about our own reply path agreeing with our own send path.
+            try? rawB.send(packet: Packet(header: .response(id),
+                                          payload: try! Packet.Payload(encoding: Ping(value: 9))))
+        }
+        try await client.activate()
+        try rawB.activate()
+
+        let seq = client.allocateSeq()
+        let outcome = await client.sendRequest(seq: seq, try Packet.Payload(encoding: Ping(value: 1)))
+        XCTAssertEqual(seen.value, seq, "the request must go out under the allocated id")
+        guard case .reply(let payload) = outcome else { return XCTFail("expected a reply") }
+        XCTAssertEqual(try payload.decode(as: Ping.self), Ping(value: 9))
+    }
+
+    func testInboundRequestHandlerSeesTheRequestID() async throws {
+        // Cancellation is a notification naming a request id, so a receiver has to be
+        // able to map an inbound cancellation onto the execution it started. That is
+        // only possible if the handler is told which id it is serving.
         let (client, server) = try await makePair()
         let seen = SeqBox()
         server.inboundRequestHandler = { seq, _, reply in
@@ -107,33 +156,6 @@ final class TransportTests: XCTestCase {
         XCTAssertEqual(try payload.decode(as: Ping.self), Ping(value: 7))
     }
 
-    func testConcurrentActivateFailsTheSecondCallerRatherThanStrandingTheFirst() async throws {
-        let (rawA, rawB) = InProcessRawTransport.makePair(debugName: "double-activate")
-        let client = Transport(debugName: "client", role: .initiator, rawTransport: rawA)
-        let server = Transport(debugName: "server", role: .responder, rawTransport: rawB)
-        // Deliberately never activated, so the responder cannot answer and the first
-        // activate() stays parked on its helloWaiter.
-        _ = server
-
-        let first = Task { try await client.activate() }
-        while !client.hasOutstandingHelloWaiter { await Task.yield() }
-        do {
-            try await client.activate()
-            XCTFail("the second activate() must not succeed")
-        } catch {
-            XCTAssertTrue("\(error)".contains("already in progress"), "\(error)")
-        }
-        // The first caller was not displaced: it is still parked, and cancelling is
-        // what resolves it.
-        client.cancel(reason: "test over")
-        do {
-            try await first.value
-            XCTFail("the first activate() should have failed on cancellation")
-        } catch {
-            // Expected: the parked waiter was resumed, not stranded.
-        }
-    }
-
     func testEitherSideCanOriginateARequest() async throws {
         // This is the whole reason the XPC reply channel is unused.
         let (client, server) = try await makePair()
@@ -180,6 +202,23 @@ final class TransportTests: XCTestCase {
         await fulfillment(of: [arrived], timeout: 2)
     }
 
+    /// A notification is sent with no id at all, and an inbound one is delivered without
+    /// consulting the request table -- so it can never resolve somebody's request.
+    func testANotificationCarriesNoCorrelationID() async throws {
+        let (rawA, rawB) = InProcessRawTransport.makePair(debugName: "notification-id")
+        let client = Transport(debugName: "client", role: .initiator, rawTransport: rawA)
+        let seen = SeqBox()
+        rawB.setPacketHandler { packet in
+            if case .notification = packet.header { seen.value = packet.header.id?.rawValue ?? 0 }
+        }
+        try await client.activate()
+        try rawB.activate()
+        try client.sendNotification(try Packet.Payload(encoding: Ping(value: 1)))
+        let arrived = await waitUntil({ seen.value != nil })
+        XCTAssertTrue(arrived, "the notification never arrived")
+        XCTAssertEqual(seen.value, 0, "a notification header has no id")
+    }
+
     func testCancellingTheTransportFailsOutstandingRequests() async throws {
         let (client, server) = try await makePair()
         server.inboundRequestHandler = { _, _, _ in }   // never replies
@@ -224,35 +263,9 @@ final class TransportTests: XCTestCase {
         XCTAssertTrue(message.contains("peer went away"), message)
     }
 
-    func testPeerDeathUnblocksAnActivateAwaitingHelloAck() async throws {
-        // Same hazard on the setup path: activate() parks on helloWaiter with no
-        // timeout behind it.
-        let (rawA, rawB) = InProcessRawTransport.makePair(debugName: "death-during-hello")
-        let client = Transport(debugName: "client", role: .initiator, rawTransport: rawA)
-        let server = Transport(debugName: "server", role: .responder, rawTransport: rawB)
-        // A responder that never activates never answers hello.
-        let task = Task { try await client.activate() }
-        while !client.hasOutstandingHelloWaiter { await Task.yield() }
-
-        server.cancel(reason: "peer went away")
-
-        // `helloWaiter` is a plain CheckedContinuation with no cancellation handler, so
-        // if it is never resumed nothing can break the wait. Confirm it was resumed
-        // before awaiting the task, or the failure mode is a hung suite.
-        guard await waitUntil({ !client.hasOutstandingHelloWaiter }) else {
-            return XCTFail("activate() is still parked -- the peer's death never arrived")
-        }
-        do {
-            try await task.value
-            XCTFail("activate() should have failed once the peer died")
-        } catch let error as SetupError {
-            XCTAssertTrue(error.message.contains("peer went away"), error.message)
-        }
-    }
-
     func testRemoteDeathAndLocalCancelCannotDoubleFire() async throws {
         // Both paths run the same teardown; the `cancelled` flag is what stops the
-        // second one. Resuming helloWaiter twice would trap outright.
+        // second one.
         let (client, server) = try await makePair()
         server.cancel(reason: "peer went away")
         let noticed = await waitUntil({ client.isCancelled })
@@ -265,93 +278,19 @@ final class TransportTests: XCTestCase {
         XCTAssertEqual(pending, 0)
     }
 
-    func testTrafficBeforeNegotiationIsRejected() async throws {
-        let (rawA, rawB) = InProcessRawTransport.makePair(debugName: "unnegotiated")
-        let client = Transport(debugName: "client", role: .initiator, rawTransport: rawA)
-        _ = Transport(debugName: "server", role: .responder, rawTransport: rawB)
-        // No activate() -- no version has been agreed.
-        XCTAssertThrowsError(try client.sendNotification(try Packet.Payload(encoding: Ping(value: 1))))
-    }
-
-    func testPacketWithWrongVersionCancelsTheSession() async throws {
-        // Spec: a receiver that sees a version mismatch cancels rather than trying to
-        // interpret the body. Dropping is strictly worse -- with no timeout it hangs
-        // the sender.
-        let (client, server) = try await makePair()
-        server.inboundNotificationHandler = { _ in XCTFail("must not deliver") }
-        // Forge a packet claiming a version nobody negotiated.
-        let header = try XCTUnwrap(
-            PacketHeader(version: ProtocolVersion(rawValue: 77), kind: .notification, seq: nil)
-        )
-        let forged = Packet(header: header, payload: try Packet.Payload(encoding: Ping(value: 1)))
-        // handleReceived is synchronous on this white-box path, so there is nothing to
-        // wait for; a sleep here would only pretend there were.
-        server.handleReceived(packet: forged)
-        // Bounded, and it returns early. A bare assertion would go red here but the
-        // process would still hang on the unbounded sendRequest below: a session that
-        // wrongly survives has no inboundRequestHandler installed, so handleNegotiated
-        // drops the follow-on request and nothing ever resolves it.
-        guard await waitUntil({ server.isCancelled }) else {
-            return XCTFail("a version mismatch must cancel the session, not drop the packet")
-        }
-        // The far end learns too: the raw pipe is unlinked synchronously by the
-        // responder's cancel, so the client's next send fails rather than hanging.
-        let outcome = await client.sendRequest(
-            seq: client.allocateSeq(), try Packet.Payload(encoding: Ping(value: 1))
-        )
-        guard case .failed = outcome else {
-            return XCTFail("the cancelled session must not still serve requests")
-        }
-    }
-
-    func testNegotiationFailureSurfacesAsAnErrorRatherThanHanging() async throws {
-        // A responder with nothing in common must say so. If it only cancels itself,
-        // activate() has no timeout to fall back on and suspends forever.
-        let (rawA, rawB) = InProcessRawTransport.makePair(debugName: "mismatch")
+    /// Traffic needs no preamble now. Under the handshake this same call failed with
+    /// "no version negotiated yet"; there is nothing left to negotiate, so a caller who
+    /// activates and immediately sends is doing nothing wrong.
+    func testTrafficNeedsNoPreamble() async throws {
+        let (rawA, rawB) = InProcessRawTransport.makePair(debugName: "no-preamble")
         let client = Transport(debugName: "client", role: .initiator, rawTransport: rawA)
         let server = Transport(debugName: "server", role: .responder, rawTransport: rawB)
+        let arrived = expectation(description: "notification arrives")
+        server.inboundNotificationHandler = { _ in arrived.fulfill() }
+        try await client.activate()
         try await server.activate()
-
-        // Drive the responder with a hello it cannot satisfy, bypassing the client's
-        // own well-formed hello.
-        let header = try XCTUnwrap(PacketHeader(version: .unnegotiated, kind: .hello, seq: nil))
-        let impossible = Packet(
-            header: header,
-            payload: try Packet.Payload(encoding: HelloBody(min: 5, max: 2))
-        )
-        server.handleReceived(packet: impossible)
-
-        do {
-            try await client.activate()
-            XCTFail("activate() should have thrown, not agreed a version")
-        } catch {
-            XCTAssertNil(client.negotiatedVersion)
-        }
-    }
-
-    func testSecondHelloOnALiveSessionIsIgnored() async throws {
-        // A buggy or hostile peer must not be able to kill an established session
-        // mid-flight by sending an unsatisfiable hello: the no-overlap path cancels.
-        let (client, server) = try await makePair()
-        let header = try XCTUnwrap(PacketHeader(version: .unnegotiated, kind: .hello, seq: nil))
-        let impossible = Packet(
-            header: header,
-            payload: try Packet.Payload(encoding: HelloBody(min: 500, max: 900))
-        )
-        server.handleReceived(packet: impossible)
-
-        XCTAssertFalse(server.isCancelled, "an established session must survive a late hello")
-        XCTAssertEqual(server.negotiatedVersion, .current)
-
-        // And it still works.
-        server.inboundRequestHandler = { _, _, reply in
-            reply(try! Packet.Payload(encoding: Ping(value: 3)))
-        }
-        let outcome = await client.sendRequest(
-            seq: client.allocateSeq(), try Packet.Payload(encoding: Ping(value: 1))
-        )
-        guard case .reply(let payload) = outcome else { return XCTFail("expected a reply") }
-        XCTAssertEqual(try payload.decode(as: Ping.self), Ping(value: 3))
+        try client.sendNotification(try Packet.Payload(encoding: Ping(value: 1)))
+        await fulfillment(of: [arrived], timeout: 2)
     }
 }
 

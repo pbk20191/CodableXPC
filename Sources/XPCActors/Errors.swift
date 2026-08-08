@@ -21,7 +21,7 @@ public enum TransportError: Error, Equatable, Sendable {
     case taskCancelled
 }
 
-/// A failure to bring a session up: connecting, activating, or agreeing a version.
+/// A failure to bring a session up: connecting or activating.
 @available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
 public struct SetupError: Error, Equatable, Sendable, CustomStringConvertible {
     public let message: String
@@ -36,7 +36,13 @@ public struct SetupError: Error, Equatable, Sendable, CustomStringConvertible {
 /// surfaced to a caller.
 @available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
 public enum PacketCodingError: Error, Equatable, Sendable {
-    /// A body encoded to something other than an xpc dictionary. Every body type
-    /// in this protocol is a struct, so this means a programming error.
-    case bodyIsNotADictionary
+    /// A `Packet.Payload` with no `"payload"` entry, so there is nothing to decode.
+    ///
+    /// Unreachable for a payload this package built -- `Payload.init(encoding:)` always
+    /// writes the entry -- and reachable for one adopted from elsewhere.
+    ///
+    /// This replaces `bodyIsNotADictionary`, which described a restriction that no
+    /// longer exists: the body is an overlay byte stream, so a top-level array is a
+    /// perfectly ordinary body, and a `RemoteInvocationResponse` is exactly that.
+    case payloadHasNoBody
 }

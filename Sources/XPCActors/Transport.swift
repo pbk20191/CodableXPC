@@ -1,42 +1,52 @@
 import Foundation
 import XPC
 
+/// Which end of the pipe this is.
+///
+/// It no longer selects any behaviour. Both roles now do the same thing on
+/// `activate()`, because there is no handshake to be asymmetric about: an initiator
+/// dialled out and a responder was accepted, and that is the whole of the difference.
+/// Kept because it is still a true and useful fact about a transport -- every debug
+/// message and every future asymmetry wants it -- not because anything branches on it.
 @available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
 public enum TransportRole: Sendable {
-    /// Dials out and sends `hello`.
+    /// Dialled out to a peer.
     case initiator
-    /// Listens and answers `hello` with `helloAck`.
+    /// Accepted an inbound connection.
     case responder
 }
 
-/// Packet framing, version negotiation, and request correlation.
+/// Packet framing and request correlation.
 ///
-/// Every packet is sent one-way; a reply is an ordinary inbound packet matched by
-/// `seq`. The XPC reply channel is never used, because it binds a response to the
-/// requester and would make it impossible for a listener-side peer to originate a
-/// call.
+/// Every packet is sent one-way; a response is an ordinary inbound packet matched by
+/// the envelope's `headerID`. The XPC reply channel is never used, because it binds a
+/// response to the requester and would make it impossible for a listener-side peer to
+/// originate a call. Apple's `XPCRawTransport.send(packet:)` sends all three kinds
+/// through the one-way `XPCSession.send(message:)` for the same reason.
+///
+/// There is no version negotiation. `hello` and `helloAck` do not exist in
+/// `XPCDistributed`, so sending them would put a packet category on the wire that no
+/// real peer can decode. What that costs is written down where the version key used to
+/// be, in `EnvelopeKey`.
 @available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
 public final class Transport: @unchecked Sendable {
 
-    /// Handles one inbound request: `(seq, body, reply)`.
+    /// Handles one inbound request: `(id, body, reply)`.
     ///
-    /// The `seq` is the envelope's correlation id. It is passed in because Phase B's
-    /// cancellation is a notification naming a `requestSeq`: without the id, a
-    /// receiver cannot map an inbound `invocationCancelled` onto the execution it
-    /// started.
+    /// The `id` is the envelope's correlation id. It is passed in because cancellation
+    /// is a notification naming a request id: without it, a receiver cannot map an
+    /// inbound `invocationCancelled` onto the execution it started.
     public typealias RequestHandler =
         @Sendable (UInt64, Packet.Payload, @escaping @Sendable (Packet.Payload) -> Void) -> Void
     public typealias NotificationHandler = @Sendable (Packet.Payload) -> Void
 
     private let debugName: String
-    private let role: TransportRole
+    public let role: TransportRole
     private let rawTransport: RawTransportProtocol
     private let requests = RequestTable()
 
     private let lock = NSLock()
-    private var _negotiatedVersion: ProtocolVersion?
     private var _nextSeq: UInt64 = 1
-    private var helloWaiter: CheckedContinuation<Result<ProtocolVersion, SetupError>, Never>?
     private var cancelled = false
 
     private var _inboundRequestHandler: RequestHandler?
@@ -52,16 +62,9 @@ public final class Transport: @unchecked Sendable {
         set { lock.withLock { _inboundNotificationHandler = newValue } }
     }
 
-    public var negotiatedVersion: ProtocolVersion? {
-        lock.withLock { _negotiatedVersion }
-    }
-
     /// Internal for tests: teardown has run, from either our own `cancel` or the
     /// raw transport's death channel.
     var isCancelled: Bool { lock.withLock { cancelled } }
-
-    /// Internal for tests: an `activate()` is parked awaiting `helloAck`.
-    var hasOutstandingHelloWaiter: Bool { lock.withLock { helloWaiter != nil } }
 
     /// Internal for tests: requests registered and not yet resolved.
     var pendingRequestCount: Int { get async { await requests.pendingCount } }
@@ -100,58 +103,28 @@ public final class Transport: @unchecked Sendable {
     }
 
     private func failEverything(reason: String) {
-        resumeHelloWaiter(with: .failure(SetupError("transport cancelled: \(reason)")))
         Task { await requests.failAll(with: .transportCancelled(message: reason)) }
     }
 
     // MARK: activation
 
-    /// Bring the pipe up. For an initiator this performs the `hello` exchange and
-    /// does not return until a version is agreed; for a responder it returns as
-    /// soon as the pipe is live, and the version is set when `hello` arrives.
+    /// Bring the pipe up.
+    ///
+    /// Nothing is exchanged and nothing is awaited: with no version to agree, there is
+    /// no state a peer has to reach before traffic can flow, for either role.
+    ///
+    /// **A listener does not learn of a peer until that peer sends something.** An XPC
+    /// session is not established by activation alone, so a responder waiting to be told
+    /// a peer exists will wait forever if the initiator only activates. This is
+    /// Apple's behaviour too -- `XPCDistributed` has no handshake either -- but it is a
+    /// change from the version of this transport that exchanged `hello`, where
+    /// activation *was* the notification. Anything that assumed "activate implies the
+    /// far side exists" has to send first now.
     public func activate() async throws(SetupError) {
         do {
             try rawTransport.activate()
         } catch {
             throw SetupError("could not activate transport: \(error)")
-        }
-        guard role == .initiator else { return }
-
-        let hello: Packet
-        do {
-            hello = try makePacket(kind: .hello, seq: nil,
-                                   payload: Packet.Payload(encoding: HelloBody.current))
-        } catch {
-            throw SetupError("could not encode hello: \(error)")
-        }
-
-        let result = await withCheckedContinuation {
-            (continuation: CheckedContinuation<Result<ProtocolVersion, SetupError>, Never>) in
-            // One waiter slot, so a concurrent second activate() must not overwrite the
-            // first: the displaced continuation would never be resumed and its caller
-            // would hang forever. Fail the newcomer instead.
-            let occupied: Bool = lock.withLock {
-                guard helloWaiter == nil else { return true }
-                helloWaiter = continuation
-                return false
-            }
-            guard !occupied else {
-                continuation.resume(returning: .failure(
-                    SetupError("activate() is already in progress and awaiting helloAck")
-                ))
-                return
-            }
-            do {
-                try rawTransport.send(packet: hello)
-            } catch {
-                resumeHelloWaiter(with: .failure(SetupError("could not send hello: \(error)")))
-            }
-        }
-        // `_negotiatedVersion` is written in `handleHelloAck`, before the waiter is
-        // resumed -- not here. That is what keeps the write ordered before any
-        // packet the peer sends immediately after its `helloAck`.
-        if case .failure(let error) = result {
-            throw error
         }
     }
 
@@ -161,8 +134,10 @@ public final class Transport: @unchecked Sendable {
     /// cancellation bookkeeping against the id before the request is in flight.
     ///
     /// Ids come from a per-transport monotonic counter and are unique within a
-    /// transport, not globally. Reserving one and never sending it is harmless: no
-    /// state is allocated until `sendRequest` registers a waiter.
+    /// transport, not globally -- which is all `headerID` needs, since a peer matches a
+    /// response against the requests it has outstanding on this one pipe. Reserving one
+    /// and never sending it is harmless: no state is allocated until `sendRequest`
+    /// registers a waiter.
     public func allocateSeq() -> UInt64 {
         lock.withLock {
             defer { _nextSeq += 1 }
@@ -170,18 +145,13 @@ public final class Transport: @unchecked Sendable {
         }
     }
 
-    /// Send a request under a `seq` obtained from `allocateSeq()` and await its reply.
+    /// Send a request under a `seq` obtained from `allocateSeq()` and await its
+    /// response.
     ///
     /// Reusing a `seq` that is still in flight fails the *new* caller rather than
     /// displacing the old one; see `RequestTable.waitForReply`.
     public func sendRequest(seq: UInt64, _ payload: Packet.Payload) async -> RequestTable.Outcome {
-        let packet: Packet
-        do {
-            packet = try makeNegotiatedPacket(kind: .request, seq: seq, payload: payload)
-        } catch {
-            // Typed throws: `error` is a RawTransportError here.
-            return .failed(.transportCancelled(message: "\(error)"))
-        }
+        let packet = Packet(header: .request(ID64(rawValue: seq)), payload: payload)
         // Bound to an explicitly typed local rather than passed as a literal: on Swift 6.4
         // a throwing closure literal cannot be converted to a `throws(RawTransportError)`
         // parameter. Do not inline this.
@@ -190,8 +160,7 @@ public final class Transport: @unchecked Sendable {
     }
 
     public func sendNotification(_ payload: Packet.Payload) throws(RawTransportError) {
-        let packet = try makeNegotiatedPacket(kind: .notification, seq: nil, payload: payload)
-        try rawTransport.send(packet: packet)
+        try rawTransport.send(packet: Packet(header: .notification, payload: payload))
     }
 
     public func cancel(reason: String) {
@@ -203,149 +172,27 @@ public final class Transport: @unchecked Sendable {
     // MARK: receiving
 
     /// Internal for tests; the raw transport calls this for every inbound packet.
+    ///
+    /// A malformed message never reaches here -- `Packet.init?(rawValue:)` has already
+    /// dropped it -- so the only thing left to decide is which of the three kinds it is.
     func handleReceived(packet: Packet) {
-        switch packet.header.kind {
-        case .hello:
-            handleHello(packet)
-        case .helloAck:
-            handleHelloAck(packet)
-        case .request, .reply, .notification:
-            guard let negotiated = negotiatedVersion,
-                  packet.header.version == negotiated
-            else {
-                // Cancel rather than drop. Dropping is strictly worse: the protocol has
-                // no timeout, so a silently discarded request hangs the sender forever,
-                // and interpreting a body under the wrong version's rules is exactly
-                // what the version field exists to prevent.
-                let expected = negotiatedVersion.map { "\($0.rawValue)" } ?? "none negotiated"
-                cancel(reason: """
-                    protocol version mismatch: peer sent \(packet.header.kind) at version \
-                    \(packet.header.version.rawValue), expected \(expected)
-                    """)
-                return
+        switch packet.header {
+        case .request(let id):
+            guard let handler = inboundRequestHandler else { return }
+            handler(id.rawValue, packet.payload) { [weak self] reply in
+                self?.sendResponse(id: id, payload: reply)
             }
-            handleNegotiated(packet)
-        }
-    }
-
-    private func handleNegotiated(_ packet: Packet) {
-        switch packet.header.kind {
-        case .request:
-            guard let seq = packet.header.seq, let handler = inboundRequestHandler else { return }
-            handler(seq, packet.payload) { [weak self] reply in
-                self?.sendReply(seq: seq, payload: reply)
-            }
-        case .reply:
-            guard let seq = packet.header.seq else { return }
-            Task { await requests.complete(seq: seq, with: .reply(packet.payload)) }
+        case .response(let id):
+            Task { await requests.complete(seq: id.rawValue, with: .reply(packet.payload)) }
         case .notification:
             inboundNotificationHandler?(packet.payload)
-        case .hello, .helloAck:
-            break
         }
     }
 
-    private func sendReply(seq: UInt64, payload: Packet.Payload) {
-        guard let packet = try? makeNegotiatedPacket(kind: .reply, seq: seq, payload: payload)
-        else { return }
-        try? rawTransport.send(packet: packet)
-    }
-
-    private func handleHello(_ packet: Packet) {
-        guard role == .responder else { return }
-        // A second hello on a live session is ignored, not honoured. Without this a
-        // buggy or hostile peer could kill an established session mid-flight by
-        // sending an unsatisfiable hello, since the no-overlap path cancels.
-        guard lock.withLock({ _negotiatedVersion }) == nil else { return }
-
-        let negotiated: ProtocolVersion? = (try? packet.payload.decode(as: HelloBody.self))
-            .flatMap { ProtocolVersion.negotiate(peerMin: $0.min, peerMax: $0.max) }
-
-        guard let version = negotiated else {
-            // Tell the peer before dying. A responder that merely cancels leaves the
-            // initiator's activate() suspended forever: this protocol has no timeout,
-            // so an absent reply is indistinguishable from a slow one.
-            sendHelloRejection()
-            cancel(reason: "no common protocol version")
-            return
-        }
-        guard let ack = try? makePacket(
-            kind: .helloAck, seq: nil,
-            payload: Packet.Payload(encoding: HelloAckBody(version: version.rawValue))
-        ) else {
-            sendHelloRejection()
-            cancel(reason: "could not encode helloAck")
-            return
-        }
-        // Store before sending, so a packet the peer sends immediately on receiving
-        // this ack cannot arrive before our own version gate knows the answer.
-        lock.withLock { _negotiatedVersion = version }
-        try? rawTransport.send(packet: ack)
-    }
-
-    /// A `helloAck` carrying the reserved sentinel, meaning "no version in common".
-    private func sendHelloRejection() {
-        guard let rejection = try? makePacket(
-            kind: .helloAck, seq: nil,
-            payload: Packet.Payload(encoding: HelloAckBody(version: ProtocolVersion.unnegotiated.rawValue))
-        ) else { return }
-        try? rawTransport.send(packet: rejection)
-    }
-
-    private func handleHelloAck(_ packet: Packet) {
-        guard role == .initiator else { return }
-        guard let body = try? packet.payload.decode(as: HelloAckBody.self) else {
-            resumeHelloWaiter(with: .failure(SetupError("malformed helloAck")))
-            return
-        }
-        let version = ProtocolVersion(rawValue: body.version)
-        guard version != .unnegotiated else {
-            resumeHelloWaiter(
-                with: .failure(SetupError("peer rejected the connection: no common protocol version"))
-            )
-            return
-        }
-        guard version >= ProtocolVersion.minimumSupported,
-              version <= ProtocolVersion.current
-        else {
-            resumeHelloWaiter(
-                with: .failure(SetupError("peer chose unsupported version \(body.version)"))
-            )
-            return
-        }
-        lock.withLock { _negotiatedVersion = version }
-        resumeHelloWaiter(with: .success(version))
-    }
-
-    private func resumeHelloWaiter(with result: Result<ProtocolVersion, SetupError>) {
-        let waiter: CheckedContinuation<Result<ProtocolVersion, SetupError>, Never>? =
-            lock.withLock {
-                defer { helloWaiter = nil }
-                return helloWaiter
-            }
-        waiter?.resume(returning: result)
-    }
-
-    // MARK: helpers
-
-    private func makePacket(
-        kind: PacketKind, seq: UInt64?, payload: Packet.Payload
-    ) throws -> Packet {
-        guard let header = PacketHeader(version: .unnegotiated, kind: kind, seq: seq) else {
-            throw SetupError("invalid handshake header for \(kind)")
-        }
-        return Packet(header: header, payload: payload)
-    }
-
-    private func makeNegotiatedPacket(
-        kind: PacketKind, seq: UInt64?, payload: Packet.Payload
-    ) throws(RawTransportError) -> Packet {
-        guard let version = negotiatedVersion else {
-            throw RawTransportError.rawTransportCancelled(message: "no version negotiated yet")
-        }
-        guard let header = PacketHeader(version: version, kind: kind, seq: seq) else {
-            throw RawTransportError.rawTransportCancelled(message: "invalid header for \(kind)")
-        }
-        return Packet(header: header, payload: payload)
+    /// A response re-uses the id it received, which is what lets the peer's request
+    /// table find the waiter. Apple's reply closure captures the request id and stores
+    /// it into the header it builds, for the same reason.
+    private func sendResponse(id: ID64, payload: Packet.Payload) {
+        try? rawTransport.send(packet: Packet(header: .response(id), payload: payload))
     }
 }
