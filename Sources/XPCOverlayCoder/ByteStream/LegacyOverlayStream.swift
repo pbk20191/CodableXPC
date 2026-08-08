@@ -2,7 +2,11 @@ import Foundation
 
 /// A decoded value. There is no single-value case: that container is transparent
 /// on the wire and writes only what it contains.
-public indirect enum LegacyOverlayValue: Equatable, Sendable {
+/// - Note: deliberately not `indirect`. Both recursive cases go through `Array`,
+///   whose buffer already breaks the cycle, so the keyword bought nothing and
+///   cost a heap box per value — a megabyte of `Data` on the iOS 17 path is a
+///   million of them.
+public enum LegacyOverlayValue: Equatable, Sendable {
     case null
     case optionalNone
     case bool(Bool)
@@ -206,6 +210,10 @@ public struct LegacyOverlayStreamReader {
 public enum LegacyOverlayStreamWriter {
 
     public static func serialize(_ value: LegacyOverlayValue) -> Data {
+        // The reservation happens inside `write`, per container, from the element
+        // count alone. Sizing the whole buffer up front means walking the tree
+        // first, and on a million-element run that traversal cost more than the
+        // reallocations it saved -- 109 ms of serialisation became 174.
         var bytes: [UInt8] = []
         write(value, into: &bytes)
         return Data(bytes)
@@ -250,28 +258,50 @@ public enum LegacyOverlayStreamWriter {
         case .uint64(let v):
             bytes.append(LegacyOverlayTag.uint64.rawValue); writeFixed(v, into: &bytes)
 
+        // Containers declare their body length before the body. Rather than build
+        // the body in a separate array to measure it and then copy it in, write a
+        // placeholder, emit in place, and go back and fill it. The bytes are the
+        // same; what goes away is a copy of every container's contents, and for a
+        // keyed container a second copy of every value.
         case .unkeyed(let elements):
             bytes.append(LegacyOverlayTag.unkeyedContainer.rawValue)
             writeFixed(UInt64(elements.count), into: &bytes)
-            var body: [UInt8] = []
-            for element in elements { write(element, into: &body) }
-            writeFixed(UInt64(body.count), into: &bytes)
-            bytes.append(contentsOf: body)
+            let lengthOffset = bytes.count
+            writeFixed(UInt64(0), into: &bytes)
+            let bodyStart = bytes.count
+            // Two bytes is the floor for any element -- a tag and a payload -- so
+            // this is a lower bound reached in O(1) from the count. Measuring the
+            // real size means walking the tree, which costs more than the
+            // reallocations it saves.
+            bytes.reserveCapacity(bytes.count + elements.count * 2)
+            for element in elements { write(element, into: &bytes) }
+            patch(UInt64(bytes.count - bodyStart), at: lengthOffset, in: &bytes)
 
         case .keyed(let entries):
             bytes.append(LegacyOverlayTag.keyedContainer.rawValue)
             writeFixed(UInt64(entries.count), into: &bytes)
-            var body: [UInt8] = []
+            let lengthOffset = bytes.count
+            writeFixed(UInt64(0), into: &bytes)
+            let bodyStart = bytes.count
+            bytes.reserveCapacity(bytes.count + entries.count * 20)
             for entry in entries {
-                body.append(LegacyOverlayTag.string.rawValue)
-                writeString(entry.key, into: &body)
-                var slot: [UInt8] = []
-                write(entry.value, into: &slot)
-                writeFixed(UInt64(slot.count), into: &body)
-                body.append(contentsOf: slot)
+                bytes.append(LegacyOverlayTag.string.rawValue)
+                writeString(entry.key, into: &bytes)
+                let slotOffset = bytes.count
+                writeFixed(UInt64(0), into: &bytes)
+                let slotStart = bytes.count
+                write(entry.value, into: &bytes)
+                patch(UInt64(bytes.count - slotStart), at: slotOffset, in: &bytes)
             }
-            writeFixed(UInt64(body.count), into: &bytes)
-            bytes.append(contentsOf: body)
+            patch(UInt64(bytes.count - bodyStart), at: lengthOffset, in: &bytes)
+        }
+    }
+
+    /// Overwrites a length placeholder in place, little-endian, exactly as
+    /// ``writeFixed(_:into:)`` would have written it.
+    private static func patch(_ value: UInt64, at offset: Int, in bytes: inout [UInt8]) {
+        for index in 0..<MemoryLayout<UInt64>.size {
+            bytes[offset + index] = UInt8(truncatingIfNeeded: value >> (8 * index))
         }
     }
 

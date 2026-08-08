@@ -86,8 +86,24 @@ final class LegacyEncodingNode {
 
     var kind: Kind?
     var leaf: LegacyOverlayValue?
+    /// An element is either a finished value or a container still being built.
+    /// Only the latter needs identity, and giving a leaf a whole object cost a
+    /// class allocation per byte on the one path where bulk bytes go into the
+    /// stream — `Data` under ``LegacyOverlayGeneration/iOS17``.
+    enum Element {
+        case leaf(LegacyOverlayValue)
+        case node(LegacyEncodingNode)
+
+        func materialise() -> LegacyOverlayValue {
+            switch self {
+            case .leaf(let value): return value
+            case .node(let node): return node.materialise()
+            }
+        }
+    }
+
     var entries: [(key: String, node: LegacyEncodingNode)] = []
-    var elements: [LegacyEncodingNode] = []
+    var elements: [Element] = []
 
     func materialise() -> LegacyOverlayValue {
         switch kind {
@@ -281,9 +297,22 @@ private struct LegacyUnkeyedEncodingContainer: UnkeyedEncodingContainer {
     var count: Int { encoder.node.elements.count }
 
     private func put(_ value: LegacyOverlayValue) {
-        let node = LegacyEncodingNode()
-        node.leaf = value
-        encoder.node.elements.append(node)
+        encoder.node.elements.append(.leaf(value))
+    }
+
+    /// `Data.encode(to:)` funnels through here rather than one `encode(_:)` per
+    /// byte. `UnkeyedEncodingContainer` declares a `contentsOf` requirement for
+    /// each primitive element type, so this is a witness rather than an overload
+    /// that would never be picked through the existential.
+    ///
+    /// It matters on the ``LegacyOverlayGeneration/iOS17`` path, where a `Data`
+    /// really does go into the stream as a run of `UInt8` — the format has no
+    /// side array to put it in. Going byte by byte through the container cost
+    /// 305 ms for a megabyte, nearly all of it protocol dispatch.
+    mutating func encode<T: Sequence>(contentsOf sequence: T) throws where T.Element == UInt8 {
+        let node = encoder.node
+        node.elements.reserveCapacity(node.elements.count + sequence.underestimatedCount)
+        for byte in sequence { node.elements.append(.leaf(.uint8(byte))) }
     }
 
     mutating func encodeNil() throws { put(.null) }
@@ -309,26 +338,26 @@ private struct LegacyUnkeyedEncodingContainer: UnkeyedEncodingContainer {
             return
         }
         let (child, childEncoder) = encoder.child(forKey: LegacyIndexKey(count))
-        encoder.node.elements.append(child)
+        encoder.node.elements.append(.node(child))
         try value.encode(to: childEncoder)
     }
 
     mutating func nestedContainer<NestedKey: CodingKey>(
         keyedBy keyType: NestedKey.Type) -> KeyedEncodingContainer<NestedKey> {
         let (child, childEncoder) = encoder.child(forKey: LegacyIndexKey(count))
-        encoder.node.elements.append(child)
+        encoder.node.elements.append(.node(child))
         return childEncoder.container(keyedBy: keyType)
     }
 
     mutating func nestedUnkeyedContainer() -> any UnkeyedEncodingContainer {
         let (child, childEncoder) = encoder.child(forKey: LegacyIndexKey(count))
-        encoder.node.elements.append(child)
+        encoder.node.elements.append(.node(child))
         return childEncoder.unkeyedContainer()
     }
 
     mutating func superEncoder() -> any Encoder {
         let (child, childEncoder) = encoder.child(forKey: LegacyIndexKey(count))
-        encoder.node.elements.append(child)
+        encoder.node.elements.append(.node(child))
         return childEncoder
     }
 }
