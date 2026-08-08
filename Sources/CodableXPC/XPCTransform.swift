@@ -62,6 +62,12 @@ internal extension String {
         // memchr rather than `utf8.contains(0)`: the scan is unavoidable, but the
         // element-by-element version dominated string encoding -- 18x the cost of
         // xpc_string_create itself, and far worse without optimisation.
+        //
+        // Going through `(self as NSString).utf8String` and checking with `strlen`
+        // was measured and is no faster. That pointer really is free and really
+        // does alias the string's own storage, but the cost here is not the
+        // bridging: it is the one copy libxpc has to make to own the bytes, which
+        // runs at memcpy speed either way.
         let hasNul = utf8.withContiguousStorageIfAvailable {
             memchr($0.baseAddress, 0, $0.count) != nil
         } ?? utf8.contains(0)
