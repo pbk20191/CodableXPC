@@ -10,7 +10,7 @@ import XCTest
 /// case, which is why this is a lint and not something the compiler catches.
 ///
 /// Every type in this module is declared inside `extension XPCCompat { ... }`
-/// (`Containers.swift`, `Endpoint.swift`, `SharedMemory.swift`, `LiteralValue.swift`),
+/// (`Containers.swift`, `Endpoint.swift`, `LiteralValue.swift`),
 /// so scanning only the enum body would miss almost all of the exposed scope. The scan
 /// is whole-directory and recursive, so a future `Coder/` subdirectory is covered too.
 final class ShadowingLintTests: XCTestCase {

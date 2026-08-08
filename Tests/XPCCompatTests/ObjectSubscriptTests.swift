@@ -67,12 +67,7 @@ final class ObjectSubscriptTests: XCTestCase {
         xpc_connection_cancel(connection)
     }
 
-    func testSharedMemoryRoundTrip() throws {
-        let memory = try XCTUnwrap(XPCCompat.SharedMemory(byteCount: 4096))
-        var d = XPCCompat.Dictionary()
-        d["mem"] = memory
-        XCTAssertNotNil(d["mem", as: XPCCompat.SharedMemory.self])
-    }
+
 
     func testAssigningNilRemovesNestedContainer() {
         var d = XPCCompat.Dictionary()
@@ -81,23 +76,10 @@ final class ObjectSubscriptTests: XCTestCase {
         XCTAssertEqual(d.count, 0)
     }
 
-    // MARK: - Fix report follow-up tests (task-9 review findings)
 
-    // Finding 1: init(_:) must not take ownership of the region backing the object
-    // it wraps. Releasing a non-owning wrapper must not unmap the owner's region.
-    func testWrappingExistingSharedMemoryDoesNotOwnRegion() throws {
-        let owner = try XCTUnwrap(XPCCompat.SharedMemory(byteCount: 4096))
-        do {
-            let wrapped = XPCCompat.SharedMemory(owner.underlying)
-            XCTAssertEqual(wrapped, owner)
-        }
-        // If `wrapped`'s deinit had wrongly unmapped the shared region, `owner`
-        // would now be pointing at an invalid mapping.
-        XCTAssertTrue(xpc_get_type(owner.underlying) == XPC_TYPE_SHMEM)
-    }
 
     // Finding 2: XPCCompat.Array needs the same typed read/write subscript surface
-    // as XPCCompat.Dictionary for nested Dictionary, Array, Endpoint, and SharedMemory.
+    // as XPCCompat.Dictionary for nested Dictionary, Array and Endpoint.
 
     func testArrayNestedDictionaryRoundTrip() {
         let raw = xpc_array_create(nil, 0)
@@ -131,12 +113,5 @@ final class ObjectSubscriptTests: XCTestCase {
         xpc_connection_cancel(connection)
     }
 
-    func testArraySharedMemoryRoundTrip() throws {
-        let memory = try XCTUnwrap(XPCCompat.SharedMemory(byteCount: 4096))
-        let raw = xpc_array_create(nil, 0)
-        xpc_array_append_value(raw, xpc_bool_create(false))
-        var a = XPCCompat.Array(raw)
-        a[0] = memory
-        XCTAssertEqual(a[0, as: XPCCompat.SharedMemory.self], memory)
-    }
+
 }
