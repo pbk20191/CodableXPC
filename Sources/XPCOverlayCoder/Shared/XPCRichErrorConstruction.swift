@@ -3,17 +3,24 @@ import XPC
 
 /// Making an `XPCRichError` when you are the one reporting the failure.
 ///
-/// ## There is no `xpc_rich_error_create`
+/// ## `xpc_rich_error_create` exists, but not where anything can reach it
 ///
-/// Checked five ways and it is absent from all of them: `dlsym` at runtime on
-/// macOS 27 and in an iOS 26.5 simulator, the full symbol table of an iOS 18.6
-/// `libxpc` including local symbols, every `.tbd` in the SDK, and every SDK
-/// header. libxpc exports exactly three rich-error symbols — the type
-/// descriptor, `xpc_rich_error_can_retry` and `xpc_rich_error_copy_description`
-/// — and carries the usual internal type callbacks (`_copy`, `_dispose`,
-/// `_serialize`…) but no creator under any name.
+///     xpc_rich_error_create(const char *description, char canRetry)
+///       -> _xpc_try_strdup, then xpc_rich_error_create_no_copy
+///       -> _xpc_base_create(OS_xpc_rich_error, 24)
 ///
-/// ## Which turns out not to matter
+/// It is a **local** symbol — lowercase `t` in the symbol table, at a fixed
+/// offset — so it is in neither the export trie nor the SDK's `.tbd`. `dlsym`
+/// cannot see it and `@_silgen_name` cannot link it. Only three rich-error
+/// symbols are exported: the type descriptor, `xpc_rich_error_can_retry` and
+/// `xpc_rich_error_copy_description`.
+///
+/// Its address can still be had — sliding from an exported neighbour by the
+/// delta the symbol table records does work, and the call returns a genuine
+/// `xpc_rich_error_t` — but that delta is a property of one build of one
+/// binary, and nothing checks it before jumping.
+///
+/// ## Which is why this does not use it
 ///
 /// `XPCRichError` does not hold an `xpc_rich_error_t`. The overlay's own
 /// `XPCRichError.init(_:)` takes one only to copy two values out of it —
@@ -22,9 +29,13 @@ import XPC
 /// instance reflects as exactly that pair, in 24 bytes: the `Bool` at offset 0,
 /// padded, then the `String`.
 ///
-/// So one can be built without libxpc at all. What that gives you is an error to
-/// *throw*, indistinguishable from the framework's own to anything that catches
-/// it. It is not something to hand back to XPC, which never takes one.
+/// So one can be built without libxpc at all — no address arithmetic, nothing
+/// that moves between builds. What that gives you is an error to *throw*,
+/// indistinguishable from the framework's own to anything that catches it. It is
+/// not something to hand back to XPC, which never takes one.
+///
+/// If you need a real `xpc_rich_error_t` for a C API rather than a Swift error
+/// to raise, this is the wrong tool and the offset route above is the only one.
 ///
 /// ## The guard
 ///
