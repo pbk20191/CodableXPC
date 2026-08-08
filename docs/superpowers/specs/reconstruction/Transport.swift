@@ -142,7 +142,18 @@ extension XPCSystem {
         /// [fieldmd] `{ID64.Generator}`. Offset 0x70 [measured]. 8 bytes, `~Copyable`
         /// [measured: value witness flags carry NonCopyable].
         ///
-        /// DEAD IN THIS BUILD, on four independent signals — this was checked rather
+        /// DEAD IN THIS BUILD — on **one** discriminating probe plus a positive control, not on
+        /// the four signals an earlier revision listed. Two of those four were checked against
+        /// controls and fail: "no accessor symbol exists" distinguishes *access level*, not
+        /// liveness (all four of `Transport`'s private fields lack accessors and three are
+        /// demonstrably live, while `Session.idGenerator` has a `read` only because it is not
+        /// `private`); and "`deinit` skips `+0x70`" also skips `+0x20`, which is
+        /// `isCancelledFuse` and unquestionably live — deinit skipping a field means it is
+        /// trivially destroyed, nothing more. The probe that does discriminate is the atomic
+        /// scan, and its positive control is the same scan over `Session`, which *does* find the
+        /// inlined generator (`cas` at `shareActor+0x24` and `handleActorShared+0x24` against
+        /// `Session+0x20`). Widened to the whole image: 2239 functions, 21 atomic sites, none in
+        /// `Transport`. Also checked rather
         /// than taken from the wire-format spec:
         ///   1. no accessor symbol of any kind exists for it, in contrast with
         ///      `XPCDistributed.XPCSystem.Session.idGenerator.read : ID64.Generator`
@@ -968,7 +979,11 @@ extension XPCSystem.TransportReceiver {
 // payload, so the reference is through `Kind`, not through a stored property; and the
 // reverse edge, `Transport.(inboundSession)`, is assigned weakly — by
 // `Session.init(actorSystem:transport:options:)` on the Session agent's reading and by
-// `Transport.setInboundSession(_:)` on mine, which are the same two instructions either
+// `Transport.setInboundSession(_:)` on mine — but those are two different functions, and
+// `setInboundSession` has **zero callers in this image** (it has no method descriptor and is not
+// a protocol requirement, so a direct scan is exhaustive for it). In this build the wiring
+// happens only inside `Session.init`, which contains an inlined copy. The instructions are the
+// same either
 // way. So the `Session <-> Transport` cycle is broken on the transport's side.
 //
 // Two more facts about neighbours that this subsystem's disassembly pins, recorded here
@@ -980,7 +995,10 @@ extension XPCSystem.TransportReceiver {
 //     `handleReceivedNotification(_:)`, +0x20 `handleActorShared(_:)`, +0x28
 //     `handleTransportCancellation()`, +0x30 `actorSystem`, +0x38 `isBidirectional`
 //     [sym], and `Transport` calls the first, second and fourth at exactly those
-//     offsets [disasm]. There is one further slot before +0x10 with no
+//     offsets [disasm]. The slot before +0x10 is the base conformance --
+//     `base conformance descriptor for XPCSystem.InboundSessionProtocol:
+//     XPCDistributed.Internal.Identifiable` at 0x2ad527cd4 = base+0x08, and 0x2ad527d60 for the
+//     outbound one; null in the live table until instantiation. RESOLVED. The old note said no
 //     `method descriptor` symbol; what it is is UNRESOLVED.
 //   * `Session.RemoteNotification` case index 1 is the escalation notification: the
 //     escalation handler stores tag 1 with `swift_storeEnumTagMultiPayload` and a

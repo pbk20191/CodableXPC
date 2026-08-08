@@ -345,7 +345,7 @@ private final class SwiftTypeCache {
 ///
 /// `Transport.(requestManager)` is `RequestManager<ID64, Result<Packet.Payload, TransportError>>`
 /// [sym, field offset symbol], which is the instantiation everything below was disassembled in.
-final actor RequestManager<A: Hashable & Sendable, B: Sendable>: ActorBackedByDispatchSerialQueue {
+actor RequestManager<A: Hashable & Sendable, B: Sendable>: ActorBackedByDispatchSerialQueue {
     /// [sym] `direct field offset for RequestManager.queue : __C.OS_dispatch_queue_serial`, plus
     /// a `property descriptor` and a `queue.getter`. `__C.OS_dispatch_queue_serial` is
     /// `DispatchSerialQueue`.
@@ -405,7 +405,7 @@ final actor RequestManager<A: Hashable & Sendable, B: Sendable>: ActorBackedByDi
     /// Also an actor, also on the manager's queue — `init` takes the same queue.
     /// [sym] `: Swift.Actor` and `: ActorBackedByDispatchSerialQueue` conformance descriptors,
     /// and `merged protocol witness for Swift.Actor.unownedExecutor.getter … Request : Actor`.
-    final actor Request: ActorBackedByDispatchSerialQueue {
+    actor Request: ActorBackedByDispatchSerialQueue {
         /// [fieldmd] order is `id, state, queue`. [sym] `property descriptor for
         /// RequestManager.Request.id : A` and `… .queue : __C.OS_dispatch_queue_serial`.
         /// `state` has no accessor and no property descriptor.
@@ -504,7 +504,7 @@ final actor RequestManager<A: Hashable & Sendable, B: Sendable>: ActorBackedByDi
 /// `Transport.(backpressureManager)` is `BackpressureManager<ID64>?` [sym, field offset symbol] —
 /// **optional**, so a transport may have none. All disassembly below is the `<ID64>`
 /// specialisation; field offsets quoted are that instantiation's.
-final actor BackpressureManager<A: Hashable & Sendable>: ActorBackedByDispatchSerialQueue {
+actor BackpressureManager<A: Hashable & Sendable>: ActorBackedByDispatchSerialQueue {
     // Field layout, [fieldmd] for names and order, and [dis] for the offsets, each one read off
     // an instruction rather than derived from declaration order:
     //   +0x10 queue                  (16-byte object header, no default-actor storage: it has a
@@ -1252,7 +1252,7 @@ extension ActorBackedByDispatchSerialQueue {
 //    name, with the known-answer controls those two use: `BackpressureManager` for `genreq`
 //    (independently known to be `A: Hashable` from its `enum case for` symbols), and `Ack`
 //    (size 0) plus `SwiftType` (size 24) for `vwt`. `support-fieldtypes.py` has a control too:
-//    every `IsVar` bit lands where a reader would predict — the six mutable fields across
+//    every `IsVar` bit lands where a reader would predict — the eight mutable fields across
 //    `RequestManager`, `BackpressureManager` and `SwiftTypeCache.State` are marked and nothing
 //    else is — which is what makes the `let`/`var` reading trustworthy rather than a bit I decided
 //    the meaning of.

@@ -115,7 +115,7 @@ extension XPCDistributed.XPCSystem {
     ///       `ServiceRegistry.Key` — `Service` and `EphemeralService` each conform to the
     ///       two protocols separately, with two conformance descriptors apiece.
     /// [sym] Exactly two conformers ship in the framework: `Service` (witness table
-    ///       @ 0xd9b83368) and `EphemeralService` (@ 0xd9b83378). `InProcessService` does
+    ///       @ 0x2d9b83368) and `EphemeralService` (@ 0x2d9b83378). `InProcessService` does
     ///       not conform — see its note.
     protocol /* XPCSystem. */ ConnectableService {
         func connect(
@@ -231,7 +231,7 @@ extension XPCDistributed.XPCSystem {
     ///        flags 0x00400000. That is the incomplete-metadata placeholder, not a real
     ///        layout: `EphemeralService` embeds the resilient `XPC.XPCEndpoint`, so its
     ///        metadata is instantiated at runtime (it has a `type metadata singleton
-    ///        initialization cache` @ 0xd70d7758 and a `type metadata completion function`
+    ///        initialization cache` @ 0x2d70d7758 and a `type metadata completion function`
     ///        @ 0x2ad4d9890). Do not read a size out of it — this is the trap where a VWT
     ///        symbol exists but carries nothing.
     /// [sym]  Conformances, each with its own descriptor: `Hashable` (0x2ad52090c),
@@ -282,7 +282,7 @@ extension XPCDistributed.XPCSystem {
         /// [sym] `EphemeralService.connect(from:with:) async throws(SetupError) -> Session`
         ///       @ 0x2ad4d7a2c; `ConnectableService` witness @ 0x2ad4d8434.
         /// [dis] Same shape as `Service.connect`: continuation 1 loads the same
-        ///       `preserveSelfIPC` field-offset global 0xd70d80c8, and continuation 2 calls
+        ///       `preserveSelfIPC` field-offset global 0x2d70d80c8, and continuation 2 calls
         ///       `generic specialization <EphemeralService> of
         ///       ServiceRegistry.lookUpAndConnect`, falling through to the endpoint-based
         ///       XPC path.
@@ -488,7 +488,7 @@ extension XPCDistributed.XPCSystem {
             /// [refl] `let id: XPCDistributed.ID64`.
             /// [dis] `init` @ 0x2ad4d5240 does NOT take `id`: it draws one from a
             ///       module-level `ID64.Generator` (a `swift_once`-initialised global at
-            ///       0xd70d7450, token at 0xd70d7a90, incremented with an atomic CAS loop)
+            ///       0x2d70d7450, token at 0x2d70d7a90, incremented with an atomic CAS loop)
             ///       and stores it at object offset 0x10.
             let id: XPCDistributed.ID64
 
@@ -656,9 +656,9 @@ extension XPCDistributed.XPCSystem {
 
         private var services: [AnyHashable: RegisteredService]
 
-        /// [sym] `static ServiceRegistry.shared` @ 0xd70d80d8, getter @ 0x2ad4c08a4,
+        /// [sym] `static ServiceRegistry.shared` @ 0x2d70d80d8, getter @ 0x2ad4c08a4,
         ///       `unsafeMutableAddressor` @ 0x2ad4c0854, `one-time initialization function
-        ///       for shared` @ 0x2ad4c080c, token @ 0xd70d7340.
+        ///       for shared` @ 0x2ad4c080c, token @ 0x2d70d7340.
         /// [dis] The initializer allocates a `ServiceRegistry` directly; there is no
         ///       `ServiceRegistry.init` symbol at all, so the implicit `init()` was inlined.
         static let shared: XPCDistributed.XPCSystem.ServiceRegistry
@@ -741,7 +741,7 @@ extension XPCDistributed.XPCSystem {
         ///       The `Xo` suffix on `receiver`'s mangled type is UNOWNED (a weak field
         ///       would end in `Xw`), and its IsVar bit is set, so it is `unowned var`.
         ///       The other two are `let`. `targetQueue` is the imported ObjC class
-        ///       `__C.OS_dispatch_queue_serial`, not Swift's `DispatchSerialQueue` — the
+        ///       `DispatchSerialQueue` -- whose mangled name **is** `So24OS_dispatch_queue_serialC`; an earlier revision claimed these were different types and they are not (measured with `_mangledTypeName(DispatchSerialQueue.self)`) — the
         ///       same spelling `register(…targetQueue:)` uses [sym].
         /// [dis] Ownership independently confirmed: `outlined copy of RegisteredService?`
         ///       @ 0x2ad4c626c calls, in field order, `swift_unownedRetain`,
@@ -791,12 +791,12 @@ extension XPCDistributed.XPCSystem {
     ///   `await receiver.unwindPeers()` then `await ServiceRegistry.shared.unregister(service:)`.
     /// [dis] Registration is GATED ON `preserveSelfIPC`, and the branch is now resolved.
     ///   In the `<Service>` specialisation's continuation 1, at +0x2dc, the field-offset
-    ///   global 0xd70d80c8 is loaded and the flag byte read, then:
+    ///   global 0x2d70d80c8 is loaded and the flag byte read, then:
     ///       +0x2f0  tbz w8, #0, 0x2ad4cba0c    ; flag FALSE -> registry path
     ///   The fall-through (flag TRUE) goes straight to
     ///   `swift_task_addCancellationHandler` and suspends — it never registers. The taken
-    ///   edge at 0x2ad4cba0c touches the `shared` one-time token (0xd70d7340), loads
-    ///   `static ServiceRegistry.shared` (0xd70d80d8), reads `XPC.XPCListener.targetQueue`,
+    ///   edge at 0x2ad4cba0c touches the `shared` one-time token (0x2d70d7340), loads
+    ///   `static ServiceRegistry.shared` (0x2d70d80d8), reads `XPC.XPCListener.targetQueue`,
     ///   and hops onto the actor to reach the `register` call in continuation 2.
     ///   Two consequences: (a) `preserveSelfIPC` suppresses BOTH halves of the
     ///   same-process optimization — nothing registers and nothing looks up, so every
@@ -1103,14 +1103,14 @@ extension XPCDistributed.XPCSystem {
 //       `EphemeralService.Receiver.listen(forPeersSatisfying:executingForEachPeer:)`.
 //     FIND + CONNECT: `ConnectableService.connect(from:with:)`. RESOLVED [dis] for
 //       `Service.connect`, continuation 1 @ 0x2ad4d7100:
-//         +0x05c  adrp/add 0xd70d80c8      ; the XPCSystem.preserveSelfIPC field offset
+//         +0x05c  adrp/add 0x2d70d80c8      ; the XPCSystem.preserveSelfIPC field offset
 //         +0x068  ldrb  w9, [x19, x9]      ; load the flag off the actor system
 //         +0x06c  cmp   w9, #1
 //         +0x070  b.ne  0x2ad4d7304        ; flag FALSE -> registry path
 //       The fall-through (flag TRUE) logs and then `b 0x2ad4d74c0`, which is the
 //       `makeXPCSession` / `XPCRawTransport` / `Session(actorSystem:transport:options:)`
 //       block — no registry lookup at all. The `b.ne` side logs and reaches
-//       0x2ad4d761c, which touches the `shared` one-time token at 0xd70d7340 and then
+//       0x2ad4d761c, which touches the `shared` one-time token at 0x2d70d7340 and then
 //       `swift_task_switch`es into continuation 2, whose only call is
 //       `lookUpAndConnect`. So `preserveSelfIPC == true` FORCES real XPC even to
 //       yourself, exactly as the `XPCSYSTEM_PRESERVE_SELFIPC` env var name implies.
