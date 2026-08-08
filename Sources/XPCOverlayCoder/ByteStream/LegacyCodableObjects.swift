@@ -1,5 +1,6 @@
 import Foundation
 import XPC
+import XPCDispatchDataBridge
 
 extension CodingUserInfoKey {
 
@@ -115,7 +116,7 @@ enum LegacyOutOfLineData {
         // index would be off by one.
         let object: xpc_object_t = data.isEmpty
             ? xpc_data_create([UInt8](), 0)
-            : data.withUnsafeBytes { xpc_data_create($0.baseAddress, $0.count) }
+            : DispatchDataBridge.xpcData(for: data)
         xpc_array_append_value(objects, object)
         return index
     }

@@ -1,5 +1,6 @@
 import Foundation
 import XPC
+import XPCDispatchDataBridge
 
 extension OverlayEnvelope {
 
@@ -27,17 +28,16 @@ extension OverlayEnvelope {
     public static func message(_ encoded: XPCOverlayEncoder.Encoded,
                                isSync: Bool = false) -> xpc_object_t {
         let message = xpc_dictionary_create(nil, nil, 0)
-        encoded.body.withUnsafeBytes {
-            xpc_dictionary_set_data(message, body, $0.baseAddress, $0.count)
-        }
+        xpc_dictionary_set_value(message, body, DispatchDataBridge.xpcData(for: encoded.body))
         xpc_dictionary_set_int64(message, coderVersion, OverlayWireFormat.coderVersion)
         xpc_dictionary_set_bool(message, isSyncKey, isSync)
 
         let blobs = xpc_array_create(nil, 0)
         for blob in encoded.outOfLine {
-            blob.withUnsafeBytes {
-                xpc_array_append_value(blobs, xpc_data_create($0.baseAddress, $0.count))
-            }
+            // This is where the time goes for a large payload: the body stays
+            // tiny because `Data` is out-of-line, so the blob copy is nearly all
+            // of the envelope's cost.
+            xpc_array_append_value(blobs, DispatchDataBridge.xpcData(for: blob))
         }
         xpc_dictionary_set_value(message, outOfLine, blobs)
 
