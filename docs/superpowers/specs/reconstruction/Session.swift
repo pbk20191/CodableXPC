@@ -214,12 +214,12 @@ extension XPCSystem {
 
         /// Set to `nil` by both initialisers. Populated by `readyToReceive(_:)`, which stores
         /// the passed `Task` as the event's owning task. Occupies +0x78..+0x99 (0x21 bytes:
-        /// `future`, `promise` (2 words), `owningTask`, `posted: Bool`), which is why
+        /// `future`, `promise` (2 words), `owningTask`, `posted: XPCDistributed.Fuse` -- not `Bool`; see `Support.swift`, which read the field record), which is why
         /// `activationFuse` sits at the unaligned +0x99.
         /// [offset] [fieldmd] [disasm @0x2ad5075b0 +0x204..0x248, @0x2ad506ff8]
         private var ownedLocalInterfaceActivationEvent: OwnedAwaitableEvent<LocalInterface.ActivationToken>?   // +0x78
 
-        /// `Fuse` is `{ value: Bool }`. Flipped 0 -> 1 with a `caslb` in `activateTransport()`,
+        /// `Fuse` is `{ value: Synchronization.Atomic<Bool> }` and is `~Copyable` -- see `Transport.swift`, which read it from `Fuse.value.read : Synchronization.Atomic<Swift.Bool>`. An earlier revision here said `{ value: Bool }`, which this file's own disassembly refutes: `caslb` on `activationFuse` and `ldaprb` in `isCancelled` are only meaningful on an `Atomic`. Writing the `Bool` version gives a copyable, non-atomic latch. Flipped 0 -> 1 with a `caslb` in `activateTransport()`,
         /// in `readyToReceive(_:)`, and in the `.inactive`-guarded activation inlined into
         /// `init(actorSystem:transport:options:)` — a one-shot "already activated" latch.
         /// [offset] [fieldmd] [disasm @0x2ad507964 +0x28, @0x2ad5075b0 +0x2c8]
@@ -396,7 +396,7 @@ extension XPCSystem {
         /// `ActorID.encode(to:)` calls through.
         func handleActorShared(_ id: RawActorID.Local) -> SharedActorKey
 
-        /// `private`. The only writer of `sharedActors`. Asserts `isBidirectional`
+        /// `private`. The only writer that *inserts* into `sharedActors`. **Not the only writer:** `cancellationCompleted()` (`0x2ad508e64`) clears the table wholesale under the same mutex -- `os_unfair_lock_lock` on `self+0x30`, release the dictionary at `+0x38`, store `_swiftEmptyDictionarySingleton`, unlock. The scan behind the original claim was a callers-of scan over the accessor, which is structurally blind to code touching the field directly. Establishing it needs an access scan over the field offset, not the accessor. Asserts `isBidirectional`
         /// (`"API violation: Session must be bidirectional to share actor references"`,
         /// `Session.swift:263`). [symbol] 0x2ad508d08
         private func addSharedActor(_ id: RawActorID.Local, at key: SharedActorKey)
@@ -408,7 +408,7 @@ extension XPCSystem {
         func resolveSharedActor(at key: SharedActorKey) -> (any DistributedActor)?
 
         // -----------------------------------------------------------------------------------
-        // Pending invocation execution tasks. All five [symbol].
+        // Pending invocation execution tasks. All six [symbol].
         // -----------------------------------------------------------------------------------
 
         func addPendingInvocationExecutionTask(_ task: Task<(), Never>, withID id: ID64)   // 0x2ad507e88
