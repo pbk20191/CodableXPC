@@ -13,13 +13,20 @@ import XPC
 /// | envelope | `_CodableBody`, `_CodableIsSync` | plus `_CodableOutOfLine` | five keys |
 /// | version key | none | none | required, `1` |
 /// | `Data` | in the stream | side array | out-of-line blob |
-/// | live objects | none | `XPCCodableObject` | `XPCCodableObject` |
+/// | live objects | none — see below | `XPCCodableObject` | `XPCCodableObject` |
 ///
 /// ## How each was established
 ///
 /// ``iOS17`` from a decompiled 17.6.1 `libswiftXPC`: every
 /// `CodingContainer.wireType` ordinal read directly, and an `encodeMessage` that
 /// writes two keys and returns. No `XPCCodableObject` anywhere in it.
+///
+/// Nor anything for it to carry. `XPCEndpoint` is macOS 15 / macCatalyst 18, so
+/// it arrived *with* ``iOS18`` and the machinery that moves it: 20 references to
+/// it and 259 to `XPCCodableObject` in that binary, none in the iOS 17 one. The
+/// older generation has no side array because in that release there was nothing
+/// to put in one — which is why an ``iOS17`` coder handed an endpoint throws
+/// rather than writing something its peer would misread.
 ///
 /// ``iOS18`` measured live in an 18.6 simulator. That build still exports the
 /// byte-level `XPCEncoder`/`XPCDecoder`, so both directions were run against
