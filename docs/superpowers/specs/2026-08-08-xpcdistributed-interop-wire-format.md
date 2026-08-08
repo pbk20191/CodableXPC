@@ -669,7 +669,9 @@ because a method of a generic type mangles only the requirements introduced at i
 `resolve() -> A` prints unconstrained; it lives in the nominal type descriptor
 (`0x2ad526f04`, `NumRequirements=2`). So this is a reference to an `@Resolvable` *protocol stub*,
 and `resolve()` hands back the stub-typed proxy. On the wire it is nothing special:
-`ActorReference.encode(to:)` is 32 bytes and tail-calls `ActorID.encode(to:)`, so an
+`ActorReference.encode(to:)` is 36 bytes and `bl`s `ActorID.encode(to:)` on `self.id` — an earlier
+revision said 32 bytes and "tail-calls", both wrong, though the semantics it drew from them hold —
+so an
 `ActorReference` **is a bare `SharedActorKey`** with nothing recording the stub type. A `Codable`
 class with `init<A1>(_: A1, as: A.Type)` and
 `resolve() -> A` — the user-facing transferable actor reference, a thing you put in a distributed
