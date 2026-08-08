@@ -151,6 +151,24 @@ this is either an explicit `if let` or an inlined `encodeIfPresent`; both omit t
 The same holds for the other optionals — `errorType`, `returnType`, `basePriority`. A nil
 optional means **the key is not written**, never a null value.
 
+### basePriority and priority
+
+`TaskPriority`, and it reaches the wire as a **bare `UInt8`** — not `{"rawValue": n}`. The
+conformance is `Swift.TaskPriority : Codable` *in the standard library*, not an extension in
+XPCDistributed, and it comes from `RawRepresentable`'s conditional conformance, which codes the
+raw value in a single-value container.
+
+Checked directly rather than reasoned about, since it is stdlib behavior we can just run:
+
+```
+TaskPriority.high        -> 25
+TaskPriority.medium      -> 21
+TaskPriority.low         -> 17
+TaskPriority.background  ->  9
+```
+
+A nil `basePriority` omits the key entirely, consistent with the optional rule above.
+
 ## Request
 
 `Session.RemoteInvocationRequest`, a struct with keys in this order:
@@ -163,15 +181,22 @@ remoteCallIdentifier : ...           the RemoteCallTarget identifier
 contents             : InvocationContents
 ```
 
-`encode(to:)` was read from the decompilation. It opens one keyed container against `CodingKeys`
-and encodes `id` through **`ID64`'s own conformance** — the generic `encode<A>(_:forKey:)`
-overload with the `ID64` witness table. So the correlation id is `{ "value": <UInt64> }`, not a
-bare integer. `targetedSharedActor` and `contents` likewise go through their own conformances;
-one non-generic `encode(_:forKey:)` call handles a builtin-typed key.
+`encode(to:)` opens one keyed container against `CodingKeys` — confirmed with
+`verify-containers.py`, and consistent with `RemoteInvocationRequest` having a `CodingKeys` in
+the field descriptors. It encodes `id` through **`ID64`'s own conformance**: the generic
+`encode<A>(_:forKey:)` overload with the `ID64` witness table. `targetedSharedActor` and
+`contents` likewise go through their own conformances; one non-generic `encode(_:forKey:)` call
+handles a builtin-typed key.
 
-That makes **`ID64` the wire representation of every identifier in this protocol** — the request
-id here, and the `dynamic` shared-actor key. Anywhere our design writes a bare `uint64`, Apple
-writes a one-field dictionary.
+Going through `ID64`'s conformance is **not** the same as writing a nested dictionary. `ID64` is
+single-value (see *Identity*), so `id` lands as a plain integer under the `id` key — the witness
+table is about which `encode` runs, not about adding a level of nesting. An earlier revision of
+this section concluded "so the correlation id is `{ "value": <UInt64> }`, not a bare integer,"
+and generalised it to "anywhere our design writes a bare `uint64`, Apple writes a one-field
+dictionary." Both were wrong, for the reason recorded under *Identity*.
+
+`ID64` is still the wire representation of every identifier in this protocol — the request id
+here, and the `dynamic` shared-actor key. It just isn't a dictionary.
 
 ### InvocationContents is not a wire discriminator — resolved
 
@@ -210,12 +235,38 @@ key.** The struct has no `CodingKeys`, and `encode(to:)` (`0x2ad50f8e0`) / `init
 unwrapped; there is no envelope around it. Resolved with `verify-containers.py`, which carries
 this method for exactly this reason — the field name reads like a key and is not one.
 
-The `_value` is a success payload or a `RemoteInvocationFailure`, a multi-payload enum coded in
-the synthesized shape:
+`_value` is not the payload directly either. It is **`Either<A, RemoteInvocationFailure>`**, a
+generic enum of Apple's own (`XPCDistributed.Either`, cases `a | b`), and `Either` carries the
+success-versus-failure discriminator. Its coding is the same shape as `SharedActorKey`'s — an
+unkeyed pair whose first element is a `UInt8` tag:
 
 ```
-{ "executionFailed":         { "_0": <payload> } }
-{ "resultPropagationFailed": { "_0": <payload> } }
+[ <Either.Case : UInt8>, <payload> ]
+
+0  ->  the success result   (A)
+1  ->  a RemoteInvocationFailure
+```
+
+`Either.encode(to:)` (`0x2ad4ed7c4`) opens an `unkeyedContainer()`; `init(from:)` (`0x2ad4ed9e4`)
+mirrors it. `Either.Case` is `RawRepresentable` over `UInt8`
+(`Either.(Case).init(rawValue: Swift.UInt8)`), with no `CodingKeys`, so the tag is a bare
+integer. As with `WireCode`, the raw values are the defaults in declaration order — `a` is 0,
+`b` is 1 — and `Either<A, RemoteInvocationFailure>` puts the result in `a`.
+
+So a full response is `[0, <result>]` or `[1, {"executionFailed": {"_0": "..."}}]`. There is no
+`_value` key and no response-level dictionary anywhere in that.
+
+Corroborating the direction, `RemoteInvocationResponse` has exactly three initializers:
+`init(result: A)`, `init(executionFailure: Swift.String)`, `init(resultPropagationFailure:
+Swift.String)`. Both failure payloads are **`String`** — which is the same fact as "Apple does
+not propagate concrete errors", below, arrived at from the type signatures.
+
+`RemoteInvocationFailure` itself is keyed (it does have `CodingKeys`), a multi-payload enum coded
+in the synthesized shape:
+
+```
+{ "executionFailed":         { "_0": <String> } }
+{ "resultPropagationFailed": { "_0": <String> } }
 ```
 
 Both per-case key sets contain exactly `_0`, confirming a single unlabelled associated value each.
