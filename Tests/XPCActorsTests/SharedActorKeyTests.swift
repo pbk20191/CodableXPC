@@ -14,19 +14,21 @@ final class SharedActorKeyTests: XCTestCase {
     //
     // Apple's shipping `SharedActorKey.encode(to:)` writes an *unkeyed* two-element
     // container -- `[ <WireCode as UInt8>, <payload> ]` -- never a keyed dictionary.
-    // These pin that shape byte for byte; see the wire-format spec's "SharedActorKey --
-    // an unkeyed pair, not synthesized coding".
+    // Both payload types are themselves single-value: `SwiftType` is a bare String and
+    // `ID64` is a bare UInt64, so no case nests a dictionary. These pin that shape byte
+    // for byte; see the wire-format spec's "SharedActorKey -- an unkeyed pair, not
+    // synthesized coding" and "Verifying a container choice".
 
     func testTheEncodedFormIsPinned() throws {
         XCTAssertEqual(
             try encoded(.exported(SwiftType(mangledTypeName: "Sample"))),
-            "[uint64(0),dict{mangledTypeName=string(Sample)}]")
+            "[uint64(0),string(Sample)]")
         XCTAssertEqual(
             try encoded(.exportedRawValue("primary")),
             "[uint64(1),string(primary)]")
         XCTAssertEqual(
             try encoded(.dynamic(ID64(rawValue: 7))),
-            "[uint64(2),dict{value=uint64(7)}]")
+            "[uint64(2),uint64(7)]")
     }
 
     func testEachCaseEncodesExactlyTwoElements() throws {
@@ -82,12 +84,39 @@ final class SharedActorKeyTests: XCTestCase {
         XCTAssertThrowsError(try XPCDecoder().decode(SharedActorKey.self, from: object))
     }
 
-    func testADynamicPayloadThatIsNotAnID64DictionaryIsRejected() throws {
-        // Wire code 2 (`dynamic`) promises an ID64, `{ "value": <UInt64> }`; a bare
-        // uint64 (the old wire shape) must not decode as one.
+    func testAnExportedPayloadThatIsNotAStringIsRejected() throws {
+        // Wire code 0 (`exported`) promises a `SwiftType`, which is a bare String; a
+        // uint64 must not be coerced into one.
         let object = xpc_array_create(nil, 0)
-        xpc_array_append_value(object, xpc_uint64_create(2))
-        xpc_array_append_value(object, xpc_uint64_create(7))
+        xpc_array_append_value(object, xpc_uint64_create(0))
+        xpc_array_append_value(object, xpc_uint64_create(42))
         XCTAssertThrowsError(try XPCDecoder().decode(SharedActorKey.self, from: object))
+    }
+
+    // MARK: decoding bytes we did not write
+    //
+    // The round-trip tests above only prove our decoder inverts our encoder -- they
+    // would still pass if both sides agreed on a shape Apple never sends. These build
+    // the peer's bytes by hand and require that they decode.
+
+    func testHandBuiltPeerBytesDecode() throws {
+        let exported = xpc_array_create(nil, 0)
+        xpc_array_append_value(exported, xpc_uint64_create(0))
+        xpc_array_append_value(exported, xpc_string_create("Sample"))
+        XCTAssertEqual(try XPCDecoder().decode(SharedActorKey.self, from: exported),
+                       .exported(SwiftType(mangledTypeName: "Sample")))
+
+        let raw = xpc_array_create(nil, 0)
+        xpc_array_append_value(raw, xpc_uint64_create(1))
+        xpc_array_append_value(raw, xpc_string_create("primary"))
+        XCTAssertEqual(try XPCDecoder().decode(SharedActorKey.self, from: raw),
+                       .exportedRawValue("primary"))
+
+        // A bare uint64, not `{ "value": 7 }` -- the shape this test previously forbade.
+        let dynamic = xpc_array_create(nil, 0)
+        xpc_array_append_value(dynamic, xpc_uint64_create(2))
+        xpc_array_append_value(dynamic, xpc_uint64_create(7))
+        XCTAssertEqual(try XPCDecoder().decode(SharedActorKey.self, from: dynamic),
+                       .dynamic(ID64(rawValue: 7)))
     }
 }

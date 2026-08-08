@@ -48,7 +48,7 @@ final class ActorIDTests: XCTestCase {
 
         let object = try encoder.encode(ActorID(raw: .local(local)))
 
-        XCTAssertEqual(normalizedDescription(object), "[uint64(2),dict{value=uint64(1)}]")
+        XCTAssertEqual(normalizedDescription(object), "[uint64(2),uint64(1)]")
         XCTAssertEqual(session.shared, [local])
     }
 
