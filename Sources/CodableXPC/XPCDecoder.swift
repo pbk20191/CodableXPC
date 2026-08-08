@@ -777,8 +777,19 @@ private struct _XPCKeyedDecodingContainer<Key:CodingKey>: KeyedDecodingContainer
     
     func decode<T>(_ type: T.Type, forKey key: Key) throws -> T where T : Decodable {
         let currentPath = codingPath + [key]
-        let object = try getValue(type, forKey: key)
+        // Null has to reach the value: `Optional`'s own conformance asks a
+        // single-value container for it and answers `.none`. Rejecting it here
+        // is why `[String: Int?]` failed while `[Int?]`, which reads the element
+        // directly, always worked.
+        let object = try getValue(forKey: key)
         let xpcType = xpc_get_type(object)
+        // The types handled below are concrete, so for them null really is a
+        // missing value rather than a representable one.
+        if xpcType == XPC_TYPE_NULL, type is Data.Type || type is Date.Type || type is UUID.Type {
+            throw DecodingError.valueNotFound(type, .init(
+                codingPath: currentPath,
+                debugDescription: "Expected \(type) but found null instead"))
+        }
         let value:T
         switch type {
         case is Data.Type:

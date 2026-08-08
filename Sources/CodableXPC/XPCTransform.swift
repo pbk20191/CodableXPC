@@ -13,9 +13,21 @@ import XPC
 
 internal extension Date {
     
+    /// `xpc_date_create` takes nanoseconds in an `Int64`, which reaches roughly
+    /// ±292 years around 1970. `Date.distantPast` and `Date.distantFuture` are
+    /// thousands of years outside it, and the conversion used to trap on the way
+    /// — a crash, in an encoder, for a value `Date` hands out as a constant.
     @usableFromInline
-    var xpcRepresentation:xpc_object_t {
-        xpc_date_create(Int64.init(timeIntervalSince1970 * 1_000_000_000))
+    func xpcRepresentation(at path: [any CodingKey]) throws -> xpc_object_t {
+        let nanos = timeIntervalSince1970 * 1_000_000_000
+        guard nanos >= -9.223372036854775e18, nanos <= 9.223372036854775e18,
+              nanos.isFinite else {
+            throw EncodingError.invalidValue(self, .init(
+                codingPath: path,
+                debugDescription: "an xpc date is nanoseconds in an Int64, which "
+                    + "reaches about ±292 years around 1970; this one is outside that"))
+        }
+        return xpc_date_create(Int64(nanos))
     }
 
     @usableFromInline
@@ -37,6 +49,23 @@ internal extension UUID {
         return xpc_uuid_create(buffer)
     }
     
+}
+
+internal extension String {
+
+    /// `xpc_string_create` takes a C string, so it stops at the first NUL while a
+    /// Swift `String` may contain one. Encoding such a value would silently drop
+    /// everything after it, which is worse than refusing.
+    @usableFromInline
+    func xpcString(at path: [any CodingKey]) throws -> xpc_object_t {
+        guard !utf8.contains(0) else {
+            throw EncodingError.invalidValue(self, .init(
+                codingPath: path,
+                debugDescription: "an xpc string cannot carry an embedded NUL; "
+                    + "this one would be truncated there, silently, so it is refused"))
+        }
+        return xpc_string_create(self)
+    }
 }
 
 internal extension Data {
