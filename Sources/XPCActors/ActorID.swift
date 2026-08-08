@@ -31,6 +31,13 @@ public struct ID64: Hashable, Sendable, Codable, CustomStringConvertible {
     public let rawValue: UInt64
     public init(rawValue: UInt64) { self.rawValue = rawValue }
 
+    /// Apple's own `ID64` names its stored field `value` on the wire; ours is spelled
+    /// `rawValue` in Swift, so the wire key is remapped rather than the property --
+    /// renaming the property would ripple through every call site for no wire benefit.
+    private enum CodingKeys: String, CodingKey {
+        case rawValue = "value"
+    }
+
     private static let counter = ManagedAtomicCounter()
     public static func next() -> ID64 { ID64(rawValue: counter.next()) }
 

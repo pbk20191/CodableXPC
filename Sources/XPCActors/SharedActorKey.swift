@@ -2,62 +2,71 @@ import Foundation
 
 /// An actor reference on the wire is exactly this and nothing else.
 ///
-/// The coding is written by hand with an explicit `kind` discriminator rather than
-/// Swift's synthesized enum coding. Apple's dump build used the synthesized form and
-/// its shipping build moved to a `UInt8` discriminator, with nothing detecting the
-/// break; an explicit discriminator from the start plus the golden fixtures in
-/// `SharedActorKeyTests` is how that failure mode is closed here.
+/// Matches Apple's shipping `XPCDistributed` (`SharedActorKey.encode(to:)`,
+/// disassembled from the macOS 27 binary at `0x2ad4f8458`), not the synthesized enum
+/// coding an older, dump-only build used. The type has no `CodingKeys` of any kind in
+/// the shipping build, so a keyed container is not an option: each case writes exactly
+/// two values -- a `WireCode`, then its payload -- into one unkeyed container.
+///
+/// See `docs/superpowers/specs/2026-08-08-xpcdistributed-interop-wire-format.md`,
+/// "SharedActorKey -- an unkeyed pair, not synthesized coding".
 @available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
 public enum SharedActorKey: Hashable, Sendable {
-    /// The default actor for a type. Pre-agreed: a peer can import it with no round trip.
-    case type(String)
-    /// An actor exported under a name. Also pre-agreed.
-    case name(String)
-    /// An actor that crossed the wire as a value during a call.
-    case dynamic(UInt64)
+    /// The default actor for a type. Pre-agreed: a peer can import it with no round
+    /// trip. Payload is a `SwiftType`, never a bare mangled name.
+    case exported(SwiftType)
+    /// An actor exported under a name. Also pre-agreed. Payload is a plain `String` --
+    /// the builtin overload, no witness-table call, per the disassembly.
+    case exportedRawValue(String)
+    /// An actor that crossed the wire as a value during a call. Payload is an `ID64`,
+    /// coded through its own conformance -- `{ "value": <UInt64> }`, not a bare integer.
+    case dynamic(ID64)
 }
 
 @available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
 extension SharedActorKey: Codable {
 
-    private enum CodingKeys: String, CodingKey {
-        case kind, type, name, id
-    }
-
-    private enum Kind: UInt64 {
-        case type = 0, name = 1, dynamic = 2
+    /// `RawRepresentable` over `UInt8`, `0, 1, 2` in declaration order -- confirmed by
+    /// `WireCode.rawValue.getter : Swift.UInt8` and `WireCode.init(rawValue:)` in the
+    /// extracted binary.
+    private enum WireCode: UInt8 {
+        case exported = 0
+        case exportedRawValue = 1
+        case dynamic = 2
     }
 
     public func encode(to encoder: any Encoder) throws {
-        var container = encoder.container(keyedBy: CodingKeys.self)
+        var container = encoder.unkeyedContainer()
         switch self {
-        case .type(let mangled):
-            try container.encode(Kind.type.rawValue, forKey: .kind)
-            try container.encode(mangled, forKey: .type)
-        case .name(let name):
-            try container.encode(Kind.name.rawValue, forKey: .kind)
-            try container.encode(name, forKey: .name)
+        case .exported(let type):
+            try container.encode(WireCode.exported.rawValue)
+            try container.encode(type)
+        case .exportedRawValue(let raw):
+            try container.encode(WireCode.exportedRawValue.rawValue)
+            try container.encode(raw)
         case .dynamic(let id):
-            try container.encode(Kind.dynamic.rawValue, forKey: .kind)
-            try container.encode(id, forKey: .id)
+            try container.encode(WireCode.dynamic.rawValue)
+            try container.encode(id)
         }
     }
 
     public init(from decoder: any Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        let raw = try container.decode(UInt64.self, forKey: .kind)
-        guard let kind = Kind(rawValue: raw) else {
+        var container = try decoder.unkeyedContainer()
+        let raw = try container.decode(UInt8.self)
+        guard let code = WireCode(rawValue: raw) else {
             throw DecodingError.dataCorruptedError(
-                forKey: .kind, in: container,
-                debugDescription: "unknown SharedActorKey kind \(raw)")
+                in: container, debugDescription: "unknown SharedActorKey wire code \(raw)")
         }
-        // The discriminator decides which key is read. A payload key that does not
-        // match the kind is not consulted, so a mismatched pair fails rather than
-        // decoding as whatever happens to be present.
-        switch kind {
-        case .type: self = .type(try container.decode(String.self, forKey: .type))
-        case .name: self = .name(try container.decode(String.self, forKey: .name))
-        case .dynamic: self = .dynamic(try container.decode(UInt64.self, forKey: .id))
+        // The discriminator decides which decode runs next. There is no payload key to
+        // consult instead -- the container is unkeyed -- so a payload of the wrong
+        // shape for this code fails the decode of that element, not a fallback guess.
+        switch code {
+        case .exported:
+            self = .exported(try container.decode(SwiftType.self))
+        case .exportedRawValue:
+            self = .exportedRawValue(try container.decode(String.self))
+        case .dynamic:
+            self = .dynamic(try container.decode(ID64.self))
         }
     }
 }
