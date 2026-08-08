@@ -72,25 +72,6 @@ extension XPCCompat.Dictionary {
         }
     }
 
-    /// Reads a shared memory object.
-    public subscript(key: String, as type: XPCCompat.SharedMemory.Type = XPCCompat.SharedMemory.self) -> XPCCompat.SharedMemory? {
-        guard let value = xpc_dictionary_get_value(underlying, key),
-              xpc_get_type(value) == XPC_TYPE_SHMEM else { return nil }
-        return XPCCompat.SharedMemory(value)
-    }
-
-    /// Reads or writes a shared memory object.
-    public subscript(key: String) -> XPCCompat.SharedMemory? {
-        get { self[key, as: XPCCompat.SharedMemory.self] }
-        set {
-            guard let newValue else {
-                xpc_dictionary_set_value(underlying, key, nil)
-                return
-            }
-            xpc_dictionary_set_value(underlying, key, newValue.underlying)
-        }
-    }
-
     /// Reads the raw object stored under `key`, whatever its type.
     public subscript(key: String, as type: xpc_object_t.Type = xpc_object_t.self) -> xpc_object_t? {
         xpc_dictionary_get_value(underlying, key)
@@ -179,29 +160,6 @@ extension XPCCompat.Array {
     ///   is empty.
     public subscript(index: Int) -> XPCCompat.Endpoint? {
         get { self[index, as: XPCCompat.Endpoint.self] }
-        set {
-            guard let newValue else {
-                preconditionFailure("XPCCompat.Array does not support removing elements by assigning nil")
-            }
-            precondition(index >= 0 && index < xpc_array_get_count(underlying), "index out of range")
-            xpc_array_set_value(underlying, index, newValue.underlying)
-        }
-    }
-
-    /// Reads a shared memory object at `index`.
-    public subscript(index: Int, as type: XPCCompat.SharedMemory.Type = XPCCompat.SharedMemory.self) -> XPCCompat.SharedMemory? {
-        guard let value = self[index, as: xpc_object_t.self],
-              xpc_get_type(value) == XPC_TYPE_SHMEM else { return nil }
-        return XPCCompat.SharedMemory(value)
-    }
-
-    /// Reads or writes a shared memory object at `index`.
-    /// - Precondition: on set, `index` is within bounds and `newValue` is non-nil.
-    ///   An `XPCCompat.Array` cannot remove elements, so assigning `nil` traps rather
-    ///   than doing nothing: `a[0] = someOptionalValue` is a crash when the optional
-    ///   is empty.
-    public subscript(index: Int) -> XPCCompat.SharedMemory? {
-        get { self[index, as: XPCCompat.SharedMemory.self] }
         set {
             guard let newValue else {
                 preconditionFailure("XPCCompat.Array does not support removing elements by assigning nil")
