@@ -48,12 +48,20 @@ import XPC
 /// import nothing from each other — the split is the honest shape of a module
 /// holding two formats that share only a lineage.
 ///
-/// ## Errors
+/// ## Errors are this module's own
 ///
-/// Failures here throw this module's own types. An `XPCRichError` can be made
-/// too, despite libxpc having no creator for one — see
-/// ``XPC/XPCRichError/make(_:canRetry:)``, which does not need libxpc because
-/// the Swift type turns out not to wrap an `xpc_rich_error_t`.
+/// Neither of Apple's XPC error types can be built from an exported symbol.
+/// `xpc_error` has no creator at any linkage — searching libxpc's whole symbol
+/// table for a name containing both "error" and "create" returns one entry, and
+/// it is not that; the four `XPC_ERROR_*` singletons are exported as data, to be
+/// recognised and passed along rather than added to. `xpc_rich_error_create`
+/// does exist but is a local symbol, so `dlsym` and `@_silgen_name` both miss
+/// it.
+///
+/// `XPCRichError` could be forged — it holds only a `String` and a `Bool`, not
+/// an `xpc_rich_error_t` — but this module does not, because a value faked from
+/// an undocumented layout is not the same kind of thing as a format reproduced
+/// from measurement, which is what everything else here is.
 public enum XPCOverlayGeneration: Sendable, Equatable, CaseIterable {
     /// macOS 14 / iOS 17.
     case iOS17
