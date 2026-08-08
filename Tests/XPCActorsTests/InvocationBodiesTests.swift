@@ -21,18 +21,6 @@ import CodableXPC
 /// Enough of a session to let an `ActorID` code itself. `ActorIDTests` has its own,
 /// `private` to that file.
 @available(macOS 14, *)
-private final class StubSession: SessionCoding, @unchecked Sendable {
-    var shared: [RawActorID.Local] = []
-    func shareDynamically(_ local: RawActorID.Local) -> SharedActorKey? {
-        shared.append(local)
-        return .dynamic(ID64(rawValue: UInt64(shared.count)))
-    }
-    func remoteID(for key: SharedActorKey) -> ActorID {
-        ActorID(raw: .remote(.init(session: self, key: key)))
-    }
-}
-
-@available(macOS 14, *)
 final class InvocationBodiesTests: XCTestCase {
 
     private func encoded<T: Encodable>(

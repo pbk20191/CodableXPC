@@ -6,24 +6,6 @@ import CodableXPC
 
 /// Stands in for a `Session`, so identity can be tested with no transport.
 @available(macOS 14, *)
-private final class StubSession: SessionCoding, @unchecked Sendable {
-    var shared: [RawActorID.Local] = []
-    var nextDynamic: UInt64 = 1
-    var refuseToShare = false
-
-    func shareDynamically(_ local: RawActorID.Local) -> SharedActorKey? {
-        guard !refuseToShare else { return nil }
-        shared.append(local)
-        defer { nextDynamic += 1 }
-        return .dynamic(ID64(rawValue: nextDynamic))
-    }
-
-    func remoteID(for key: SharedActorKey) -> ActorID {
-        ActorID(raw: .remote(.init(session: self, key: key)))
-    }
-}
-
-@available(macOS 14, *)
 final class ActorIDTests: XCTestCase {
 
     private func userInfo(_ session: StubSession) -> [CodingUserInfoKey: Any] {
