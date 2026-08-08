@@ -673,7 +673,14 @@ and `resolve()` hands back the stub-typed proxy. On the wire it is nothing speci
 `ActorReference` **is a bare `SharedActorKey`** with nothing recording the stub type. A `Codable`
 class with `init<A1>(_: A1, as: A.Type)` and
 `resolve() -> A` — the user-facing transferable actor reference, a thing you put in a distributed
-func's signature. It is not consulted by the session at all. One more field list that looked like
+func's signature. **No statically bound call to `ActorReference.init(_:as:)` or `resolve()` exists
+inside `XPCDistributed`** — which is what the scan behind this actually supports, and not the same
+as "the session never consults it": both are vtable members with method descriptors, so a
+direct-branch scan is blind to exactly the dispatch they would use. An earlier revision said "it
+is not consulted by the session at all," and the reconstruction pass declined to inherit that
+strong form rather than repeat it. Left as the weaker claim until someone scans `blraa` too.
+
+One more field list that looked like
 an answer.
 
 ### Where a SharedActorKey is minted, and by which generator
@@ -999,7 +1006,13 @@ init(actorSystem: XPCSystem, local:     LocalSessionState,   options: Initializa
 inference**: the two initialisers and the two payload types are facts; the case-to-payload
 assignment was not read out of `Kind`'s field descriptor payload records.
 
-`InitializationOptions` is `{ rawValue }`, an OptionSet. **Its members were not resolved.**
+`InitializationOptions` is `{ rawValue }`, an OptionSet with exactly two members —
+`bidirectional` = **2** and `inactive` = **4**, bit 0 unused. Two independent reads each: the
+static storage at `0x2ad523140`/`0x2ad523148`, and the getters, which are literally
+`mov w0,#2; ret` and `mov w0,#4; ret`. Independently re-verified during the reconstruction
+review. And `isBidirectional` is set from it — both initializers end
+`ubfx w8, wOptions, #1, #1; strb w8, [self, #0x70]` — and is a stored `let`, so those two
+initializers are the whole story.
 
 `isBidirectional` is a plain stored `Bool` at `Session+0x70`, also an `InboundSessionProtocol`
 requirement. It gates the entire shared-actor mechanism: `addSharedActor` asserts it, and
@@ -1161,13 +1174,16 @@ narrower: a callers-of scan over `__text` finds that `Transport.sendRequest(id:p
 is only one place an outgoing `headerID` can come from, and only one `cas` on that path mints an
 id. Following the closure's capture chain to the store would close it; that was not done.
 
-`Session` and the `DistributedActorSystem` conformance are covered by *The session layer*. What
-that round left unresolved, listed so it is not mistaken for settled: the case-to-payload
-assignment of `Session.Kind`; the members of `Session.InitializationOptions`; where
-`isBidirectional` is written; which protocol existential each of `ActorID`'s two coding methods
-casts the userInfo value to (inferred from the field type and the failure strings, not read from
-the descriptors); and the purpose of `ActivationToken`'s `Codable` conformance, which is not
-exercised by any packet path in this image.
+`Session` and the `DistributedActorSystem` conformance are covered by *The session layer*. Three items that round left unresolved were closed by the reconstruction pass and are recorded
+above: `Session.Kind`'s case-to-payload assignment (`.xpc(Transport)` / `.local(LocalSessionState)`,
+8 bytes with the tag in pointer bit 63 — read independently by two agents with two implementations
+of the field-record reader, then cross-checked against both store sites), the members of
+`InitializationOptions`, and where `isBidirectional` is written.
+
+Still unresolved, listed so it is not mistaken for settled: which protocol existential each of
+`ActorID`'s two coding methods casts the userInfo value to (inferred from the field type and the
+failure strings, not read from the descriptors); and the purpose of `ActivationToken`'s `Codable`
+conformance, which is not exercised by any packet path in this image.
 
 The goal is **our own protocol matched to Apple's format**, not live interop with Apple's
 services — so the entitlement wall (`"Peer failed XPCSystem's entitlement check"`, enforced by
