@@ -38,9 +38,13 @@ import XPC
 /// classes are gone and all three message entry points gained one, which is also
 /// when `encodeMessage` grew its `userInfo:` parameter.
 ///
-/// `XPCReceivedMessage` differs with them. On ``iOS17`` and ``iOS18`` it carries
-/// an `XPCReceivedMessageMetadata`, a nested type the newer one does not have,
-/// and there is no `init(dictionary:)` to make one from a bare dictionary.
+/// `XPCReceivedMessage` differs with them: on ``iOS17`` and ``iOS18`` it carries
+/// an `XPCReceivedMessageMetadata`, a nested type the newer one does not have.
+///
+/// It does still have an `init(dictionary:)` there — the same mangled name, as a
+/// local symbol rather than an exported one, verified by calling it on iOS 18.
+/// Only ``iOS26`` exports it, which is the whole reason ``AppleCoderBridge``
+/// works on that generation and reports itself unavailable on the others.
 /// ## Where the code is
 ///
 /// `ByteStream/` is ``iOS17`` and ``iOS18``; `EncodingGraph/` is ``iOS26``;

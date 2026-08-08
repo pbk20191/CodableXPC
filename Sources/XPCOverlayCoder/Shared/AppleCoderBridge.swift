@@ -5,12 +5,27 @@ import XPC
 ///
 /// ## Why this is possible at all
 ///
-/// `XPCReceivedMessage.init(dictionary:)` is exported from `libswiftXPC.dylib` —
-/// it is in the `.tbd` the linker reads — but it is absent from the public
-/// `.swiftinterface`, so there is no declaration to call. Both its parameter and
-/// its result are public types, though, which is what makes the gap bridgeable:
-/// declaring a Swift function with the same Swift signature lets the compiler
-/// emit the calling convention, instead of us asserting one and being wrong.
+/// `XPCReceivedMessage.init(dictionary:)` is exported from `libswiftXPC.dylib` on
+/// macOS 26+ / iOS 26+ — it is in the `.tbd` the linker reads — but it is absent
+/// from the public `.swiftinterface`, so there is no declaration to call. Both
+/// its parameter and its result are public types, though, which is what makes
+/// the gap bridgeable: declaring a Swift function with the same Swift signature
+/// lets the compiler emit the calling convention, instead of us asserting one
+/// and being wrong.
+///
+/// ## On the older builds it is there but not exported
+///
+/// iOS 18 has the same initialiser under the same mangled name as a **local**
+/// symbol, so `dlsym` returns nil and ``isAvailable`` reports `false`. That is
+/// linkage, not absence: sliding to it from an exported neighbour by the delta
+/// the symbol table records produces a working `XPCReceivedMessage` that decodes
+/// a real message. This does not do that — the delta belongs to one build — and
+/// the older builds need no bridge anyway, since they export the byte-level
+/// `XPCEncoder`/`XPCDecoder` outright.
+///
+/// iOS 17 is unverified either way. Only a decompile is to hand, and that same
+/// tool reports no such initialiser for iOS 18, where the binary demonstrably
+/// has one — so its silence is not evidence.
 ///
 /// ## Why the *encoder* is not here
 ///
