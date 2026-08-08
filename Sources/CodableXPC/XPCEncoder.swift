@@ -274,7 +274,7 @@ private struct _XPCKeyedEncodingContainer<Key : CodingKey>: KeyedEncodingContain
         let newPath = codingPath + [key]
         let newRef = xpc_dictionary_create(nil, nil, 0)
         xpc_dictionary_set_value(ref, key.stringValue, newRef)
-        let childContainer = _XPCKeyedEncodingContainer<NestedKey>(ref: ref, path: newPath, userInfo: userInfo)
+        let childContainer = _XPCKeyedEncodingContainer<NestedKey>(ref: newRef, path: newPath, userInfo: userInfo)
         return KeyedEncodingContainer<NestedKey>(childContainer)
     }
     
@@ -282,7 +282,7 @@ private struct _XPCKeyedEncodingContainer<Key : CodingKey>: KeyedEncodingContain
         let newPath = codingPath + [key]
         let newRef =  xpc_array_create(nil, 0)
         xpc_dictionary_set_value(ref, key.stringValue, newRef)
-        let childContainer = _XPCUnkeyedEncodingContainer(ref: ref, path: newPath, userInfo: userInfo)
+        let childContainer = _XPCUnkeyedEncodingContainer(ref: newRef, path: newPath, userInfo: userInfo)
         return childContainer
     }
     
