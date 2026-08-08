@@ -70,11 +70,11 @@ internal extension String {
 
 internal extension Data {
     
+    /// Routed through ``DispatchDataBridge``, which takes the cheaper of two
+    /// copies at size and the plain one below it.
     @usableFromInline
     var xpcData: xpc_object_t {
-        return withUnsafeBytes {
-            xpc_data_create($0.baseAddress, $0.count)
-        }
+        DispatchDataBridge.xpcData(for: self)
     }
     
     
