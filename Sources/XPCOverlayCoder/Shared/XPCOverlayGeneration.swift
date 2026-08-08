@@ -41,6 +41,21 @@ import XPC
 /// `XPCReceivedMessage` differs with them. On ``iOS17`` and ``iOS18`` it carries
 /// an `XPCReceivedMessageMetadata`, a nested type the newer one does not have,
 /// and there is no `init(dictionary:)` to make one from a bare dictionary.
+/// ## Where the code is
+///
+/// `ByteStream/` is ``iOS17`` and ``iOS18``; `EncodingGraph/` is ``iOS26``;
+/// `Shared/` is this file and ``AppleCoderBridge``. The two implementations
+/// import nothing from each other — the split is the honest shape of a module
+/// holding two formats that share only a lineage.
+///
+/// ## Errors are ours, not Apple's
+///
+/// Failures here throw this module's own error types. `XPCRichError` cannot be
+/// constructed: libxpc exports exactly three rich-error symbols — the type
+/// descriptor, `xpc_rich_error_can_retry` and `xpc_rich_error_copy_description`
+/// — and no creator under any name, while the Swift struct exports only its
+/// `canRetry` and `debugDescription` getters. It is something the framework
+/// hands you, never something you make.
 public enum XPCOverlayGeneration: Sendable, Equatable, CaseIterable {
     /// macOS 14 / iOS 17.
     case iOS17
