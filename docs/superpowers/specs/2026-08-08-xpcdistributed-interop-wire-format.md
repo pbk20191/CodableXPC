@@ -33,21 +33,36 @@ XPCDistributed/Transport/XPC/Service+XPC.swift
 XPCDistributed/Utilities/{RequestManager,Precondition}.swift
 ```
 
-## The coding convention, and why it matters
+## The `.mm` dump is a DIFFERENT, OLDER BUILD
 
-Apple's bodies use **Swift's synthesized `Codable` for enums**, not a hand-written discriminator.
-That shape is:
+Discovered late, and it invalidates anything derived from `xpcDistributed/*.mm` alone.
+
+The `.mm` decompilation shows `SharedActorKey.ExportedCodingKeys`, `DynamicCodingKeys`, and
+`ExportedRawValueCodingKeys` — synthesized per-case enum coding. **The macOS 27 binary contains
+none of them.** Its `SharedActorKey` has exactly one nested type, `WireCode`, and no `CodingKeys`
+at all. Two independent checks agree: the extracted binary's 5705-entry symbol table has no
+symbol matching those names, and the reflection field descriptors list only `WireCode`.
+
+So the two sources are different builds, and the original design document was right about this:
+"Apple's dump build uses Swift's synthesized enum coding here; its shipping build moved to a
+`UInt8` discriminator." macOS 27 is the shipping build.
+
+**Rule for the rest of this document: where the two disagree, the extracted macOS 27 binary
+wins.** The `.mm` remains useful for functions the binary's symbols alone do not explain, but
+never for format.
+
+## The coding convention
+
+Enums that *are* coded with Swift's synthesis use the shape
 
 ```
 { "<caseName>": { "<label or _0>": <payload> } }
 ```
 
-exactly one key at the top level. The binary enforces it — `Session+CommunicationProtocol.swift`
-carries the string `"Invalid number of keys found, expected one."`
-
-This is the single most important correction to the previous design, which wrote one flat
-dictionary with an explicit `kind` integer. Every enum on the wire below follows the synthesized
-shape unless stated otherwise.
+with exactly one key at the top level, which the binary enforces —
+`Session+CommunicationProtocol.swift` carries `"Invalid number of keys found, expected one."`
+`RemoteInvocationFailure` and `RemoteNotification` are coded this way. `SharedActorKey` is not;
+see below.
 
 Every `CodingKeys` raw value is its case name. No explicit raw values were found: the three key
 names longer than Swift's 15-byte small-string limit — `genericSubsitutions`,
@@ -116,8 +131,14 @@ it as "purpose could not be determined"; `InvocationCoder.swift` settles it with
 `"Encoding second _DistributedActorStub "`, an error raised when a second stub is recorded,
 which means the field holds at most one.
 
-⚠️ **Unverified:** whether `protocolStub` is written as absent or as null when a call targets a
-concrete actor. Determine before claiming byte fidelity.
+**Absent when nil, not null** — resolved. `InvocationEncoder.encode(to:)` (`0x2ad4ffb38`) opens a
+keyed container against `InvocationCodingKeys` and branches on the optional before encoding
+(`cbnz x8`, a value test — distinct from the `cbnz x21` error-register tests that follow every
+throwing call). The whole binary contains zero occurrences of `encodeIfPresent` as a symbol, so
+this is either an explicit `if let` or an inlined `encodeIfPresent`; both omit the key.
+
+The same holds for the other optionals — `errorType`, `returnType`, `basePriority`. A nil
+optional means **the key is not written**, never a null value.
 
 ## Request
 
@@ -162,9 +183,10 @@ Apple's decoder type here is `EncodedInvocationDecoder`, distinct from `Invocati
 carries the `DistributedTargetInvocationDecoder` conformance
 (`decodeGenericSubstitutions`, `decodeNextArgument`, `decodeErrorType`, `decodeReturnType`).
 
-⚠️ **Unverified:** `encode(to:)` guards everything after `id` behind a condition. Either a group
-of keys is genuinely conditional, or the decompiler mis-structured the control flow. Resolve it —
-if real, a request can carry only an `id`, which no reading of the field list would predict.
+**The apparent conditional was a decompiler artifact** — resolved. Disassembling the real
+`encode(to:)` (`0x2ad50dd3c`) shows the guards are `cbnz x21, 0x2ad50dfb0`: the Swift error
+register tested after each throwing encode, all branching to one shared cleanup path. There is no
+conditional group. All five keys are always encoded, subject only to the optional rule above.
 
 Failure strings: `"Failed to encode invocation request (error: "`,
 `"Request contents are corrupted."`, `"Received invocation contents cannot be encoded."`
@@ -206,42 +228,36 @@ envelope's sequence distinguishable from the request being referred to; that ren
 interoperable. Apple has no envelope `seq` to collide with, because correlation lives in the
 request body's `id`.
 
-## SharedActorKey
+## SharedActorKey — an unkeyed pair, not synthesized coding
 
 ```
 exported | exportedRawValue | dynamic
 ```
 
-`SharedActorKey.encode(to:)` was read from the decompilation and settles the shape. It takes one
-keyed container against `CodingKeys`, then switches on the case tag and opens a *nested* container
-against a per-case key type:
+`SharedActorKey.encode(to:)` was disassembled from the **macOS 27 binary** (`0x2ad4f8458`). Each
+of the three branches performs exactly two encodes: a `WireCode`, then the payload.
 
-| tag | outer key | nested keys | payload |
-|---|---|---|---|
-| 0 | `exported` | `ExportedCodingKeys` | a **`SwiftType`** — encoded generically, so `{ mangledTypeName: … }` |
-| 1 | `exportedRawValue` | `ExportedRawValueCodingKeys` | a **String** — the non-generic `encode(_:forKey:)` overload |
-| 2 | `dynamic` | `DynamicCodingKeys` | an **`ID64`** — encoded generically through ID64's own conformance |
+```
+[ <WireCode : UInt8>, <payload> ]
+```
 
-So this is Swift's synthesized enum coding, and the previous design's flat `{kind, type|name|id}`
-is wrong in both shape and case names (it used `type` / `name` / `dynamic`).
+| `WireCode` | payload |
+|---|---|
+| `exported` | a **`SwiftType`** — so `{ mangledTypeName: … }` |
+| `exportedRawValue` | a **String** (no witness-table call; the builtin overload) |
+| `dynamic` | an **`ID64`** — so `{ value: <UInt64> }` |
 
-`WireCode` carries the same three case names and is a separate `RawRepresentable` enum. It does
-**not** appear in `encode(to:)` — the tag there is the `CodingKeys` case index, not a `WireCode`
-raw value. `WireCode` is therefore internal, not peer-observable, and we need not reproduce it.
+The container is **unkeyed**. That is not an inference from the instruction sequence alone: the
+type has no `CodingKeys` of any kind in this build, so a keyed container is impossible, and each
+case emits two sequential encodes into the same container.
 
-Note the asymmetry worth preserving: `exported` carries a *type*, `exportedRawValue` a *string*.
-The previous design collapsed both into strings.
+`WireCode` is `RawRepresentable` with `UInt8` — confirmed by
+`WireCode.rawValue.getter : Swift.UInt8` and `WireCode.init(rawValue: Swift.UInt8)`. Raw values
+are the default `0, 1, 2` in declaration order.
 
-⚠️ **Unverified:** the nested payload key name for these three cases. `_0` is the natural guess —
-it is what Swift synthesizes for an unlabelled associated value, and it is confirmed for
-`RemoteInvocationFailure`'s two cases. But a scan of all 106 descriptors found `_0` on *only*
-those two, and not on `SharedActorKey`'s per-case key types, so the guess is not evidence. The
-three per-case types are private and their names carry a discriminator hash, which is why the
-extractor could not resolve their field lists. Read them before implementing.
-
-Apple **refuses to forward a remote proxy**: `"API violation: Remote proxy cannot be shared!"` and
-`"Cannot send remote actor proxies over an session."` (their typo). The previous design allowed a
-proxy to cross the wire to a third party. Match Apple: refuse.
+This partly vindicates our Task 2, which chose an explicit discriminator. What it got wrong is
+the case names, the payload types (all three were strings), and the container — Task 2 wrote a
+keyed dictionary, Apple writes a two-element array.
 
 ## Identity — unchanged, and already correct
 
@@ -289,7 +305,35 @@ encode as an `ID64` struct, not a bare `uint64`.
 | Task | Status |
 |---|---|
 | 1 — TypeName cache | **Keep.** Matches `SwiftTypeCache.State`. Needs a `SwiftType` wrapper added at the wire boundary. |
-| 2 — SharedActorKey | **Rewrite.** Wrong case names, wrong coding shape. |
+| 2 — SharedActorKey | **Rewrite.** Explicit discriminator was right; case names, payload types, and container (unkeyed pair, not a keyed dict) all wrong. |
+| 3 — ActorID | **Keep**, pending the `ID64`-on-the-wire question. Field names already match. |
+| 4 — ActorRegistry | **Keep.** Not peer-observable. |
+| 5 — invocation bodies | **Rewrite.** Wrong keys, wrong envelope, wrong error model. |
+| 6 — InvocationEncoder | **Rewrite.** Must produce `protocolStub`/`genericSubsitutions`/`arguments`/`errorType`/`returnType`. |
+| Phase A handshake | **Delete from the interop path.** `ProtocolVersion`, `HelloBody`, `HelloAckBody`, and negotiation are not interoperable. |
+
+## Status
+
+All three remaining unknowns are resolved, from the extracted macOS 27 binary:
+`SharedActorKey`'s container and payloads, `protocolStub`'s absent-vs-null, and the request
+encoder's apparent conditional. Nothing in this document is now marked unverified.
+
+The goal is **our own protocol matched to Apple's format**, not live interop with Apple's
+services — so the entitlement wall (`"Peer failed XPCSystem's entitlement check"`, enforced by
+`findmydevice-user-agent`, `searchpartyd`, `transparencyd`) does not apply, and byte fidelity is
+a matter of discipline rather than of a peer accepting us.
+
+That has one honest consequence. **Nothing here has been validated against a running Apple peer,
+and under this goal nothing ever will be.** Every claim is read from reflection metadata,
+disassembly, and string tables. The strongest available check is internal consistency, which is
+why the `.mm`-versus-binary disagreement above matters so much: it is the one case where two
+sources could be compared, and they disagreed. Treat single-sourced claims accordingly.
+
+## What this costs the existing implementation
+| Task | Status |
+|---|---|
+| 1 — TypeName cache | **Keep.** Matches `SwiftTypeCache.State`. Needs a `SwiftType` wrapper added at the wire boundary. |
+| 2 — SharedActorKey | **Rewrite.** Explicit discriminator was right; case names, payload types, and container (unkeyed pair, not a keyed dict) all wrong. |
 | 3 — ActorID | **Keep**, pending the `ID64`-on-the-wire question. Field names already match. |
 | 4 — ActorRegistry | **Keep.** Not peer-observable. |
 | 5 — invocation bodies | **Rewrite.** Wrong keys, wrong envelope, wrong error model. |
