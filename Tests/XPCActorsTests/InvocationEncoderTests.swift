@@ -9,7 +9,7 @@ private struct Boom: Error, Codable {}
 @available(macOS 14, *)
 final class InvocationEncoderTests: XCTestCase {
 
-    func testRecordingBuildsARequestBody() throws {
+    func testRecordingBuildsARequest() throws {
         var encoder = InvocationEncoder()
         try encoder.recordGenericSubstitution(Int.self)
         try encoder.recordArgument(RemoteCallArgument(label: "name", name: "name", value: "hi"))
@@ -18,13 +18,21 @@ final class InvocationEncoderTests: XCTestCase {
         try encoder.recordReturnType(String.self)
         try encoder.doneRecording()
 
-        let body = encoder.makeRequestBody(actor: .exportedRawValue("primary"), target: "t", basePriority: nil)
-        XCTAssertEqual(body.actor, .exportedRawValue("primary"))
-        XCTAssertEqual(body.target, "t")
-        XCTAssertEqual(body.generics, [try XCTUnwrap(TypeName.mangled(for: Int.self))])
-        XCTAssertEqual(body.args.count, 2)
-        XCTAssertEqual(body.errorType, try XCTUnwrap(TypeName.mangled(for: Boom.self)))
-        XCTAssertEqual(body.returnType, try XCTUnwrap(TypeName.mangled(for: String.self)))
+        let request = encoder.makeRequest(id: ID64(rawValue: 5),
+                                          actor: .exportedRawValue("primary"),
+                                          target: "t", basePriority: nil)
+        XCTAssertEqual(request.id, ID64(rawValue: 5))
+        XCTAssertEqual(request.targetedSharedActor, .exportedRawValue("primary"))
+        XCTAssertEqual(request.remoteCallIdentifier, "t")
+        XCTAssertEqual(request.contents.genericSubsitutions,
+                       [SwiftType(mangledTypeName: try XCTUnwrap(TypeName.mangled(for: Int.self)))])
+        XCTAssertEqual(request.contents.arguments.count, 2)
+        XCTAssertEqual(request.contents.errorType,
+                       SwiftType(mangledTypeName: try XCTUnwrap(TypeName.mangled(for: Boom.self))))
+        XCTAssertEqual(request.contents.returnType,
+                       SwiftType(mangledTypeName: try XCTUnwrap(TypeName.mangled(for: String.self))))
+        // R3 rewrites the encoder to record one; until then it is always absent.
+        XCTAssertNil(request.contents.protocolStub)
     }
 
     /// Labels are discarded deliberately: the receiver knows them statically, so
@@ -34,10 +42,9 @@ final class InvocationEncoderTests: XCTestCase {
         try encoder.recordArgument(RemoteCallArgument(label: "greeting", name: "g", value: "hi"))
         try encoder.doneRecording()
         let rendered = normalizedDescription(
-            try XPCEncoder().encode(encoder.makeRequestBody(actor: .dynamic(ID64(rawValue: 1)), target: "t",
-                                                            basePriority: nil)))
+            try XPCEncoder().encode(encoder.makeInvocationBody()))
         XCTAssertFalse(rendered.contains("greeting"))
-        XCTAssertTrue(rendered.contains("args=[string(hi)]"))
+        XCTAssertTrue(rendered.contains("arguments=[string(hi)]"))
     }
 
     func testArgumentOrderIsPreserved() throws {
@@ -46,24 +53,24 @@ final class InvocationEncoderTests: XCTestCase {
             try encoder.recordArgument(RemoteCallArgument(label: nil, name: "", value: n))
         }
         try encoder.doneRecording()
-        let body = encoder.makeRequestBody(actor: .dynamic(ID64(rawValue: 1)), target: "t", basePriority: nil)
+        let body = encoder.makeInvocationBody()
         XCTAssertEqual(normalizedDescription(try XPCEncoder().encode(body)).contains(
-            "args=[int64(0),int64(1),int64(2),int64(3),int64(4)]"), true)
+            "arguments=[int64(0),int64(1),int64(2),int64(3),int64(4)]"), true)
     }
 
     func testNoErrorTypeMeansTheTargetDoesNotThrow() throws {
         var encoder = InvocationEncoder()
         try encoder.doneRecording()
-        XCTAssertNil(encoder.makeRequestBody(actor: .dynamic(ID64(rawValue: 1)), target: "t",
-                                             basePriority: nil).errorType)
+        XCTAssertNil(encoder.makeInvocationBody().errorType)
     }
 
     func testBasePriorityIsCarriedThrough() throws {
         var encoder = InvocationEncoder()
         try encoder.doneRecording()
-        let body = encoder.makeRequestBody(actor: .dynamic(ID64(rawValue: 1)), target: "t",
-                                           basePriority: UInt64(TaskPriority.high.rawValue))
-        XCTAssertEqual(body.basePriority, UInt64(TaskPriority.high.rawValue))
+        let request = encoder.makeRequest(id: ID64(rawValue: 1),
+                                          actor: .dynamic(ID64(rawValue: 1)), target: "t",
+                                          basePriority: .high)
+        XCTAssertEqual(request.basePriority, .high)
     }
 
     /// Two calls must not share accumulated state. `makeInvocationEncoder()` returns a
