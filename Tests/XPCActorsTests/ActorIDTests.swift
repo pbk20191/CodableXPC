@@ -46,17 +46,32 @@ final class ActorIDTests: XCTestCase {
         XCTAssertFalse(rendered.contains("222"))
     }
 
-    // MARK: encoding a remote id sends the key back unchanged
+    // MARK: encoding a remote id is refused
 
-    func testARemoteIDEncodesItsOwnKey() throws {
+    /// This test used to assert the opposite -- that a remote id sends its own key
+    /// back unchanged. That was the bug. A `SharedActorKey` is only meaningful in the
+    /// key space of the side that minted it, and both sides' `dynamic` counters start
+    /// at 1, so writing a proxy's key into any session lies about which actor it names.
+    ///
+    /// Apple's `ActorID.encode(to:)` traps here (`"Cannot send remote actor proxies
+    /// over an session."`). We keep the rule and throw instead: the value shape is
+    /// peer-influenced, so it has to be diagnosable rather than fatal.
+    ///
+    /// The cost is Apple's too and is worth naming: a proxy cannot be passed on, to
+    /// the peer it came from or to a third party. Supporting that needs the two key
+    /// spaces made attributable first, which is a feature, not a repair.
+    func testARemoteIDRefusesToEncode() throws {
         let session = StubSession()
         let id = session.remoteID(for: .exportedRawValue("primary"))
         var encoder = XPCEncoder()
         encoder.userInfo = userInfo(session)
 
-        XCTAssertEqual(normalizedDescription(try encoder.encode(id)),
-                       "[uint64(1),string(primary)]")
-        XCTAssertTrue(session.shared.isEmpty, "a remote id has nothing to share")
+        XCTAssertThrowsError(try encoder.encode(id)) { error in
+            guard case EncodingError.invalidValue = error else {
+                return XCTFail("expected EncodingError.invalidValue, got \(error)")
+            }
+        }
+        XCTAssertTrue(session.shared.isEmpty, "and it must not be shared as a way round it")
     }
 
     // MARK: decoding

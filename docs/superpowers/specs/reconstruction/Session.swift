@@ -352,9 +352,18 @@ extension XPCSystem {
         /// to propagate the cancellation. [symbol] [disasm @0x2ad506a98]
         func cancel(because reason: String)
 
-        /// `os_unfair_lock_lock` / `unlock` around a drain, plus two byte stores.
-        /// Called by `handleTransportCancellation()`. Which lock is taken was not resolved.
-        /// [symbol] [disasm @0x2ad508e64]
+        /// RESOLVED — an earlier revision left the lock unidentified and read the tail as
+        /// "two byte stores". The lock is `sharedActors`' own mutex word at `self+0x30`, and
+        /// the whole body is: lock; `swift_bridgeObjectRelease` the dictionary at `+0x38`;
+        /// store `_swiftEmptyDictionarySingleton` (GOT `0x2d0102610`); unlock. Then fulfil
+        /// the `cancellationEvent` promise (`ldp x8,x20,[self,#0x48]` then `blraa`) and the
+        /// `unownedLocalInterfaceActivationEvent` promise (`ldp x8,x20,[self,#0x60]`). The
+        /// "two byte stores" are `strb wzr,[sp,#0xf]` / `[sp,#0xe]` — the `()` values passed
+        /// to those two closures, not stores into the object.
+        ///
+        /// So a completed cancellation **empties the exported-actor table**, which is
+        /// behaviour a `Session` implementation has to model.
+        /// Called by `handleTransportCancellation()`. [symbol] [disasm @0x2ad508e64]
         func cancellationCompleted()
 
         /// 40 bytes: `cancelAllPendingInvocationExecutionTasks()` then
@@ -892,12 +901,6 @@ extension XPCSystem {
 //    **zero** direct callers of either `__allocating_init` and zero of either dispatch thunk,
 //    so the constructions are all vtable-indirect (`blraa`) or inlined — a direct-branch scan
 //    cannot answer it and a register-tracking pass over the `blraa` sites would be needed.
-//
-// 2. Which lock `Session.cancellationCompleted()` (0x2ad508e64) takes, and what it drains.
-//    It calls `os_unfair_lock_lock`/`unlock` and `swift_bridgeObjectRelease`. The only
-//    `os_unfair_lock` in `Session` is `sharedActors`' Mutex word at +0x30, which does not
-//    obviously belong here. Next step: read the base register of the `os_unfair_lock_lock`
-//    argument against the field-offset table.
 //
 // 3. Whether `Session.local` is declared as a getter or with `_read`. Both a `local.getter`
 //    (0x2ad506fc4) and a `local.read` coroutine (0x2ad507a78) exist; which the source spells
