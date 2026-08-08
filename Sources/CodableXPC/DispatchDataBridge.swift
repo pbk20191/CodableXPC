@@ -43,9 +43,18 @@ private extension NSData {
 /// function pointer, and `BOOL` comes back as `Bool`.
 ///
 /// The return type has to be `Unmanaged`. `_createDispatchData` hands back +1,
-/// and "create" is not one of the prefixes ARC infers a retain family from, so
-/// declaring it as `-> NSData` leaks every buffer: forty 8 MiB calls grew the
-/// footprint by 320.8 MiB, against 8.1 with `takeRetainedValue`.
+/// and "create" is not one of the prefixes ARC infers a retain family from —
+/// `alloc`, `new`, `copy`, `mutableCopy`, `init` — so declaring it as `-> NSData`
+/// leaks every buffer: forty 8 MiB calls grew the footprint by 320.8 MiB,
+/// against 8.1 with `takeRetainedValue`.
+///
+/// Swift has no way to say it otherwise. There is no return-ownership specifier;
+/// `consuming` and `borrowing` describe parameters. Objective-C does have one,
+/// and it works — a header declaring the selector
+/// `NS_RETURNS_RETAINED` imports with the +1 consumed and leaks nothing (0.1 MiB
+/// over the same forty calls), leaving a call site with no `Unmanaged` in it. It
+/// would cost this package a C target and a public header to carry two private
+/// selectors, which is more than one `takeRetainedValue` is worth.
 ///
 /// ## Private, so guarded
 ///
