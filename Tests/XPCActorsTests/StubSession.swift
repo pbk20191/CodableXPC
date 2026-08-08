@@ -23,6 +23,12 @@ final class StubSession: SessionCoding, @unchecked Sendable {
     /// became ready. `remoteID(for:)` is unaffected.
     var refuseToShare = false
 
+    /// A system id nobody else has. This stub belongs to no `XPCActorSystem`, and
+    /// `ID64.next()` is never recycled, so a proxy reached through it is refused by
+    /// every real system -- which is the honest answer and is what
+    /// `XPCActorSystemTests.testARemoteIDFromAForeignSessionConformerThrows` pins.
+    let systemID = ID64.next()
+
     func shareDynamically(_ local: RawActorID.Local) -> SharedActorKey? {
         guard !refuseToShare else { return nil }
         shared.append(local)

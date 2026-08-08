@@ -36,7 +36,9 @@ final class SessionTests: XCTestCase {
 
     private func makeSession() -> (TestSession, ActorRegistry<Int>) {
         let registry = ActorRegistry<Int>()
-        return (Session(registry: registry), registry)
+        // No system here on purpose: these tests are about the coding path, which never
+        // consults `systemID`. A fresh id stands in for the system that would own it.
+        return (Session(registry: registry, systemID: ID64.next()), registry)
     }
 
     private func register(_ instance: AnyObject, in registry: ActorRegistry<Int>) -> RawActorID.Local {
