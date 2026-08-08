@@ -1,7 +1,10 @@
 import XCTest
 @testable import XPCActors
 
-private struct Sample: Codable, Equatable { let n: Int }
+/// Deliberately `internal`, not `private`. A `private` or `fileprivate` type mangles
+/// with a `$<process address>yXZ` discriminator that `_typeByName` cannot resolve, so it
+/// has no round trip to test -- and no peer could resolve it either.
+struct Sample: Codable, Equatable { let n: Int }
 
 @available(macOS 14, *)
 final class TypeNameTests: XCTestCase {

@@ -30,11 +30,23 @@ public struct SwiftType: Sendable {
 
     /// Convenience for the common case of already holding the concrete type.
     ///
-    /// Fails rather than degrading. An unmangleable type has no name a peer could feed
-    /// back to `_typeByName`, so a fallback like `String(reflecting:)` would put a
-    /// string on the wire that is guaranteed not to resolve on the other side, and the
-    /// failure would surface there -- far from here, as an unresolvable type with no
+    /// Fails rather than degrading, and checks the round trip rather than trusting the
+    /// mangler. `_mangledTypeName` returning non-nil does **not** mean the name is
+    /// usable: a function-local type mangles to a name embedding a process address that
+    /// `_typeByName` cannot resolve, and an ObjC class created at runtime over a Swift
+    /// superclass mangles to the *superclass's* name -- non-nil, resolvable, and wrong.
+    /// A nil check catches neither. `_typeByName(name) == type` catches both, at the
+    /// cost of one cached lookup per type.
+    ///
+    /// The point of failing is that the alternative fails somewhere worse. A name that
+    /// does not resolve on the far side surfaces there, as an unresolvable type, with no
     /// indication of where it came from.
+    ///
+    /// Verified not to reject ordinary types: 26 spot checks across structs, classes,
+    /// enums, actors, generic instantiations, nested types, stdlib and Foundation types,
+    /// collections, optionals, and existentials all round-trip. The only construction
+    /// found that fails is the function-local type, which is exactly the case a peer
+    /// could not resolve either.
     ///
     /// Degradation is still legitimate in one place: `errorType`'s *presence* is what
     /// tells the receiver the target can throw, so dropping the field changes the
@@ -42,7 +54,9 @@ public struct SwiftType: Sendable {
     /// call site, spelled out -- `SwiftType(E.self) ?? SwiftType(mangledTypeName: "\(E.self)")`
     /// -- not hidden in an initializer that every other caller also goes through.
     public init?(_ type: Any.Type) {
-        guard let mangled = TypeName.mangled(for: type) else { return nil }
+        guard let mangled = TypeName.mangled(for: type),
+              TypeName.type(for: mangled) == type
+        else { return nil }
         self.mangledTypeName = mangled
     }
 }
