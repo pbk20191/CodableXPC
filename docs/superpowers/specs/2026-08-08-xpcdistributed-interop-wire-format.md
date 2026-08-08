@@ -124,18 +124,32 @@ concrete actor. Determine before claiming byte fidelity.
 `Session.RemoteInvocationRequest`, a struct with keys in this order:
 
 ```
-id                   : UInt64        the correlation id
+id                   : ID64          the correlation id -- NOT a bare integer
 basePriority         : ...           TaskPriority
 targetedSharedActor  : SharedActorKey
 remoteCallIdentifier : ...           the RemoteCallTarget identifier
 contents             : InvocationContents
 ```
 
+`encode(to:)` was read from the decompilation. It opens one keyed container against `CodingKeys`
+and encodes `id` through **`ID64`'s own conformance** — the generic `encode<A>(_:forKey:)`
+overload with the `ID64` witness table. So the correlation id is `{ "value": <UInt64> }`, not a
+bare integer. `targetedSharedActor` and `contents` likewise go through their own conformances;
+one non-generic `encode(_:forKey:)` call handles a builtin-typed key.
+
+That makes **`ID64` the wire representation of every identifier in this protocol** — the request
+id here, and the `dynamic` shared-actor key. Anywhere our design writes a bare `uint64`, Apple
+writes a one-field dictionary.
+
 `InvocationContents` is an enum: `send | recv`. This is the `contents` nesting the previous design
 flattened away, and it is load-bearing.
 
-⚠️ **Unverified:** what distinguishes `send` from `recv`, and the payload of each. Both names
-appear in `__swift5_reflstr` adjacent to the request's keys. Determine before implementing.
+⚠️ **Unverified:** what distinguishes `send` from `recv`, and the payload of each. Read
+`XPCSystem.Session.RemoteInvocationRequest.InvocationContents`'s own `encode(to:)`.
+
+⚠️ **Unverified:** `encode(to:)` guards everything after `id` behind a condition. Either a group
+of keys is genuinely conditional, or the decompiler mis-structured the control flow. Resolve it —
+if real, a request can carry only an `id`, which no reading of the field list would predict.
 
 Failure strings: `"Failed to encode invocation request (error: "`,
 `"Request contents are corrupted."`, `"Received invocation contents cannot be encoded."`
