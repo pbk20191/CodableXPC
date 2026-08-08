@@ -3,6 +3,12 @@ import Foundation
 import XPC
 import ObjectiveC
 
+private extension NSData {
+    @NSManaged func _canReplaceWithDispatchDataForXPCCoder() -> Bool
+    /// `Unmanaged` because this returns +1 -- see ``DispatchDataBridge``.
+    @NSManaged func _createDispatchData() -> Unmanaged<NSData>
+}
+
 /// Builds the `xpc_data` for a `Data`, taking the cheaper of two copies.
 ///
 /// `xpc_data_create` copies the bytes itself. Handing libxpc a `dispatch_data_t`
@@ -30,6 +36,17 @@ import ObjectiveC
 /// no below about 64 KiB, where the substitution would cost more than it saves,
 /// so there is no constant to pick or to keep up to date.
 ///
+/// ## Declared, not looked up
+///
+/// `@NSManaged` says "something else provides this at runtime", so the compiler
+/// emits the `objc_msgSend` with the right types — no `dlsym`, no hand-cast
+/// function pointer, and `BOOL` comes back as `Bool`.
+///
+/// The return type has to be `Unmanaged`. `_createDispatchData` hands back +1,
+/// and "create" is not one of the prefixes ARC infers a retain family from, so
+/// declaring it as `-> NSData` leaks every buffer: forty 8 MiB calls grew the
+/// footprint by 320.8 MiB, against 8.1 with `takeRetainedValue`.
+///
 /// ## Private, so guarded
 ///
 /// Both selectors are SPI. Everything is resolved once and checked; if either
@@ -38,24 +55,19 @@ import ObjectiveC
 /// identical bytes — so losing this costs speed and nothing else.
 enum DispatchDataBridge {
 
-    private static let canReplace = NSSelectorFromString("_canReplaceWithDispatchDataForXPCCoder")
-    private static let createDispatchData = NSSelectorFromString("_createDispatchData")
-
-    /// `objc_msgSend` typed twice, because the two selectors differ in return
-    /// and one of them is `BOOL`, which `perform(_:)` cannot express.
-    private typealias AskBool = @convention(c) (AnyObject, Selector) -> Bool
-    private typealias MakeObject = @convention(c) (AnyObject, Selector) -> Unmanaged<AnyObject>?
-
-    private static let entryPoints: (ask: AskBool, make: MakeObject)? = {
-        guard let send = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "objc_msgSend"),
-              NSData().responds(to: canReplace),
-              NSData().responds(to: createDispatchData)
-        else { return nil }
-        return (unsafeBitCast(send, to: AskBool.self), unsafeBitCast(send, to: MakeObject.self))
-    }()
+    private static let canReplaceSelector =
+        NSSelectorFromString("_canReplaceWithDispatchDataForXPCCoder")
+    private static let createSelector = NSSelectorFromString("_createDispatchData")
 
     /// Whether the substitution can be attempted at all on this OS.
-    static var isAvailable: Bool { entryPoints != nil }
+    ///
+    /// `@NSManaged` emits the call without checking anything, so a missing
+    /// selector would be an unrecognised-selector crash rather than a fallback.
+    /// This is what makes it a fallback.
+    static let isAvailable: Bool = {
+        let probe = NSData()
+        return probe.responds(to: canReplaceSelector) && probe.responds(to: createSelector)
+    }()
 
     /// The `xpc_data` for `data`, by whichever route is cheaper.
     static func xpcData(for data: Data) -> xpc_object_t {
@@ -64,19 +76,13 @@ enum DispatchDataBridge {
     }
 
     /// Internal rather than private so a test can observe which path ran, instead
-    /// of inferring it from a timing or from a BOOL selector called through
-    /// `perform(_:)`, which reinterprets the boolean as a pointer.
+    /// of inferring it from a timing.
     static func substituting(_ data: Data) -> xpc_object_t? {
-        guard let entry = entryPoints else { return nil }
+        guard isAvailable else { return nil }
         let bridged = data as NSData
-        guard entry.ask(bridged, canReplace) else { return nil }
+        guard bridged._canReplaceWithDispatchDataForXPCCoder() else { return nil }
 
-        // `_createDispatchData` hands back +1. Taking it as a plain `AnyObject`
-        // lets ARC treat it as +0 and over-release, which segfaults well away
-        // from here -- `Unmanaged` is what makes the ownership explicit, since
-        // "create" is not one of the prefixes ARC infers a retain family from.
-        guard let owned = entry.make(bridged, createDispatchData) else { return nil }
-        let dispatchData = owned.takeRetainedValue()
+        let dispatchData = bridged._createDispatchData().takeRetainedValue()
         return xpc_data_create_with_dispatch_data(
             unsafeBitCast(dispatchData, to: __DispatchData.self))
     }

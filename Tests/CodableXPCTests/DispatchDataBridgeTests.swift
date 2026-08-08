@@ -1,6 +1,7 @@
 #if canImport(Darwin)
 import XCTest
 import XPC
+import MachO
 @testable import CodableXPC
 
 /// `Data` is encoded by whichever of two copies is cheaper. Which one runs must
@@ -51,6 +52,37 @@ final class DispatchDataBridgeTests: XCTestCase {
                      "4 KiB is still below where it pays")
         XCTAssertNotNil(DispatchDataBridge.substituting(Data(count: 1 << 20)),
                         "a megabyte is what the substitution exists for")
+    }
+
+    /// The substituted object is +1 and has to be consumed. Declaring
+    /// `_createDispatchData` as returning `NSData` rather than
+    /// `Unmanaged<NSData>` compiles, runs, produces correct bytes — and leaks
+    /// every buffer. Forty 8 MiB calls grew the footprint by 320.8 MiB that way.
+    func testTheSubstitutionDoesNotLeak() throws {
+        try XCTSkipUnless(DispatchDataBridge.isAvailable, "always falls back here")
+
+        func footprintMiB() -> Double {
+            var info = task_vm_info_data_t()
+            var count = mach_msg_type_number_t(
+                MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<Int32>.size)
+            let result = withUnsafeMutablePointer(to: &info) {
+                $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                    task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+                }
+            }
+            return result == KERN_SUCCESS ? Double(info.phys_footprint) / 1024 / 1024 : -1
+        }
+
+        var blob = Data(count: 8 << 20)
+        blob.withUnsafeMutableBytes { memset($0.baseAddress, 0x5A, $0.count) }
+
+        _ = DispatchDataBridge.substituting(blob)   // warm, so the first call is not counted
+        let before = footprintMiB()
+        for _ in 0..<40 { autoreleasepool { _ = DispatchDataBridge.substituting(blob) } }
+        let growth = footprintMiB() - before
+
+        // Leaking would be 320 MiB. A generous ceiling still catches it.
+        XCTAssertLessThan(growth, 64, "grew \(growth) MiB over 40 x 8 MiB — the +1 is not consumed")
     }
 
     /// Encoding a `Data` field goes through it, and comes back equal.
