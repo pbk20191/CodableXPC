@@ -22,10 +22,22 @@ extension CodingUserInfoKey {
     ///   when the array is absent.
     static let xpcLegacyCodableObjects = CodingUserInfoKey(rawValue: "_XPCCodable")!
 
-    /// The same array, unwrapped. `XPCArray` is what Apple's code casts to, so the
-    /// key above has to hold one — but that type carries an OS floor this module
-    /// does not, and the `Data` path needs the array on every platform the package
-    /// supports. The raw handle costs nothing and is ours alone.
+    /// The same array again, unwrapped, under a key of our own. It does two jobs.
+    ///
+    /// It keeps `XPCArray`'s OS floor out of the containers. Apple's code casts
+    /// the entry above to `XPCArray`, so that is what has to be stored there —
+    /// but `XPCArray` is macOS 13+, and the encoding containers carry no
+    /// availability of their own. Reading it back through them is a compile
+    /// error. Nothing above macOS 13 can actually reach this code, since
+    /// ``XPCLegacyOverlayEncoder/encode(_:)`` is gated, but the compiler cannot
+    /// see that from inside a container conformance; the alternative is an
+    /// `if #available` whose else-branch would silently write the wrong format.
+    /// A raw `xpc_object_t` has no floor at all.
+    ///
+    /// And its presence *is* the signal that this message carries a side array,
+    /// which is how ``LegacyOverlayGeneration`` gating works: an `iOS17` coder
+    /// installs neither key, so ``LegacyOutOfLineData/isEnabled(_:)`` is false
+    /// and `Data` takes its ordinary `Codable` path.
     static let xpcLegacyRawObjectArray = CodingUserInfoKey(rawValue: "_XPCCodableRawArray")!
 }
 
