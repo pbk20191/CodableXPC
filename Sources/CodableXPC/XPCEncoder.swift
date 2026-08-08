@@ -103,7 +103,7 @@ private class _XPCEncoderImp: Encoder, SingleValueEncodingContainer {
     
     func encode(_ value: String) throws {
         assertCanEncodeNewValue()
-        xpc = xpc_string_create(value)
+        xpc = try value.xpcString(at: codingPath)
     }
     
     func encode(_ value: Double) throws {
@@ -168,7 +168,7 @@ private class _XPCEncoderImp: Encoder, SingleValueEncodingContainer {
             xpc = data.xpcData
             break
         case let date as Date:
-           xpc = date.xpcRepresentation
+           xpc = try date.xpcRepresentation(at: codingPath)
         case let uid as UUID:
             xpc = uid.xpcUUID
             break
@@ -197,7 +197,7 @@ private struct _XPCKeyedEncodingContainer<Key : CodingKey>: KeyedEncodingContain
     }
     
     mutating func encode(_ value: String, forKey key: Key) throws {
-        xpc_dictionary_set_value(ref, key.stringValue, xpc_string_create(value))
+        xpc_dictionary_set_value(ref, key.stringValue, try value.xpcString(at: codingPath + [key]))
     }
     
     mutating func encode(_ value: Double, forKey key: Key) throws {
@@ -254,7 +254,7 @@ private struct _XPCKeyedEncodingContainer<Key : CodingKey>: KeyedEncodingContain
             xpc_dictionary_set_value(ref, key.stringValue, data.xpcData)
             break
         case let date as Date:
-            xpc_dictionary_set_value(ref, key.stringValue, date.xpcRepresentation)
+            xpc_dictionary_set_value(ref, key.stringValue, try date.xpcRepresentation(at: codingPath + [key]))
         case let uid as UUID:
             xpc_dictionary_set_value(ref, key.stringValue, uid.xpcUUID)
             break
@@ -353,7 +353,7 @@ private struct _XPCUnkeyedEncodingContainer: UnkeyedEncodingContainer {
     }
     
     mutating func encode(_ value: String) throws {
-        xpc_array_append_value(ref, xpc_string_create(value))
+        xpc_array_append_value(ref, try value.xpcString(at: codingPath))
     }
     
     mutating func encode(_ value: Double) throws {
@@ -410,7 +410,7 @@ private struct _XPCUnkeyedEncodingContainer: UnkeyedEncodingContainer {
             xpc_array_append_value(ref, data.xpcData)
             break
         case let date as Date:
-            xpc_array_append_value(ref, date.xpcRepresentation)
+            xpc_array_append_value(ref, try date.xpcRepresentation(at: codingPath))
         case let uid as UUID:
             xpc_array_append_value(ref, uid.xpcUUID)
             break
