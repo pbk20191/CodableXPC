@@ -37,6 +37,18 @@ import XPC
 /// If you need a real `xpc_rich_error_t` for a C API rather than a Swift error
 /// to raise, this is the wrong tool and the offset route above is the only one.
 ///
+/// ## The other error type has no creator at all
+///
+/// `xpc_error` — the classic `XPC_TYPE_ERROR` a connection handler receives — is
+/// not created by anyone, exported or otherwise. Searching the whole symbol
+/// table for a name containing both "error" and "create" returns exactly one
+/// entry, the local `_xpc_rich_error_create` above. What libxpc exports instead
+/// are the four singletons themselves, as data:
+/// `XPC_ERROR_CONNECTION_INTERRUPTED`, `XPC_ERROR_CONNECTION_INVALID`,
+/// `XPC_ERROR_TERMINATION_IMMINENT` and the peer-code-signing one, plus
+/// `XPC_ERROR_KEY_DESCRIPTION` and the type descriptor. They are values to
+/// recognise and pass along, never a family to add to.
+///
 /// ## The guard
 ///
 /// This depends on a layout nothing documents. Rather than trust it, every call
