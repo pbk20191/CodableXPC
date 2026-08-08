@@ -16,7 +16,7 @@ private func marker(of packet: Packet) -> UInt64? {
 final class InProcessRawTransportTests: XCTestCase {
 
     private func notification(_ marker: UInt64) throws -> Packet {
-        Packet(header: .notification, payload: try Packet.Payload(encoding: marker))
+        Packet(header: .notification, payload: try Packet.Payload(encoding: marker, userInfo: [:]))
     }
 
     func testPacketCrossesToTheOtherEnd() throws {

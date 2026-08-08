@@ -60,7 +60,7 @@ final class PacketBodyTests: XCTestCase {
     // MARK: the request
 
     func testARequestSurvivesTheRealEncoder() throws {
-        let payload = try Packet.Payload(encoding: Self.request)
+        let payload = try Packet.Payload(encoding: Self.request, userInfo: [:])
         try assertBodyIsAByteStream(payload)
 
         let decoded = try payload.decode(as: InboundRequest.self)
@@ -82,7 +82,7 @@ final class PacketBodyTests: XCTestCase {
     func testAppleDecodesARequestWeEncoded() throws {
         try XCTSkipUnless(AppleCoderBridge.isAvailable,
                           "XPCReceivedMessage.init(dictionary:) no longer resolves")
-        let payload = try Packet.Payload(encoding: Self.request)
+        let payload = try Packet.Payload(encoding: Self.request, userInfo: [:])
         let decoded = try XCTUnwrap(
             AppleCoderBridge.decode(InboundRequest.self, from: try envelope(of: payload)))
         XCTAssertEqual(decoded.id, ID64(rawValue: 17))
@@ -124,17 +124,17 @@ final class PacketBodyTests: XCTestCase {
 
     func testAResponseFailureSurvivesTheRealEncoder() throws {
         let payload = try Packet.Payload(
-            encoding: RemoteInvocationResponse(executionFailure: "boom"))
+            encoding: RemoteInvocationResponse<Never>(executionFailure: "boom"), userInfo: [:])
         try assertBodyIsAByteStream(payload)
-        XCTAssertEqual(try payload.decode(as: RemoteInvocationResponse.self),
+        XCTAssertEqual(try payload.decode(as: RemoteInvocationResponse<Never>.self),
                        .failure(.executionFailed("boom")))
     }
 
     func testAPropagationFailureSurvivesTheRealEncoder() throws {
         let payload = try Packet.Payload(
-            encoding: RemoteInvocationResponse(resultPropagationFailure: "no reply"))
+            encoding: RemoteInvocationResponse<Never>(resultPropagationFailure: "no reply"), userInfo: [:])
         try assertBodyIsAByteStream(payload)
-        XCTAssertEqual(try payload.decode(as: RemoteInvocationResponse.self),
+        XCTAssertEqual(try payload.decode(as: RemoteInvocationResponse<Never>.self),
                        .failure(.resultPropagationFailed("no reply")))
     }
 
@@ -142,63 +142,107 @@ final class PacketBodyTests: XCTestCase {
         try XCTSkipUnless(AppleCoderBridge.isAvailable,
                           "XPCReceivedMessage.init(dictionary:) no longer resolves")
         let payload = try Packet.Payload(
-            encoding: RemoteInvocationResponse(executionFailure: "boom"))
+            encoding: RemoteInvocationResponse<Never>(executionFailure: "boom"), userInfo: [:])
         XCTAssertEqual(
-            try AppleCoderBridge.decode(RemoteInvocationResponse.self,
+            try AppleCoderBridge.decode(RemoteInvocationResponse<Never>.self,
                                         from: try envelope(of: payload)),
             .failure(.executionFailed("boom")))
     }
 
-    /// **A defect pinned, not a behaviour endorsed.**
+    /// **The wall from R4 is gone.**
     ///
-    /// The failure half of a response crosses the real encoder; the success half does
-    /// not, and cannot. `RemoteInvocationResponse.result` carries an `XPCNativeObject`,
-    /// whose `Codable` conformance throws for every coder but `CodableXPC`'s
-    /// `XPCEncoder` -- deliberately, because no other coder can place a live xpc object
-    /// in a graph it does not build. The R4 brief's §4.5 asks for a Void success to
-    /// survive `Payload(encoding:)`, and that is not reachable without changing the
-    /// response type, which R4 is told not to touch.
-    ///
-    /// The reasoning behind `XPCNativeObject` was "our transport decodes the envelope
-    /// before the call site's return type is in scope, so hold the result undecoded".
-    /// That reasoning was sound against a native-xpc body and does not survive a byte
-    /// stream: there is no live object to hold. Apple does not have the problem because
-    /// `RemoteInvocationResponse<A>` is generic and `sendInvocation<A>` decodes at the
-    /// call site, where `A` is known.
-    ///
-    /// So the fix belongs with whoever owns the response type: make it generic over the
-    /// result, as Apple's is. Until then this asserts the exact wall, so that the day
-    /// the type changes this test fails and says why.
-    func testTheSuccessHalfOfAResponseCannotYetCrossTheRealEncoder() {
-        let cases: [(String, RemoteInvocationResponse)] = [
-            ("void", .void),
-            ("result", try! RemoteInvocationResponse(result: 42 as Int, userInfo: [:])),
-        ]
-        for (label, response) in cases {
-            XCTAssertThrowsError(try Packet.Payload(encoding: response), label) { error in
-                guard case EncodingError.invalidValue(let value, _) = error else {
-                    return XCTFail("\(label): expected an EncodingError, got \(error)")
-                }
-                XCTAssertTrue(value is XPCNativeObject,
-                              "\(label): the wall is XPCNativeObject, not something new: \(value)")
-            }
-        }
+    /// This replaces `testTheSuccessHalfOfAResponseCannotYetCrossTheRealEncoder`, which
+    /// asserted the opposite and was right to: `RemoteInvocationResponse.result` held an
+    /// `XPCNativeObject`, whose `Codable` conformance throws for every coder but
+    /// `CodableXPC`'s native-xpc `XPCEncoder`, so a success response could not cross the
+    /// byte-stream encoder at all. The response is generic over its success type now, as
+    /// Apple's `RemoteInvocationResponse<A>` is, and there is no erased object left to
+    /// refuse. The old test is deliberately deleted, not disabled -- its subject no
+    /// longer exists.
+    func testTheSuccessHalfOfAResponseCrossesTheRealEncoder() throws {
+        let payload = try Packet.Payload(encoding: RemoteInvocationResponse<Int>.result(42), userInfo: [:])
+        try assertBodyIsAByteStream(payload)
+        XCTAssertEqual(try payload.decode(as: RemoteInvocationResponse<Int>.self),
+                       .result(42))
+
+        let text = try Packet.Payload(encoding: RemoteInvocationResponse<String>.result("hi"), userInfo: [:])
+        try assertBodyIsAByteStream(text)
+        XCTAssertEqual(try text.decode(as: RemoteInvocationResponse<String>.self),
+                       .result("hi"))
     }
 
-    /// And the shape is still right, which is what makes the wall an encoder problem
-    /// rather than a wire one: `[0, <result>]`, tag first. Pinned through the same
-    /// native-xpc coder R1--R3 used, since that is the only coder that can run it.
+    /// And a void success, which is the case the R4 brief asked for and could not have.
+    /// The payload is Apple's `Ack` -- see
+    /// `InvocationBodiesTests.testAVoidSuccessIsTagZeroAndAnEmptyDictionary` for the
+    /// call chain that resolves it.
+    func testAVoidSuccessCrossesTheRealEncoder() throws {
+        let payload = try Packet.Payload(encoding: RemoteInvocationResponse<Ack>.void, userInfo: [:])
+        try assertBodyIsAByteStream(payload)
+        XCTAssertEqual(try payload.decode(as: RemoteInvocationResponse<Ack>.self), .void)
+    }
+
+    /// The case that could not exist before R5: Apple's own decoder reading a *success*
+    /// response we encoded. Every earlier response check through this bridge was a
+    /// failure, because the success half could not be encoded.
+    func testAppleDecodesASuccessResponseWeEncoded() throws {
+        try XCTSkipUnless(AppleCoderBridge.isAvailable,
+                          "XPCReceivedMessage.init(dictionary:) no longer resolves")
+        let payload = try Packet.Payload(encoding: RemoteInvocationResponse<Int>.result(42), userInfo: [:])
+        XCTAssertEqual(
+            try AppleCoderBridge.decode(RemoteInvocationResponse<Int>.self,
+                                        from: try envelope(of: payload)),
+            .result(42))
+
+        let void = try Packet.Payload(encoding: RemoteInvocationResponse<Ack>.void, userInfo: [:])
+        XCTAssertEqual(
+            try AppleCoderBridge.decode(RemoteInvocationResponse<Ack>.self,
+                                        from: try envelope(of: void)),
+            .void)
+    }
+
+    /// A result carrying an `ActorID` still codes against the session in `userInfo`.
+    ///
+    /// This is the property `init(result:userInfo:)` existed to protect. That
+    /// initializer pre-encoded the value so that its `userInfo` was the only one the
+    /// value would ever see, and trapped loudly if a session was missing. With the
+    /// erasure gone there is nothing to pre-encode: the response is encoded once, here,
+    /// against the payload's `userInfo`, exactly like a request's arguments.
+    func testAResultCarryingAnActorIDCodesAgainstTheSessionInUserInfo() throws {
+        let session = StubSession()
+        let local = ActorID(raw: .local(.init(systemID: ID64(rawValue: 1),
+                                              instanceID: ID64(rawValue: 2))))
+        let payload = try Packet.Payload(
+            encoding: RemoteInvocationResponse<ActorID>.result(local),
+            userInfo: [.xpcActorSession: session])
+        try assertBodyIsAByteStream(payload)
+
+        let decoded = try payload.decode(as: RemoteInvocationResponse<ActorID>.self,
+                                         userInfo: [.xpcActorSession: session])
+        guard case .result(let recovered) = decoded,
+              case .remote(let remote) = recovered.raw else {
+            return XCTFail("expected a remote id, got \(decoded)")
+        }
+        XCTAssertEqual(remote.key, .dynamic(ID64(rawValue: 1)))
+    }
+
+    /// The wire shape is unchanged by the redesign: `[0, <result>]`, tag first. Pinned
+    /// through the native-xpc coder R1--R3 used, which is where the golden fixtures live.
     func testTheSuccessShapeIsStillTheUnkeyedPair() throws {
         XCTAssertEqual(
-            normalizedDescription(try XPCEncoder().encode(RemoteInvocationResponse.void)),
+            normalizedDescription(
+                try XPCEncoder().encode(RemoteInvocationResponse<Ack>.void)),
             "[uint64(0),dict{}]")
+        XCTAssertEqual(
+            normalizedDescription(
+                try XPCEncoder().encode(RemoteInvocationResponse<Int>.result(42))),
+            "[uint64(0),int64(42)]")
     }
 
     // MARK: the notification
 
     func testANotificationBodySurvivesTheRealEncoder() throws {
         let payload = try Packet.Payload(
-            encoding: RemoteNotification.invocationCancelled(id: ID64(rawValue: 17)))
+            encoding: RemoteNotification.invocationCancelled(id: ID64(rawValue: 17)), userInfo: [:])
         try assertBodyIsAByteStream(payload)
         XCTAssertEqual(try payload.decode(as: RemoteNotification.self),
                        .invocationCancelled(id: ID64(rawValue: 17)))
@@ -209,7 +253,7 @@ final class PacketBodyTests: XCTestCase {
                           "XPCReceivedMessage.init(dictionary:) no longer resolves")
         let payload = try Packet.Payload(
             encoding: RemoteNotification.invocationEscalated(id: ID64(rawValue: 5),
-                                                             priority: .background))
+                                                             priority: .background), userInfo: [:])
         XCTAssertEqual(
             try AppleCoderBridge.decode(RemoteNotification.self,
                                         from: try envelope(of: payload)),

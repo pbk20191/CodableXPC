@@ -39,7 +39,7 @@ final class XPCRawTransportTests: XCTestCase {
             let transport = Transport(debugName: "server", role: .responder, rawTransport: raw)
             transport.inboundRequestHandler = { _, payload, reply in
                 guard let ping = try? payload.decode(as: Ping.self),
-                      let body = try? Packet.Payload(encoding: Ping(value: ping.value + 1))
+                      let body = try? Packet.Payload(encoding: Ping(value: ping.value + 1), userInfo: [:])
                 else { return }
                 reply(body)
             }
@@ -62,7 +62,7 @@ final class XPCRawTransportTests: XCTestCase {
         // until its first message -- so the listener does not learn of this peer until
         // the request below is sent. Waiting for `serverReady` first would deadlock,
         // and it did: that is what deleting the `hello` changed here.
-        let request = try Packet.Payload(encoding: Ping(value: 41))
+        let request = try Packet.Payload(encoding: Ping(value: 41), userInfo: [:])
         async let pending = client.sendRequest(seq: client.allocateSeq(), request)
 
         await fulfillment(of: [serverReady], timeout: 5)

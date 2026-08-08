@@ -35,8 +35,12 @@ private final class StubSession: SessionCoding, @unchecked Sendable {
 @available(macOS 14, *)
 final class InvocationBodiesTests: XCTestCase {
 
-    private func encoded<T: Encodable>(_ value: T) throws -> String {
-        normalizedDescription(try XPCEncoder().encode(value))
+    private func encoded<T: Encodable>(
+        _ value: T, userInfo: [CodingUserInfoKey: Any] = [:]
+    ) throws -> String {
+        var encoder = XPCEncoder()
+        encoder.userInfo = userInfo
+        return normalizedDescription(try encoder.encode(value))
     }
 
     private static let fullInvocation = InvocationBody(
@@ -232,28 +236,88 @@ final class InvocationBodiesTests: XCTestCase {
     // single-value container around an `Either<A, RemoteInvocationFailure>`, and
     // `Either` codes as an unkeyed pair whose first element is a `UInt8` tag --
     // `a` is 0 (the result), `b` is 1 (the failure).
+    //
+    // The response is generic over its success type, as Apple's is. Nothing about the
+    // wire changed with that: the pair is the pair. What changed is who decodes the
+    // payload -- the call site, which knows the return type, instead of the envelope.
 
     func testASuccessResponseIsAnUnkeyedPair() throws {
-        XCTAssertEqual(try encoded(RemoteInvocationResponse(result: 42 as Int, userInfo: [:])),
+        XCTAssertEqual(try encoded(RemoteInvocationResponse<Int>.result(42)),
                        "[uint64(0),int64(42)]")
     }
 
-    /// A Void success is `[0, {}]`, not an absent payload: "returned nothing" has to
-    /// stay distinguishable from "carried no result".
+    /// **A Void success is `[0, {}]` -- resolved, no longer assumed.**
+    ///
+    /// The bytes are what we already had; the reason we had written down was ours and
+    /// was wrong. It is not "an empty dictionary so that returning nothing stays
+    /// distinguishable from carrying no result". It is Apple's `XPCDistributed.Ack`,
+    /// a field-less struct with synthesized `Codable`, standing in for `Void` as the
+    /// generic argument, and `{}` is simply what an empty keyed container writes.
+    ///
+    /// The chain, resolved in the macOS 27 binary with `dump-function.py`:
+    ///
+    ///     EncodedResultHandler.onReturnVoid()  @0x2ad5036f4
+    ///         tail-calls its own vtable slot +0x88 -- onReturn<A>(value:) -- with
+    ///         x1 = type metadata for XPCDistributed.Ack (0x2d9b84470),
+    ///         x2 = Ack : Decodable, x3 = Ack : Encodable, and no value register
+    ///         (Ack is zero-sized).
+    ///     EncodedResultHandler.onReturn<A>    @0x2ad503404
+    ///         builds Result<A, Error> with swift_storeEnumTagMultiPayload(..., 0)
+    ///         -- .success -- and calls ReplyHandler.encodeReply(with:).
+    ///     encodeReply<A, B>(with:)            @0x2ad512738
+    ///         the .success arm calls encodeReturn<A>(value:) directly.
+    ///     encodeReturn<A>(value:)             @0x2ad512298
+    ///         calls RemoteInvocationResponse<A>.init(result:) -- tag 0 -- then
+    ///         Packet.Payload.init(encoding:userInfo:).
+    ///     Ack.encode(to:)                     @0x2ad4ebb70
+    ///         opens container(keyedBy: Ack.CodingKeys) and writes nothing;
+    ///         `field-descriptors.txt` shows Ack with no fields and its CodingKeys
+    ///         with no cases.
+    ///
+    /// Corroborated independently by the in-process path: `ResultHandler.onReturnVoid()`
+    /// (`0x2ad5051b4`) stores `.success(Ack())` as an `any Decodable & Encodable` into
+    /// `DirectResultHandler.capturedResult`. Two unrelated paths, one stand-in type.
     func testAVoidSuccessIsTagZeroAndAnEmptyDictionary() throws {
-        XCTAssertEqual(try encoded(RemoteInvocationResponse.void), "[uint64(0),dict{}]")
+        XCTAssertEqual(try encoded(RemoteInvocationResponse<Ack>.void),
+                       "[uint64(0),dict{}]")
     }
 
+    /// And `Ack` alone is `{}` -- the empty keyed container, not a null and not an
+    /// absent value. This is the whole of the void payload.
+    func testAckEncodesAsAnEmptyDictionary() throws {
+        XCTAssertEqual(try encoded(Ack()), "{}")
+        XCTAssertEqual(try XPCDecoder().decode(Ack.self,
+                                               from: xpc_dictionary_create(nil, nil, 0)),
+                       Ack())
+    }
+
+    /// Failure responses are spelled `<Never>` because a failure carries no success
+    /// value -- which is exactly what Apple does. `encodeReply`'s failure arm
+    /// instantiates `RemoteInvocationResponse<Swift.Never>` (the lazy `Encodable`
+    /// witness accessor for it is a direct call in that arm), and so does
+    /// `encodeReturn`'s catch path.
     func testAnExecutionFailureResponseIsPinned() throws {
         XCTAssertEqual(
-            try encoded(RemoteInvocationResponse(executionFailure: "boom")),
+            try encoded(RemoteInvocationResponse<Never>(executionFailure: "boom")),
             "[uint64(1),dict{executionFailed=dict{_0=string(boom)}}]")
     }
 
     func testAResultPropagationFailureResponseIsPinned() throws {
         XCTAssertEqual(
-            try encoded(RemoteInvocationResponse(resultPropagationFailure: "no reply")),
+            try encoded(RemoteInvocationResponse<Never>(resultPropagationFailure: "no reply")),
             "[uint64(1),dict{resultPropagationFailed=dict{_0=string(no reply)}}]")
+    }
+
+    /// `RemoteInvocationResponse<Never>` cannot hold a result -- the case is
+    /// uninhabited, so `.result` is unspellable at compile time and tag 0 has nothing
+    /// to decode into at run time. That is why `<Never>` is a failure-only
+    /// instantiation on Apple's side too, and why it is not the void answer.
+    func testANeverResponseCannotCarryAResult() throws {
+        let object = xpc_array_create(nil, 0)
+        xpc_array_append_value(object, xpc_uint64_create(0))
+        xpc_array_append_value(object, xpc_dictionary_create(nil, nil, 0))
+        XCTAssertThrowsError(
+            try XPCDecoder().decode(RemoteInvocationResponse<Never>.self, from: object))
     }
 
     /// The failure is a keyed enum in Swift's synthesized shape: exactly one top-level
@@ -266,44 +330,38 @@ final class InvocationBodiesTests: XCTestCase {
                        "{resultPropagationFailed=dict{_0=string(x)}}")
     }
 
-    /// The result is encoded eagerly by `init(result:userInfo:)`, not later at payload
-    /// time, so that `userInfo` is the only one the value will ever see. A returned
-    /// value carrying an `ActorID` therefore needs the session *here* -- and
-    /// `ActorID.encode` traps rather than throws without one, which is why the
-    /// parameter is not defaulted.
+    /// A returned value may itself contain an `ActorID`, which needs the owning session
+    /// to code itself -- and `ActorID.encode` traps rather than throws without one.
+    /// That is the property `init(result:userInfo:)` existed to protect, and it now
+    /// holds by construction: nothing is pre-encoded, so the only `userInfo` in play is
+    /// the coder's, which is the same one every other field of the response sees.
     func testAResultCarryingAnActorIDEncodesAgainstTheSuppliedSession() throws {
         let session = StubSession()
         let local = ActorID(raw: .local(.init(systemID: ID64(rawValue: 1),
                                               instanceID: ID64(rawValue: 2))))
-        let response = try RemoteInvocationResponse(
-            result: local,
-            userInfo: [.xpcActorSession: session])
+        let response = RemoteInvocationResponse<ActorID>.result(local)
 
-        XCTAssertEqual(try encoded(response), "[uint64(0),[uint64(2),uint64(1)]]")
+        XCTAssertEqual(try encoded(response, userInfo: [.xpcActorSession: session]),
+                       "[uint64(0),[uint64(2),uint64(1)]]")
         XCTAssertEqual(session.shared.count, 1,
                        "the ActorID should have been shared into the supplied session")
     }
 
-    /// And a result with nothing session-bound in it still encodes identically under an
-    /// empty `userInfo` -- requiring the parameter changed no bytes.
-    func testASessionFreeResultIsUnaffectedByRequiringUserInfo() throws {
-        XCTAssertEqual(try encoded(RemoteInvocationResponse(result: 42 as Int,
-                                                            userInfo: [:])),
-                       "[uint64(0),int64(42)]")
-    }
-
     func testAResponseRoundTrips() throws {
-        let cases: [RemoteInvocationResponse] = [
-            .void,
-            try RemoteInvocationResponse(result: "hello", userInfo: [:]),
-            RemoteInvocationResponse(executionFailure: "boom"),
-            RemoteInvocationResponse(resultPropagationFailure: "gone"),
-        ]
-        for value in cases {
+        func roundTrip<Success: Codable & Equatable>(
+            _ value: RemoteInvocationResponse<Success>, line: UInt = #line
+        ) throws {
             let object = try XPCEncoder().encode(value)
-            XCTAssertEqual(try XPCDecoder().decode(RemoteInvocationResponse.self,
-                                                   from: object), value)
+            XCTAssertEqual(
+                try XPCDecoder().decode(RemoteInvocationResponse<Success>.self,
+                                        from: object),
+                value, line: line)
         }
+        try roundTrip(RemoteInvocationResponse<Ack>.void)
+        try roundTrip(RemoteInvocationResponse<String>.result("hello"))
+        try roundTrip(RemoteInvocationResponse<Int>.result(42))
+        try roundTrip(RemoteInvocationResponse<Never>(executionFailure: "boom"))
+        try roundTrip(RemoteInvocationResponse<Never>(resultPropagationFailure: "gone"))
     }
 
     // MARK: tier 1 -- the notification
@@ -438,11 +496,17 @@ final class InvocationBodiesTests: XCTestCase {
         let success = xpc_array_create(nil, 0)
         xpc_array_append_value(success, xpc_uint64_create(0))
         xpc_array_append_value(success, xpc_int64_create(42))
-        guard case .result(let value) = try XPCDecoder().decode(
-            RemoteInvocationResponse.self, from: success) else {
-            return XCTFail("tag 0 must decode as a result")
-        }
-        XCTAssertEqual(xpc_int64_get_value(value.object), 42)
+        XCTAssertEqual(
+            try XPCDecoder().decode(RemoteInvocationResponse<Int>.self, from: success),
+            .result(42))
+
+        // The void reply a real peer sends: tag 0 and Apple's `Ack`, which is `{}`.
+        let void = xpc_array_create(nil, 0)
+        xpc_array_append_value(void, xpc_uint64_create(0))
+        xpc_array_append_value(void, xpc_dictionary_create(nil, nil, 0))
+        XCTAssertEqual(
+            try XPCDecoder().decode(RemoteInvocationResponse<Ack>.self, from: void),
+            .void)
 
         let payload = xpc_dictionary_create(nil, nil, 0)
         xpc_dictionary_set_string(payload, "_0", "boom")
@@ -452,7 +516,16 @@ final class InvocationBodiesTests: XCTestCase {
         xpc_array_append_value(failure, xpc_uint64_create(1))
         xpc_array_append_value(failure, wrapper)
         XCTAssertEqual(
-            try XPCDecoder().decode(RemoteInvocationResponse.self, from: failure),
+            try XPCDecoder().decode(RemoteInvocationResponse<Never>.self, from: failure),
+            .failure(.executionFailed("boom")))
+
+        // And the production spelling of that same failure, which is the commonest
+        // runtime path in the design: a call site names its own return type and has to
+        // handle tag 1 arriving where it expected tag 0. `<Never>` above is the
+        // instantiation Apple builds when it *knows* the reply is a failure; a caller
+        // awaiting a result never gets to know that in advance.
+        XCTAssertEqual(
+            try XPCDecoder().decode(RemoteInvocationResponse<Int>.self, from: failure),
             .failure(.executionFailed("boom")))
     }
 
@@ -492,14 +565,14 @@ final class InvocationBodiesTests: XCTestCase {
         xpc_array_append_value(object, xpc_uint64_create(7))
         xpc_array_append_value(object, xpc_int64_create(1))
         XCTAssertThrowsError(
-            try XPCDecoder().decode(RemoteInvocationResponse.self, from: object))
+            try XPCDecoder().decode(RemoteInvocationResponse<Int>.self, from: object))
     }
 
     func testATruncatedResponsePairIsRejected() throws {
         let object = xpc_array_create(nil, 0)
         xpc_array_append_value(object, xpc_uint64_create(0))
         XCTAssertThrowsError(
-            try XPCDecoder().decode(RemoteInvocationResponse.self, from: object))
+            try XPCDecoder().decode(RemoteInvocationResponse<Int>.self, from: object))
     }
 
     /// The three shapes a hostile peer reaches for first. All three already fail; these
@@ -511,7 +584,7 @@ final class InvocationBodiesTests: XCTestCase {
         let object = xpc_dictionary_create(nil, nil, 0)
         xpc_dictionary_set_uint64(object, "_value", 0)
         XCTAssertThrowsError(
-            try XPCDecoder().decode(RemoteInvocationResponse.self, from: object))
+            try XPCDecoder().decode(RemoteInvocationResponse<Int>.self, from: object))
     }
 
     func testAFailurePayloadSentAsAStringIsRejected() throws {
@@ -520,7 +593,7 @@ final class InvocationBodiesTests: XCTestCase {
         xpc_array_append_value(object, xpc_uint64_create(1))
         xpc_array_append_value(object, xpc_string_create("boom"))
         XCTAssertThrowsError(
-            try XPCDecoder().decode(RemoteInvocationResponse.self, from: object))
+            try XPCDecoder().decode(RemoteInvocationResponse<Never>.self, from: object))
     }
 
     func testAFailureMessageThatIsNotAStringIsRejected() throws {

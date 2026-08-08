@@ -48,9 +48,26 @@ extension Packet {
             self.object = object
         }
 
+        /// Deliberately not defaulted, and this is the only guard left for it.
+        ///
+        /// `ActorID.encode` is a `preconditionFailure` when the session is missing, not a
+        /// throw -- so `userInfo: [:]` is a process-trapping spelling for any value that
+        /// contains an actor reference, and the shape of that value follows from which
+        /// `func` a peer chose to invoke. A default would make the trapping spelling the
+        /// shortest one.
+        ///
+        /// The argument used to live on `RemoteInvocationResponse.init(result:userInfo:)`,
+        /// which pre-encoded the result and so was the only place that could hold it.
+        /// Making the response generic removed that initializer and with it the guard;
+        /// the exposure did not go away, it moved here -- and widened, because requests
+        /// carry actor references in their arguments too.
+        ///
+        /// Note the asymmetry it protects against: outbound, a missing session **traps**
+        /// (`ActorID.encode`); inbound, it **throws** (`ActorID.init(from:)`). Callers
+        /// with genuinely nothing session-bound to encode pass `[:]` and say so.
         public init<T: Encodable>(
             encoding value: T,
-            userInfo: [CodingUserInfoKey: Any] = [:]
+            userInfo: [CodingUserInfoKey: Any]
         ) throws {
             var encoder = XPCOverlayEncoder()
             encoder.userInfo = userInfo

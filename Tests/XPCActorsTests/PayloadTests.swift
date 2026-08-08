@@ -19,14 +19,14 @@ final class PayloadTests: XCTestCase {
 
     func testRoundTrips() throws {
         let original = Body(name: "hello", count: 3)
-        let payload = try Packet.Payload(encoding: original)
+        let payload = try Packet.Payload(encoding: original, userInfo: [:])
         XCTAssertEqual(try payload.decode(as: Body.self), original)
     }
 
     // MARK: shape
 
     func testTheObjectIsADictionaryWithExactlyOneEntryNamedPayload() throws {
-        let payload = try Packet.Payload(encoding: Body(name: "x", count: 1))
+        let payload = try Packet.Payload(encoding: Body(name: "x", count: 1), userInfo: [:])
         XCTAssertEqual(xpc_get_type(payload.object), XPC_TYPE_DICTIONARY)
         XCTAssertEqual(xpc_dictionary_get_count(payload.object), 1)
         XCTAssertNotNil(xpc_dictionary_get_value(payload.object, "payload"))
@@ -36,7 +36,7 @@ final class PayloadTests: XCTestCase {
     /// `xpc_data` blob, so no field of the value is an xpc entry and no key name in
     /// the spec is an xpc dictionary key.
     func testTheBodyIsAnOverlayEnvelopeWhoseCodableBodyIsAByteStream() throws {
-        let payload = try Packet.Payload(encoding: Body(name: "x", count: 1))
+        let payload = try Packet.Payload(encoding: Body(name: "x", count: 1), userInfo: [:])
         let envelope = try XCTUnwrap(xpc_dictionary_get_value(payload.object, "payload"))
         let body = try XCTUnwrap(xpc_dictionary_get_value(envelope, OverlayEnvelope.body))
         XCTAssertEqual(xpc_get_type(body), XPC_TYPE_DATA,
@@ -46,7 +46,7 @@ final class PayloadTests: XCTestCase {
     }
 
     func testTheOverlayEnvelopeCarriesItsCoderVersion() throws {
-        let payload = try Packet.Payload(encoding: Body(name: "x", count: 1))
+        let payload = try Packet.Payload(encoding: Body(name: "x", count: 1), userInfo: [:])
         let envelope = try XCTUnwrap(xpc_dictionary_get_value(payload.object, "payload"))
         let version = try XCTUnwrap(
             xpc_dictionary_get_value(envelope, OverlayEnvelope.coderVersion))
@@ -59,8 +59,8 @@ final class PayloadTests: XCTestCase {
     /// on a byte stream, so `PacketCodingError.bodyIsNotADictionary` has nothing left
     /// to describe.
     func testANonDictionaryTopLevelValueIsFine() throws {
-        XCTAssertEqual(try Packet.Payload(encoding: 42).decode(as: Int.self), 42)
-        XCTAssertEqual(try Packet.Payload(encoding: [1, 2, 3]).decode(as: [Int].self),
+        XCTAssertEqual(try Packet.Payload(encoding: 42, userInfo: [:]).decode(as: Int.self), 42)
+        XCTAssertEqual(try Packet.Payload(encoding: [1, 2, 3], userInfo: [:]).decode(as: [Int].self),
                        [1, 2, 3])
     }
 
@@ -99,7 +99,7 @@ final class PayloadTests: XCTestCase {
             }
         }
 
-        let payload = try Packet.Payload(encoding: Body(name: "x", count: 1))
+        let payload = try Packet.Payload(encoding: Body(name: "x", count: 1), userInfo: [:])
         let probe = try payload.decode(as: Probe.self, userInfo: [key: "present"])
         // The mechanism identity relies on: it is how an `ActorID` codes itself
         // against its session.
@@ -110,7 +110,7 @@ final class PayloadTests: XCTestCase {
 
     func testDecodingTheWrongTypeThrows() throws {
         struct Other: Codable { let totallyDifferent: [String] }
-        let payload = try Packet.Payload(encoding: Body(name: "x", count: 1))
+        let payload = try Packet.Payload(encoding: Body(name: "x", count: 1), userInfo: [:])
         XCTAssertThrowsError(try payload.decode(as: Other.self))
     }
 

@@ -108,7 +108,7 @@ final class AppleDecodesInvocationArgumentsTests: XCTestCase {
     /// The check the R4 brief called the point of the task: a real invocation, its
     /// arguments included, read back by Apple's own coder.
     func testAppleDecodesTheArgumentsOfARequestWeEncoded() throws {
-        let payload = try Packet.Payload(encoding: Self.request)
+        let payload = try Packet.Payload(encoding: Self.request, userInfo: [:])
         let decoded = try XCTUnwrap(
             AppleCoderBridge.decode(EagerRequest.self, from: try envelope(of: payload)))
         XCTAssertEqual(decoded, Self.expected)
@@ -118,7 +118,7 @@ final class AppleDecodesInvocationArgumentsTests: XCTestCase {
     /// expectation. Alone it would prove only self-consistency; next to the test
     /// above it says the two decoders agree rather than merely that each works.
     func testOurDecoderAgreesWithAppleOnTheSameBytes() throws {
-        let payload = try Packet.Payload(encoding: Self.request)
+        let payload = try Packet.Payload(encoding: Self.request, userInfo: [:])
         XCTAssertEqual(try payload.decode(as: EagerRequest.self), Self.expected)
     }
 }
