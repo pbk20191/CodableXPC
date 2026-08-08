@@ -48,14 +48,12 @@ import XPC
 /// import nothing from each other — the split is the honest shape of a module
 /// holding two formats that share only a lineage.
 ///
-/// ## Errors are ours, not Apple's
+/// ## Errors
 ///
-/// Failures here throw this module's own error types. `XPCRichError` cannot be
-/// constructed: libxpc exports exactly three rich-error symbols — the type
-/// descriptor, `xpc_rich_error_can_retry` and `xpc_rich_error_copy_description`
-/// — and no creator under any name, while the Swift struct exports only its
-/// `canRetry` and `debugDescription` getters. It is something the framework
-/// hands you, never something you make.
+/// Failures here throw this module's own types. An `XPCRichError` can be made
+/// too, despite libxpc having no creator for one — see
+/// ``XPC/XPCRichError/make(_:canRetry:)``, which does not need libxpc because
+/// the Swift type turns out not to wrap an `xpc_rich_error_t`.
 public enum XPCOverlayGeneration: Sendable, Equatable, CaseIterable {
     /// macOS 14 / iOS 17.
     case iOS17

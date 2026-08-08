@@ -16,7 +16,7 @@ extension CodingUserInfoKey {
     /// of the running dylib by calling the static getter directly — Hex-Rays had
     /// dropped the argument, and at eleven characters it is a Swift small string, so
     /// it appears in no string table either.
-    public static let xpcOverlayCodableObjects = CodingUserInfoKey(rawValue: "_XPCCodable")!
+    static let xpcOverlayCodableObjects = CodingUserInfoKey(rawValue: "_XPCCodable")!
 }
 
 /// Bridges the `_CodableOutOfLine4CodableObject` side array in and out of `userInfo`.
