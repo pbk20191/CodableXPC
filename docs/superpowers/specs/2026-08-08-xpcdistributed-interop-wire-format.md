@@ -1219,6 +1219,26 @@ services — so the entitlement wall (`"Peer failed XPCSystem's entitlement chec
 `findmydevice-user-agent`, `searchpartyd`, `transparencyd`) does not apply, and byte fidelity is
 a matter of discipline rather than of a peer accepting us.
 
+### It was tried, once, and the wall is where the document said
+
+**A real peer was dialled.** `com.apple.icloud.findmydeviced.localfindable`, a Mach service of
+the running `findmydevice-user-agent`, on this machine, from an unentitled client:
+
+| what was sent | outcome |
+|---|---|
+| a dictionary with one string key — not a packet at all | `XPC_ERROR_CONNECTION_INTERRUPTED` |
+| a real `Packet`: `headerCategory`/`headerID`/`payload`, the payload an overlay-encoded `RemoteInvocationRequest` built by this package | `XPC_ERROR_CONNECTION_INTERRUPTED` |
+
+**Identical** — the same error singleton, the same description. A second service
+(`com.apple.findmydeviced.btfindingsession`) simply never answered. The peer tears the connection
+down *before anything looks at our bytes*, which is exactly what the entitlement check quoted
+above would do, and it means **no amount of byte fidelity changes the outcome**. Nothing in the
+system log named the refusal.
+
+So the negative result is real but narrow: it confirms the wall is in front of the parser, and it
+confirms this document's claim that live validation is unavailable. It says nothing whatever
+about whether the format below is right.
+
 That has one honest consequence. **Nothing here has been validated against a running Apple peer,
 and under this goal nothing ever will be.** Every claim is read from reflection metadata,
 disassembly, and string tables. The strongest available check is internal consistency, which is
