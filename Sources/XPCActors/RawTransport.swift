@@ -38,4 +38,23 @@ public protocol RawTransportProtocol: AnyObject, Sendable {
     /// session. `cancel` is idempotent and keeps the first reason, which is the one
     /// that explains why the pipe died.
     func cancel(reason: String)
+
+    /// What this transport can prove about the process on the other end, or `nil` when it
+    /// can prove nothing.
+    ///
+    /// Apple's `RawTransportProtocol.auditToken : audit_token_t?`, one level of indirection
+    /// further out: the *token* is the only identity an XPC pipe has, but it is not the only
+    /// identity a transport could have, and every consumer of it only ever asks it one
+    /// question. Handing over the question-answerer rather than the token keeps
+    /// ``Session``'s two gates written against "can the peer prove this" instead of against
+    /// Mach.
+    ///
+    /// Defaulted to `nil` so that a transport which cannot attest says so by saying nothing.
+    /// `nil` is **not** "yes": see ``PeerAttestation``.
+    var peerAttestation: (any PeerAttestation)? { get }
+}
+
+@available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
+extension RawTransportProtocol {
+    public var peerAttestation: (any PeerAttestation)? { nil }
 }

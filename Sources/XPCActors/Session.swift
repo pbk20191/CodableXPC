@@ -178,13 +178,37 @@ final class Session: SessionCoding, OutboundSession, InboundSession, @unchecked 
 
     private var isCancelled = false
 
+    /// **Apple's local-interface activation gate**, and the thing an inbound execution
+    /// waits on before it is allowed to resolve a target.
+    ///
+    /// `Session` has two activation events over there --
+    /// `unownedLocalInterfaceActivationEvent` (+0x58, always present) and
+    /// `ownedLocalInterfaceActivationEvent` (+0x78, `nil` until `readyToReceive(_:)`
+    /// installs one around the passed `Task`) -- and `waitForLocalInterfaceActivation()` is
+    /// a `swift_task_switch` prologue onto whichever is in force. One event here, because
+    /// the difference between the two is only *whose* priority a waiter escalates, and
+    /// ``ActivationEvent`` carries that as an optional owner.
+    ///
+    /// **Ours starts posted; Apple's does not.** Both of Apple's initialisers leave the
+    /// owned event `nil`, so a session that never went through `readyToReceive(_:)` blocks
+    /// every inbound execution until `cancellationCompleted()` fulfils the unowned one --
+    /// which is fine over there, because a session that receives requests is one a
+    /// `LocalInterface.activateThen…` entry point drove, and those call `readyToReceive`.
+    /// There is no `LocalInterface` in this module and no `export` API that would call it,
+    /// so defaulting closed would make every session a session that never answers. The
+    /// default is a parameter on ``XPCActorSystem/makeSession(over:localInterfaceActivated:)``
+    /// and it moves to `InitializationOptions` when those arrive.
+    private let activationEvent: ActivationEvent
+
     /// `fileprivate`: sessions come from ``XPCActorSystem/makeSession(over:)``, which is
     /// at the bottom of this file. (`private` would not reach it -- Swift extends
     /// `private` to extensions of *the same type* in the same file, and the vending
     /// method is an extension of the system.)
-    fileprivate init(system: XPCActorSystem, transport: Transport) {
+    fileprivate init(system: XPCActorSystem, transport: Transport,
+                     localInterfaceActivated: Bool) {
         self.system = system
         self.transport = transport
+        self.activationEvent = ActivationEvent(posted: localInterfaceActivated)
         // Weakly, as Apple's initialiser does it (`swift_unknownObjectWeakAssign` into
         // `transport+0x10`). We hold the transport; it must not hold us back.
         transport.install(inboundSession: self)
@@ -483,6 +507,139 @@ final class Session: SessionCoding, OutboundSession, InboundSession, @unchecked 
         [.xpcActorSession: self, .actorSystemKey: system]
     }
 
+    // MARK: - Activation
+
+    /// The local interface is up: inbound executions may resolve targets.
+    ///
+    /// Apple reaches this through `readyToReceive(_:)` (which also installs the owned event)
+    /// and through the task that event owns; the two are split here because there is no
+    /// `ActivationToken` to hand back and nothing to own it.
+    ///
+    /// One-shot and idempotent, because Apple's `posted` is a `Fuse`.
+    func activateLocalInterface() {
+        activationEvent.post()
+    }
+
+    /// Internal: the task a waiter's priority should reach -- Apple's
+    /// `OwnedAwaitableEvent.owningTask`, which is escalated and **never awaited**.
+    ///
+    /// Named `escalate` rather than typed `Task<…, Never>` because Apple's is generic over
+    /// the owner's `Success` (`Task<LocalInterface.ActivationToken, Never>`) and this module
+    /// has no token type to name.
+    func setActivationOwner(_ escalate: @escaping @Sendable (TaskPriority) -> Void) {
+        activationEvent.setOwner(escalate)
+    }
+
+    /// Internal for tests.
+    var isLocalInterfaceActivated: Bool { activationEvent.isPosted }
+
+    /// Apple's `Session.waitForLocalInterfaceActivation() async`, step 3 of the inbound
+    /// success path -- before `Task.isCancelled`, before `resolveSharedActor(at:)`, and so
+    /// before either the target or its peer requirement is looked at.
+    ///
+    /// **Escalate-plus-single-await, not a join.** See ``ActivationEvent/wait()``.
+    ///
+    /// A cancelled session releases every waiter, because ``cancellationCompleted()`` posts
+    /// this event -- which is Apple's too: their `cancellationCompleted()` fulfils the
+    /// `unownedLocalInterfaceActivationEvent` promise. Without that, an execution parked
+    /// here would outlive the transport and never reply.
+    func waitForLocalInterfaceActivation() async {
+        await activationEvent.wait()
+    }
+
+    // MARK: - The two peer gates
+
+    /// **Gate one: does the peer satisfy the *actor system's* requirement?**
+    ///
+    /// Apple's `Session.remoteSatisfiesActorSystemRequirement() -> Bool` (`0x2ad508ed8`),
+    /// which instantiates `XPC.XPCPeerRequirement` metadata and checks the peer against it.
+    /// `handleReceivedRequest` calls it at `+0x930`, and the two things around that call are
+    /// worth having right because both were misread before:
+    ///
+    /// - it runs **before** the payload is decoded (the `XPCDictionary.decode(as:
+    ///   RemoteInvocationRequest.self, forKey: "payload")` call is at `+0x9a4`, and the
+    ///   `"payload"` key literal is built between the two). The interop spec lists the order
+    ///   the other way round; the branch targets say otherwise. So an unentitled peer's
+    ///   bytes are never parsed;
+    /// - it is guarded by `isBidirectional` (`ldrb w8,[x25,#0x70]; cmp #1; b.ne`), whose
+    ///   other arm answers `"Session cannot receive requests"` without decoding either.
+    ///   That flag is not modelled here -- see ``shareDynamically(_:)`` for why -- so that
+    ///   arm has no counterpart.
+    ///
+    /// `nil` requirement admits everyone, which is the shipping default and the reason
+    /// nothing broke while this was missing. A requirement that is set and a peer that
+    /// cannot be attested to at all is **refused**: `RemoteInterface.satisfies(requirement:)`
+    /// is `Bool?` precisely so that "unknown" is not "no", and this is the one place that
+    /// has to collapse the three values into two. Collapsing "unknown" to *admit* would mean
+    /// a transport with no attestation silently disabled the gate.
+    ///
+    /// **Apple does not refuse there; Apple dies there, in three different ways, and this is
+    /// the second place in this file where that divergence is taken deliberately** (the other
+    /// is ``peerSatisfiesRequirement(of:)``, which is the same call about the per-actor gate).
+    /// Read out of `0x2ad508ed8`:
+    ///
+    /// | condition | Apple | here |
+    /// |---|---|---|
+    /// | `kind` is `.local` (`tbnz x8,#0x3f` at `+0x17c`) | `brk #1` at `+0x234` | n/a — no `.local` session exists |
+    /// | `RemoteInterface.auditToken` is `nil` (`cmp w8,#1; b.eq` at `+0x1bc`) | `_assertionFailure` at `+0x238` | `false` |
+    /// | the token exists but `audit_token_t.isValid` is `false` (`tbz w0,#0` at `+0x1dc`) | `_assertionFailure` at `+0x284` | `false` |
+    ///
+    /// The two assertion literals, decoded from the `adrp`/`add`/`sub #0x20` operands rather
+    /// than attributed by adjacency:
+    ///
+    /// - `0x2ad525e10`, 121 bytes: `"Bug in XPCDistributed: This method should only be
+    ///   called once a message from the remote endis known to have been received"` — the
+    ///   missing space is in Apple's literal, which is how you can tell it is one string
+    ///   built from two source lines.
+    /// - `0x2ad525e90`, 77 bytes: `"Bug in XPCDistributed: Expected valid audit token if the
+    ///   transport returns one"` — the same literal the reconstruction attributes to
+    ///   `RemoteInterface.auditToken`.
+    ///
+    /// Both wordings say what the trap is *for*: over there this is unreachable unless the
+    /// framework called it too early, because an `.xpc` session that has received a message
+    /// always has a token. That is exactly the assumption our transport seam does not carry —
+    /// ``RawTransportProtocol/peerAttestation`` is `nil` for every transport that cannot
+    /// attest, and a conformer outside this module may be such a transport. So the condition
+    /// Apple treats as "impossible, therefore fatal" is here "possible, therefore refuse",
+    /// and refusing is the only answer that is not either a lie or an abort.
+    func remoteSatisfiesActorSystemRequirement() -> Bool {
+        guard let requirement = system.peerRequirement else { return true }
+        return transport.peerAttestation?.satisfies(requirement) == true
+    }
+
+    /// **Gate two: does the peer satisfy *this actor's* requirement?**
+    ///
+    /// Apple's is inside `handleReceivedRequest`'s `closure #2`, after the target resolves:
+    /// `swift_getObjectType` then `swift_conformsToProtocol2` against the
+    /// `RestrictedAccessDistributedActor` descriptor at `0x2ad527dd8`; if the actor does not
+    /// conform (`cbz x0`) the check is skipped entirely; if it does, the path reads
+    /// `RemoteInterface.auditToken`, calls the `peerRequirement` witness at witness-table
+    /// slot `+0x10`, and hands both to `audit_token_t.satisfies(requirement:)`.
+    ///
+    /// **A nil audit token is `brk #1` over there** (`0x2ad514e70`, reached by
+    /// `ldrb w8,[x22,#0x218]; cmp #1; b.eq`) -- a force-unwrap, so a restricted actor
+    /// exported over a transport that cannot attest kills the process. Ours refuses instead,
+    /// on this module's stated criterion: the *peer* chooses which actor a request names, so
+    /// the peer chooses whether that trap fires, and a peer-triggerable abort is a denial of
+    /// service. The misconfiguration is still an error -- it just gets reported to the peer
+    /// that provoked it rather than ending the process for everyone.
+    ///
+    /// Returns Apple's own failure text on refusal so that a peer sees what a peer would
+    /// see: `"Failed actor's peer requirement check"`, read out of `__cstring` at
+    /// `0x2ad5262b0` (37 bytes), and distinct from the system-wide gate's wording.
+    private func peerSatisfiesRequirement(of instance: AnyObject) -> Bool {
+        guard let restricted = instance as? any RestrictedAccessDistributedActor
+        else { return true }
+        return transport.peerAttestation?.satisfies(restricted.peerRequirement) == true
+    }
+
+    /// Apple's `Session.cancel(because:)`, at the width this module has: tearing the
+    /// transport down is what runs `handleTransportCancellation()`, which cancels the
+    /// in-flight executions and empties the exported-actor table.
+    func cancel(because reason: String) {
+        transport.cancel(reason: reason)
+    }
+
     // MARK: - Inbound
 
     /// One request from the peer: decode it, find the actor, run the target, reply.
@@ -494,27 +651,49 @@ final class Session: SessionCoding, OutboundSession, InboundSession, @unchecked 
     /// build a `RemoteCallTarget` from `remoteCallIdentifier`; clamp the priority; spawn;
     /// register.
     ///
-    /// **Every arm replies.** A receiver that dropped a malformed request would park the
-    /// peer forever: there is no timeout in this protocol, and the peer's `RequestTable`
+    /// **Every arm replies, with exactly two exceptions, and both of them are arms where the
+    /// peer is *already* being told.** A receiver that dropped a malformed request would park
+    /// the peer forever: there is no timeout in this protocol, and the peer's `RequestTable`
     /// entry is only resolved by a response or by the pipe dying. That is why the decode
-    /// failure, the missing-actor failure and the duplicate-id failure are answers rather
-    /// than returns, and it is what Apple's six inlined `RemoteInvocationResponse<Never>`
-    /// failure sites are.
+    /// failure, the missing-actor failure, the per-actor refusal and the duplicate-id failure
+    /// are answers rather than returns, and it is what Apple's six inlined
+    /// `RemoteInvocationResponse<Never>` failure sites are. The exceptions are the
+    /// system-wide gate (which cancels the session, so the transport fails the request) and
+    /// the post-activation cancellation check (whose caller has already been failed with
+    /// `.callingTaskCancelled`). Both are Apple's arms, and both are argued at their sites.
     ///
-    /// **Out of scope, deliberately: the per-actor entitlement check.** Apple's success
-    /// path tests the resolved actor for conformance to
-    /// `XPCSystem.RestrictedAccessDistributedActor` and, if it conforms, checks the peer's
-    /// audit token against that actor's `peerRequirement`. We have no entitlements story
-    /// and no audit token to check against -- an in-process pair has no peer to attest --
-    /// so inventing one here would be worse than its absence. It goes in with the transport
-    /// that can answer `RemoteInterface.auditToken`.
+    /// **The two peer gates are in.** Gate one, ``remoteSatisfiesActorSystemRequirement()``,
+    /// runs first and before the decode, as Apple's does, and a failure **cancels the
+    /// session** rather than answering -- see the call site. Gate two,
+    /// ``peerSatisfiesRequirement(of:)``, runs on the execution task once the target is
+    /// resolved, and a failure *is* answered.
     ///
-    /// Apple's step 3, `waitForLocalInterfaceActivation()`, is likewise absent: it is the
-    /// `ActivationToken` machinery, which arrives with `InitializationOptions`.
+    /// **The target now resolves on the execution task, not here.** Apple's step order is
+    /// `waitForLocalInterfaceActivation()` → `Task.isCancelled` → `resolveSharedActor(at:)`,
+    /// and the activation wait is an `await`, so everything after it has to be inside the
+    /// task -- **including the `Task.isCancelled` check**, which is implemented and not
+    /// merely described; see the guard after the wait for the window it closes. The
+    /// observable difference is only *when* the "nothing is shared at that key" failure is
+    /// written; it is still written.
     func handleReceivedRequest(
         _ payload: Packet.Payload,
         replyUsing reply: @escaping @Sendable (Packet.Payload) -> Void
     ) {
+        // Gate one, before the bytes are read, and it does not reply.
+        //
+        // **Apple cancels the session here** and sends nothing: the failure arm at `+0xba8`
+        // is a tail call to `Session.cancel(because:)` carrying the 71-byte literal below,
+        // read out of `__cstring` at `0x2ad526220`. That is not a dropped request -- the
+        // cancellation fails the peer's outstanding call through the transport, so the peer
+        // learns immediately, with `.underlyingSessionCancelled` rather than
+        // `.executionFailed`. Answering per-request instead would leave the door open for
+        // the *next* request from a peer we have just decided must not talk to us at all.
+        guard remoteSatisfiesActorSystemRequirement() else {
+            cancel(because:
+                "(Internal) Remote peer does not satisfy actor system's peer requirement")
+            return
+        }
+
         let request: InboundRequest
         do {
             request = try payload.decode(as: InboundRequest.self, userInfo: userInfo)
@@ -526,14 +705,6 @@ final class Session: SessionCoding, OutboundSession, InboundSession, @unchecked 
             return
         }
 
-        guard let target = resolveSharedTarget(at: request.targetedSharedActor) else {
-            reply(Self.failure("""
-                no actor is shared at \(request.targetedSharedActor) in this session, so \
-                \(request.remoteCallIdentifier) has nothing to run on
-                """))
-            return
-        }
-
         let callTarget = RemoteCallTarget(request.remoteCallIdentifier)
         // `canThrow` is the presence of `errorType`, which is the only signal the wire
         // carries. See ``ResultHandler/canThrow``, which records that Apple's own
@@ -542,8 +713,16 @@ final class Session: SessionCoding, OutboundSession, InboundSession, @unchecked 
                                     userInfo: userInfo)
         let contents = request.contents
         let id = request.id
+        let key = request.targetedSharedActor
         let system = self.system
-        let priority = Self.executionPriority(requested: request.basePriority)
+        // Both halves of Apple's clamp, both read **here**, on the delivering context --
+        // `Task.currentPriority` is read at `+0x13cc`, before the `Task.immediate` at
+        // `+0x1630`, and reading it inside the spawned task would read the priority that is
+        // being clamped. See ``executionPriority(requested:)`` and
+        // ``executionFloorPriority()``.
+        let floor = Self.executionFloorPriority()
+        let priority = Self.spawnPriority(
+            requested: Self.executionPriority(requested: request.basePriority), floor: floor)
 
         // **Registered before the task can complete, and that is what the lock buys.**
         // The execution's last act is to remove itself, which takes this same lock -- so
@@ -575,6 +754,75 @@ final class Session: SessionCoding, OutboundSession, InboundSession, @unchecked 
         let accepted = lock.withLock { () -> Bool in
             guard pendingInvocationExecutionTasks[id] == nil else { return false }
             pendingInvocationExecutionTasks[id] = Task(priority: priority) { [weak self] in
+                // The floor, applied the way Apple applies it: not as the spawn priority
+                // but as an escalation of the task that is already running, which is why it
+                // can only ever raise. See ``executionFloorPriority()``.
+                //
+                // `UnsafeCurrentTask.escalatePriority(to:)` is SE-0462 and macOS 26+, above
+                // this module's floor. Below it the same value is folded into the spawn
+                // priority instead -- see ``spawnPriority(requested:floor:)``, which is why
+                // `floor` is still read on every path.
+                if #available(macOS 26, iOS 26, tvOS 26, watchOS 26, *) {
+                    withUnsafeCurrentTask { $0?.escalatePriority(to: floor) }
+                }
+
+                guard let self else {
+                    // The session went away between registration and the first hop. Nothing
+                    // can resolve, and the peer is still owed an answer.
+                    reply(Self.failure("""
+                        the session that received \(callTarget.identifier) was released \
+                        before the invocation could be executed
+                        """))
+                    return
+                }
+
+                // Apple's step 3, and the reason resolution is inside this task at all.
+                await self.waitForLocalInterfaceActivation()
+
+                // **Apple's step 4, and it is load-bearing precisely because step 3 is not
+                // cancellation-aware.** `closure #2 +0x358` reads `Task.isCancelled`,
+                // releases the `os_transaction`, and returns -- no reply, no target.
+                //
+                // The window it closes is one S5 *opened*. Before the activation gate,
+                // nothing suspended unboundedly between registering the execution and
+                // running it, so a cancellation that arrived in between had nowhere to land.
+                // Now a peer can park a request on a not-yet-activated session, abandon its
+                // caller (which sends `invocationCancelled`, so this task really is
+                // cancelled), and the target would still run on activation -- side effects
+                // and all -- for a call whose caller was already failed.
+                //
+                // `ActivationEvent.wait()` deliberately does not observe cancellation, which
+                // is Apple's shape too (`await future.value` does not either). That is what
+                // makes the check here the thing doing the work rather than a second belt.
+                //
+                // **No reply, and that is Apple's arm rather than an oversight.** The caller
+                // has already been failed with `.callingTaskCancelled` -- sending it a
+                // response now would be answering a question nobody is still asking, and the
+                // only other listener for this id is a `RequestTable` entry that is gone.
+                // The pending-table entry still has to be drained.
+                guard !Task.isCancelled else {
+                    self.finishPendingInvocationExecutionTask(withID: id)
+                    return
+                }
+
+                guard let target = self.resolveSharedTarget(at: key) else {
+                    reply(Self.failure("""
+                        no actor is shared at \(key) in this session, so \
+                        \(callTarget.identifier) has nothing to run on
+                        """))
+                    self.finishPendingInvocationExecutionTask(withID: id)
+                    return
+                }
+
+                // Gate two. Per resolved target, so a restricted actor and an unrestricted
+                // one on the same session are answered differently for the same peer.
+                guard self.peerSatisfiesRequirement(of: target.instance) else {
+                    // Apple's literal, `0x2ad5262b0`, 37 bytes.
+                    reply(Self.failure("Failed actor's peer requirement check"))
+                    self.finishPendingInvocationExecutionTask(withID: id)
+                    return
+                }
+
                 do {
                     try await target.thunk(target.instance, system, callTarget,
                                            contents, handler)
@@ -606,7 +854,7 @@ final class Session: SessionCoding, OutboundSession, InboundSession, @unchecked 
                 // orphaned execution is a leaked session graph, not just a leaked task.
                 // (The `[weak self]` on the transport handlers in `init` is a different
                 // thing and *is* load-bearing -- the transport outlives nothing there.)
-                self?.finishPendingInvocationExecutionTask(withID: id)
+                self.finishPendingInvocationExecutionTask(withID: id)
             }
             return true
         }
@@ -623,14 +871,27 @@ final class Session: SessionCoding, OutboundSession, InboundSession, @unchecked 
 
     /// The priority to run an inbound execution at.
     ///
-    /// **Half of Apple's clamp, and the half that is resolved.** The spec records
-    /// `handleReceivedRequest` clamping "against `Task.currentPriority` and
-    /// `TaskPriority.userInitiated` via `Comparable.<`" before
-    /// `Task.immediate(name:priority:executorPreference:operation:)`. What role
-    /// `Task.currentPriority` plays -- floor, tie-break, or the other operand of the same
-    /// `min` -- is **not** resolved, and is deliberately not guessed at: an absent
-    /// `basePriority` runs at the ambient priority, which is what `nil` means to
-    /// `Task(priority:)`.
+    /// **RESOLVED, and `Task.currentPriority` is not part of this clamp at all.** The spec
+    /// records `handleReceivedRequest` clamping "against `Task.currentPriority` **and**
+    /// `TaskPriority.userInitiated` via `Comparable.<`" and leaves the role of the first
+    /// operand open. Disassembling `0x2ad512a04` shows two *separate* clamps, not one
+    /// three-operand one, and only the second involves `currentPriority`:
+    ///
+    /// - `+0x11b4 … +0x13bc`, this function. `TaskPriority.userInitiated.getter`, then
+    ///   `Comparable.<` with lhs `userInitiated` and rhs the request's `basePriority`
+    ///   payload; the true arm takes `userInitiated`, the false arm copies `basePriority`.
+    ///   Wrapped in a `getEnumTagSinglePayload` test that preserves `nil` by storing tag 1.
+    ///   The buffer this writes is `[x29-0x100]`, and `[x29-0x100]` is the `priority:`
+    ///   argument of the `Task.immediate` at `+0x1630`. So the spawn priority is exactly
+    ///   `basePriority.map { min($0, .userInitiated) }` -- what this function already was.
+    /// - `+0x13c0 … +0x1438`, ``executionFloorPriority()``. A second, independent
+    ///   `min(Task.currentPriority, .userInitiated)`, which is *not* combined with the
+    ///   first: it is copied into the execution closure's context and applied inside it.
+    ///
+    /// The brief's candidate reading, `max(currentPriority, min(requested, .userInitiated))`,
+    /// is close and wrong in two ways that matter: `currentPriority` is itself capped at
+    /// `.userInitiated` before it is used as a floor, and it is applied by escalating a task
+    /// that is already running rather than by choosing its base priority.
     ///
     /// **The ceiling is not a scheduling nicety; without it a peer can abort this
     /// process.** `basePriority` arrives as a bare `UInt8` and `TaskPriority.init(rawValue:)`
@@ -643,9 +904,68 @@ final class Session: SessionCoding, OutboundSession, InboundSession, @unchecked 
     /// on a request whose only unusual field is `"basePriority": 255`. So reading the field
     /// at all is only safe *because* of this line. Before this slice the field was decoded
     /// and discarded, which was safe by accident and divergent in silence.
-    private static func executionPriority(requested: TaskPriority?) -> TaskPriority? {
+    static func executionPriority(requested: TaskPriority?) -> TaskPriority? {
         guard let requested else { return nil }
         return min(requested, .userInitiated)
+    }
+
+    /// The **other** half of Apple's clamp: the floor an inbound execution is escalated to.
+    ///
+    /// `min(Task.currentPriority, .userInitiated)`, read at `0x2ad513dc0..0x2ad513e38`:
+    /// `Task.currentPriority.getter` into one stack buffer, `TaskPriority.userInitiated.getter`
+    /// into another, `Comparable.<(userInitiated, currentPriority)`, then a `csel` pair that
+    /// keeps one address and destroys the other. Which one survives is not a guess -- the
+    /// address in `x0` is passed straight to the value witness at VWT`+0x08`, which is
+    /// `destroy`, and the address kept in `x19` is the one `initializeWithTake` (VWT`+0x20`)
+    /// then copies into the execution closure's context. The survivor is the **smaller**.
+    /// (`TaskPriority` is address-only here because it is resilient, which is why the whole
+    /// sequence moves pointers around instead of bytes.)
+    ///
+    /// Inside the execution closure it is applied at `0x2ad5154b4`:
+    /// `withUnsafeCurrentTask { $0!.escalatePriority(to: floor) }`, immediately after
+    /// `os_transaction_create` and before `waitForLocalInterfaceActivation()`.
+    ///
+    /// **Why a floor and not a second ceiling.** `escalatePriority` only ever raises, so the
+    /// pair composes to `min(max(requested, currentPriority), .userInitiated)`: a peer can
+    /// ask for *less* than the delivering context's priority and not get it, and can ask for
+    /// more than `.userInitiated` and not get that either. What it buys concretely is that a
+    /// peer cannot make this process do its work at `.background` when the work was
+    /// delivered on a `.userInitiated` queue -- priority is the one field a peer chooses
+    /// that costs *us* rather than it.
+    ///
+    /// Read on the delivering context, deliberately: `Task.currentPriority` inside the
+    /// spawned task would be the task's own priority, which is the thing being clamped.
+    static func executionFloorPriority() -> TaskPriority {
+        min(Task.currentPriority, .userInitiated)
+    }
+
+    /// What to hand `Task(priority:)`, given both halves of the clamp.
+    ///
+    /// Apple's answer is "the ceiling, and nothing else" -- the floor arrives later, as an
+    /// escalation. That is reproduced verbatim where the escalation API exists. Where it
+    /// does not (`UnsafeCurrentTask.escalatePriority(to:)` is SE-0462, macOS 26+, and this
+    /// module's floor is macOS 14) the floor has to be applied at the only other moment
+    /// there is, which is here.
+    ///
+    /// The two are not identical and the difference is worth naming rather than papering
+    /// over: escalating a running task raises its priority *and* propagates that to
+    /// anything already waiting on it, while spawning higher never has anything to
+    /// propagate to. For a task that has not started yet the observable priority is the
+    /// same, which is why this is a sound fallback and not a second behaviour.
+    ///
+    /// `nil` requested means "ambient" to `Task(priority:)`. The fallback substitutes `floor`
+    /// for it, and that is **not** the same thing: `floor` is the delivering context's
+    /// priority *capped* at `.userInitiated`, where Apple passes `nil` and lets escalation
+    /// only ever raise. So on a delivering context above `.userInitiated` this fallback runs
+    /// the execution *lower* than Apple would. The direction is the safe one -- a peer cannot
+    /// gain priority from it -- and it is unreachable wherever
+    /// `UnsafeCurrentTask.escalatePriority(to:)` exists, which is every platform this package
+    /// is currently built for. Named rather than smoothed over, because "capped, unlike
+    /// Apple's" is the kind of difference that gets read as "exactly Apple's" a slice later.
+    static func spawnPriority(requested: TaskPriority?, floor: TaskPriority) -> TaskPriority? {
+        if #available(macOS 26, iOS 26, tvOS 26, watchOS 26, *) { return requested }
+        guard let requested else { return floor }
+        return max(requested, floor)
     }
 
     /// Apple's `handleReceivedNotification(_:)`: decode, and dispatch the three cases.
@@ -752,6 +1072,14 @@ final class Session: SessionCoding, OutboundSession, InboundSession, @unchecked 
             byKey.removeAll()
             keyForLocal.removeAll()
         }
+        // **Apple's, and not tidiness.** Their `cancellationCompleted()` fulfils the
+        // `cancellationEvent` promise *and* the `unownedLocalInterfaceActivationEvent` one
+        // (`ldp x8,x20,[self,#0x48]` then `[self,#0x60]`). Without this an execution parked
+        // in `waitForLocalInterfaceActivation()` on a session that is never activated would
+        // survive transport death, never reply, and hold the session graph alive -- the
+        // same shape as the orphaned-execution leak the duplicate-id guard exists for.
+        // Released *after* the table is cleared, so a waker resolves nothing.
+        activationEvent.post()
     }
 }
 
@@ -783,7 +1111,15 @@ extension XPCActorSystem {
     /// The session is *not* retained by the system. Apple's `XPCSystem` does not hold its
     /// sessions either -- the transport holds one weakly, and everything else that keeps
     /// a session alive is a caller. Dropping the returned value drops the session.
-    func makeSession(over transport: Transport) -> Session {
-        Session(system: self, transport: transport)
+    /// - Parameter localInterfaceActivated: whether inbound executions may resolve targets
+    ///   straight away. `false` is Apple's own starting state -- both their initialisers
+    ///   leave `ownedLocalInterfaceActivationEvent` `nil` and `readyToReceive(_:)` is what
+    ///   opens the gate -- and `true` is this module's default because there is no
+    ///   `LocalInterface` here to drive it, so defaulting closed would make every session a
+    ///   session that never answers. See ``Session/activateLocalInterface()``.
+    func makeSession(over transport: Transport,
+                     localInterfaceActivated: Bool = true) -> Session {
+        Session(system: self, transport: transport,
+                localInterfaceActivated: localInterfaceActivated)
     }
 }

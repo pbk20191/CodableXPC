@@ -79,4 +79,78 @@ final class XPCRawTransportTests: XCTestCase {
         box.transport?.cancel(reason: "test over")
         listener.cancel()
     }
+
+    /// Keeps the raw transport as well, so the attestation can be read off the accepted
+    /// side of a live connection.
+    final class RawBox: @unchecked Sendable {
+        var raw: XPCRawTransport?
+        var transport: Transport?
+    }
+
+    /// **The peer check, over a real connection, with nothing stubbed.**
+    ///
+    /// This is the test behind the claim that Apple's overlay gives us what the gates need.
+    /// `XPCRawTransport.peerAttestation` reads `XPCSession.auditToken` and
+    /// `audit_token_t.isValid` through symbols that `libswiftXPC` exports and the public
+    /// `.swiftinterface` does not declare; here they run against a connection libxpc
+    /// actually established, and the token comes back **valid** -- which is the one thing a
+    /// synthesised `XPCDictionary` cannot show (`PeerGateTests` pins that an unconnected
+    /// dictionary's token is invalid, i.e. that "valid" here means something).
+    ///
+    /// The peer is this same process, so what it is asked is the pair of questions whose
+    /// answers do not depend on how the test binary happens to be signed: a requirement the
+    /// checker cannot express (`nil`), and an entitlement nothing has (`false`).
+    func testPeerAttestationOverRealXPCIsTheLiveConnectionsAuditToken() async throws {
+        guard #available(macOS 26, macCatalyst 26, *) else {
+            throw XCTSkip("XPCPeerRequirement and the audit-token accessors are macOS 26+")
+        }
+        let serverReady = expectation(description: "server transport built")
+        let box = RawBox()
+
+        let listener = XPCListener(targetQueue: nil, options: .inactive) { request in
+            let (decision, raw) = XPCRawTransport.accepting(request)
+            let transport = Transport(debugName: "server", role: .responder, rawTransport: raw)
+            transport.inboundRequestHandler = { _, payload, reply in
+                guard let ping = try? payload.decode(as: Ping.self),
+                      let body = try? Packet.Payload(encoding: Ping(value: ping.value + 1),
+                                                     userInfo: [:])
+                else { return }
+                reply(body)
+            }
+            box.raw = raw
+            box.transport = transport
+            Task { try? await transport.activate() }
+            serverReady.fulfill()
+            return decision
+        }
+        try listener.activate()
+
+        let clientRaw = try XPCRawTransport.connecting(to: listener.endpoint)
+        let client = Transport(debugName: "client", role: .initiator, rawTransport: clientRaw)
+        try await client.activate()
+
+        // The session is not established until the first message, so one round trip first.
+        let request = try Packet.Payload(encoding: Ping(value: 1), userInfo: [:])
+        async let pending = client.sendRequest(seq: client.allocateSeq(), request)
+        await fulfillment(of: [serverReady], timeout: 5)
+        guard case .reply = await pending else { return XCTFail("expected a reply") }
+
+        for (side, attestation) in [("server", box.raw?.peerAttestation),
+                                    ("client", clientRaw.peerAttestation)] {
+            let real = try XCTUnwrap(attestation,
+                                     "\(side): a live XPC connection must attest to its peer")
+            XCTAssertTrue(real is AuditTokenAttestation, "\(side): \(type(of: real))")
+            XCTAssertNil(real.satisfies(PeerRequirement("nothing can express this")),
+                         "\(side): an inexpressible requirement must not read as satisfied")
+            XCTAssertEqual(
+                real.satisfies(PeerRequirement(.hasEntitlement("com.example.not-granted"),
+                                               describedAs: "ungranted")),
+                false,
+                "\(side): an entitlement nothing holds must not read as satisfied")
+        }
+
+        client.cancel(reason: "test over")
+        box.transport?.cancel(reason: "test over")
+        listener.cancel()
+    }
 }
