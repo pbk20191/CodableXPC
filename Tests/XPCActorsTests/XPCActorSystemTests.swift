@@ -3,8 +3,10 @@ import XCTest
 import Distributed
 @testable import XPCActors
 
-/// The identity half of `DistributedActorSystem`, plus the three call requirements that
-/// are knowingly stubbed until the transport-wired session lands.
+/// The identity half of `DistributedActorSystem`, plus what is left knowingly stubbed --
+/// which is now only the inbound trio: `invokeHandlerOnReturn`, `InvocationDecoder` and
+/// `ResultHandler`. The outbound path is real, and is tested in
+/// `OutboundInvocationTests`.
 ///
 /// Read the *shape* of the resolve tests as the point: `resolve` has three outcomes and
 /// they are not interchangeable. A `.local` id that is not in the table **throws** --
@@ -155,7 +157,7 @@ final class XPCActorSystemTests: XCTestCase {
 
     func testARemoteIDFromOneOfOurOwnSessionsAsksForAProxy() throws {
         let system = XPCActorSystem("proxy")
-        let session = Session(registry: system.registry, systemID: system.id)
+        let session = system.makeDetachedSession()
         let id = session.remoteID(for: .dynamic(ID64(rawValue: 1)))
 
         XCTAssertNil(try system.resolve(id: id, as: Probe.self))
@@ -166,7 +168,7 @@ final class XPCActorSystemTests: XCTestCase {
     func testARemoteIDFromAnotherSystemsSessionThrows() throws {
         let system = XPCActorSystem("mine")
         let other = XPCActorSystem("theirs")
-        let theirSession = Session(registry: other.registry, systemID: other.id)
+        let theirSession = other.makeDetachedSession()
         let id = theirSession.remoteID(for: .dynamic(ID64(rawValue: 1)))
 
         XCTAssertThrowsError(try system.resolve(id: id, as: Probe.self)) { error in
@@ -186,7 +188,7 @@ final class XPCActorSystemTests: XCTestCase {
     /// it is worth a test.
     func testAProxyIsBornAndDiesWithoutReachingTheResignTrap() throws {
         let system = XPCActorSystem("proxy")
-        let session = Session(registry: system.registry, systemID: system.id)
+        let session = system.makeDetachedSession()
         let id = session.remoteID(for: .dynamic(ID64(rawValue: 1)))
 
         do {
@@ -249,7 +251,7 @@ final class XPCActorSystemTests: XCTestCase {
     /// still keeping it alive -- paying for the strong hold and not getting it.
     func testASharedActorResolvesThroughItsSessionAfterBeingResigned() throws {
         let system = XPCActorSystem("shared")
-        let session = Session(registry: system.registry, systemID: system.id)
+        let session = system.makeDetachedSession()
         let probe = Probe(actorSystem: system)
         let localID = try local(probe.id)
 
@@ -266,15 +268,21 @@ final class XPCActorSystemTests: XCTestCase {
     /// A key the session never minted names nothing, rather than something.
     func testResolveSharedActorReturnsNilForAKeyItNeverMinted() {
         let system = XPCActorSystem("shared")
-        let session = Session(registry: system.registry, systemID: system.id)
+        let session = system.makeDetachedSession()
         XCTAssertNil(session.resolveSharedActor(at: .dynamic(ID64(rawValue: 7))))
         XCTAssertNil(session.resolveSharedActor(at: .exportedRawValue("nope")))
     }
 
-    // MARK: - the stubs
+    // MARK: - the call requirements refuse a local actor
 
-    func testRemoteCallThrowsRatherThanReturningSomethingPlausible() async throws {
-        let system = XPCActorSystem("stub")
+    // These two used to assert that `remoteCall` and `remoteCallVoid` were stubs, by
+    // passing a **local** actor -- which is the one argument for which they would have
+    // thrown anyway. They pinned the stub, not the path. They now pin the refusal that
+    // was always the real answer for a local actor, and the path itself is covered in
+    // `OutboundInvocationTests`, over a transport, against bytes a peer wrote.
+
+    func testRemoteCallOnALocalActorThrowsApplesMessage() async throws {
+        let system = XPCActorSystem("local")
         let probe = Probe(actorSystem: system)
         var encoder = system.makeInvocationEncoder()
         do {
@@ -286,12 +294,13 @@ final class XPCActorSystemTests: XCTestCase {
                 returning: Int.self)
             XCTFail("remoteCall returned \(value) instead of throwing")
         } catch {
-            XCTAssertTrue("\(error)".contains("not wired"), "\(error)")
+            XCTAssertEqual(error.reason, .executionFailed)
+            XCTAssertTrue(error.message.contains("Remote call on a local actor."), error.message)
         }
     }
 
-    func testRemoteCallVoidThrows() async throws {
-        let system = XPCActorSystem("stub")
+    func testRemoteCallVoidOnALocalActorThrowsApplesMessage() async throws {
+        let system = XPCActorSystem("local")
         let probe = Probe(actorSystem: system)
         var encoder = system.makeInvocationEncoder()
         do {
@@ -302,9 +311,11 @@ final class XPCActorSystemTests: XCTestCase {
                 throwing: TestError.self)
             XCTFail("remoteCallVoid returned instead of throwing")
         } catch {
-            XCTAssertTrue("\(error)".contains("not wired"), "\(error)")
+            XCTAssertTrue("\(error)".contains("Remote call on a local actor."), "\(error)")
         }
     }
+
+    // MARK: - the stubs that are left, all inbound
 
     func testInvokeHandlerOnReturnThrows() async throws {
         let system = XPCActorSystem("stub")

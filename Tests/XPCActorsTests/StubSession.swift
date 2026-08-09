@@ -1,5 +1,26 @@
 @testable import XPCActors
 
+@available(macOS 14, *)
+extension XPCActorSystem {
+
+    /// A real ``Session`` over a transport with nobody on the other end.
+    ///
+    /// For the tests that are about identity and sharing, where the transport is only
+    /// there because a session has one. Nothing is ever sent, so the far end is dropped
+    /// and neither end is activated -- a send would fail rather than hang, which is the
+    /// right shape for a test that does not intend to send.
+    ///
+    /// A session used to be constructible from a registry and a system id, which is how
+    /// these call sites were spelled before; it now comes from the system that owns it,
+    /// so this is the whole of what those call sites need.
+    func makeDetachedSession(debugName: String = "detached") -> Session {
+        let (near, _) = InProcessRawTransport.makePair(debugName: debugName)
+        return makeSession(over: Transport(debugName: debugName,
+                                           role: .initiator,
+                                           rawTransport: near))
+    }
+}
+
 /// Enough of a session for an `ActorID` to code itself against.
 ///
 /// One copy, because there were three and they differed only in how they counted:

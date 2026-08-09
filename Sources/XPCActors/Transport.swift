@@ -16,6 +16,26 @@ public enum TransportRole: Sendable {
     case responder
 }
 
+/// The session on the receiving end of a transport.
+///
+/// Apple's `InboundSessionProtocol`, which is class-bound and has six requirements:
+/// `handleReceivedRequest`, `handleReceivedNotification`, `handleActorShared`,
+/// `handleTransportCancellation`, `actorSystem` and `isBidirectional`. Only the one this
+/// slice has a caller for is here; the rest arrive with the inbound execution path, and
+/// adding a requirement nothing invokes would only be a stub with a protocol around it.
+///
+/// It exists at all so that ``Transport`` can tell its session the pipe is gone without
+/// knowing what a session is -- and so it can hold it **weakly**, which a stored closure
+/// could not do: a session holds its transport strongly, so a closure capturing the
+/// session would make the pair immortal.
+@available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
+public protocol InboundSession: AnyObject, Sendable {
+    /// The pipe died, from either end. Apple's does two things -- cancel the invocation
+    /// executions this process started for the peer, and complete the cancellation,
+    /// which empties the exported-actor table.
+    func handleTransportCancellation()
+}
+
 /// Packet framing and request correlation.
 ///
 /// Every packet is sent one-way; a response is an ordinary inbound packet matched by
@@ -51,6 +71,45 @@ public final class Transport: @unchecked Sendable {
 
     private var _inboundRequestHandler: RequestHandler?
     private var _inboundNotificationHandler: NotificationHandler?
+    private weak var _inboundSession: (any InboundSession)?
+
+    /// The session speaking over this transport, held **weakly**.
+    ///
+    /// Apple's `Transport.(inboundSession)` is a weak `InboundSessionProtocol?` that
+    /// `Session.init(actorSystem:transport:options:)` assigns itself into
+    /// (`swift_unknownObjectWeakAssign` into `transport+0x10`). The direction of the
+    /// strength is the whole of it: the session owns the transport, so the back-pointer
+    /// must not own the session.
+    ///
+    /// Read-only from outside, because Apple's field is `private` and has exactly one
+    /// writer. See ``install(inboundSession:)``.
+    public var inboundSession: (any InboundSession)? { lock.withLock { _inboundSession } }
+
+    /// Seat the session that speaks over this transport. The one writer, called from
+    /// `Session`'s initializer.
+    ///
+    /// **Traps on a second live install**, and the alternative is worse than a trap: a
+    /// silent overwrite orphans the first session, which would then never be told the pipe
+    /// died and would hold its exported actors strongly for the life of the process. There
+    /// is no correct recovery and nothing a peer can do to reach it -- the only way here is
+    /// calling `makeSession(over:)` twice on one transport, in our own code, which is the
+    /// same criterion `actorReady`'s trap uses.
+    ///
+    /// A *dead* previous session is not an error: the weak reference is already `nil`, so
+    /// re-using a transport whose session has gone is allowed. So is re-installing the
+    /// same session, which makes the call idempotent.
+    func install(inboundSession session: any InboundSession) {
+        lock.withLock {
+            if let existing = _inboundSession, existing !== session {
+                preconditionFailure("""
+                    this transport already has a live session (\(existing)); a second one \
+                    would silently orphan the first, which would then never learn that the \
+                    transport had died
+                    """)
+            }
+            _inboundSession = session
+        }
+    }
 
     public var inboundRequestHandler: RequestHandler? {
         get { lock.withLock { _inboundRequestHandler } }
@@ -102,7 +161,16 @@ public final class Transport: @unchecked Sendable {
         }
     }
 
+    /// Both teardown paths -- our own `cancel` and the peer's death -- funnel here, and
+    /// `beginCancelling` has already made sure this runs once.
+    ///
+    /// The session is told **first**, and synchronously. Failing the request table is a
+    /// hop through the actor, so a caller that observes its own failure would otherwise
+    /// be able to see a session that had not yet cleared its exported-actor table. Apple
+    /// runs `handleTransportCancellation` on the transport's serial queue for the same
+    /// class of reason.
     private func failEverything(reason: String) {
+        inboundSession?.handleTransportCancellation()
         Task { await requests.failAll(with: .transportCancelled(message: reason)) }
     }
 

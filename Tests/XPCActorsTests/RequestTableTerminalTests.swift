@@ -22,25 +22,31 @@ final class RequestTableTerminalTests: XCTestCase {
     /// Every call here is one that *hung* before the fix, so a regression must fail
     /// rather than wedge the suite. Two seconds is far beyond any legitimate path:
     /// nothing in these tests touches a real transport.
+    ///
+    /// **Abandons rather than races.** An earlier version put the body and a sleeper in
+    /// a `withTaskGroup` and cancelled the group on the first result — which is unsound,
+    /// because `withTaskGroup` awaits every child on the way out, so a genuinely parked
+    /// `CheckedContinuation` hangs the helper too. It happened to work here only because
+    /// `waitForReply` installs a cancellation handler that `cancelAll()` could fire; a
+    /// mutation that empties that handler brought the hang straight back, which is
+    /// exactly the failure this helper exists to prevent. Now the body runs in an
+    /// unstructured `Task` whose result is polled, and a body that never finishes is
+    /// left running rather than awaited.
     private func withTimeout<T: Sendable>(
         _ seconds: Double = 2,
         file: StaticString = #filePath, line: UInt = #line,
         _ body: @escaping @Sendable () async -> T
     ) async -> T? {
-        await withTaskGroup(of: T?.self) { group in
-            group.addTask { await body() }
-            group.addTask {
-                try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
-                return nil
-            }
-            let first = await group.next() ?? nil
-            group.cancelAll()
-            if first == nil {
-                XCTFail("timed out after \(seconds)s -- the caller was never resumed",
-                        file: file, line: line)
-            }
-            return first
+        let box = ResultBox<T>()
+        let task = Task { box.value = await body() }
+        defer { task.cancel() }
+
+        let finished = await waitUntil(timeout: seconds) { box.value != nil }
+        if !finished {
+            XCTFail("timed out after \(seconds)s -- the caller was never resumed",
+                    file: file, line: line)
         }
+        return box.value
     }
 
     func testAWaiterRegisteredAfterFailAllStillGetsAnOutcome() async {
@@ -103,4 +109,10 @@ final class RequestTableTerminalTests: XCTestCase {
 
 private final class Box: @unchecked Sendable {
     var value = false
+}
+
+/// Carries the body's result out of the unstructured task. Safe because `waitUntil`
+/// establishes the ordering: nothing reads `value` except after observing it non-nil.
+private final class ResultBox<T>: @unchecked Sendable {
+    var value: T?
 }
