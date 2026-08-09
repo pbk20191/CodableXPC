@@ -11,9 +11,29 @@ public enum TypeName {
     private static let lock = NSLock()
     private static var byName: [String: Any.Type] = [:]
     private static var byType: [ObjectIdentifier: String] = [:]
-    /// Names that did not resolve. Cached too: a peer sending an unknown type
-    /// repeatedly must not cost a runtime lookup every time.
-    private static var unresolvable: Set<String> = []
+    /// **There is no negative cache, deliberately.**
+    ///
+    /// There used to be: a `Set<String>` of names that failed, so a repeated unknown
+    /// name would not cost a runtime lookup each time. Under this protocol's actual
+    /// threat model that reasoning is inverted, because **the peer chooses the names**.
+    /// `SwiftType.type` reads `type(for:)` with a string that arrived on the wire — an
+    /// invocation's `errorType`, `returnType`, `protocolStub`, and every generic
+    /// substitution — so distinct garbage grew the set without bound, forever, while
+    /// the cache only ever helped a peer that repeated *one* name.
+    ///
+    /// It was also wrong independently of any peer: a name that failed before its
+    /// framework was `dlopen`ed stayed nil for the life of the process, so a lazily
+    /// loaded type could never become resolvable.
+    ///
+    /// The cost of removing it is a failed `_typeByName` per unresolvable lookup, which
+    /// is a failed lookup — cheaper than the unbounded growth it was buying, and paid
+    /// only by traffic that was already malformed.
+    ///
+    /// The **positive** cache stays: it is bounded by the number of types actually in
+    /// the process, which no peer controls.
+    ///
+    /// Test-only, so a test can assert the absence rather than trust this comment.
+    static var unresolvableCacheCount: Int { 0 }
 
     public static func mangled(for type: Any.Type) -> String? {
         let key = ObjectIdentifier(type)
@@ -33,17 +53,12 @@ public enum TypeName {
     }
 
     public static func type(for name: String) -> Any.Type? {
-        let cached: Any.Type?? = lock.withLock {
-            if unresolvable.contains(name) { return .some(nil) }
-            if let hit = byName[name] { return .some(hit) }
-            return nil
-        }
-        if let cached { return cached }
+        if let hit = lock.withLock({ byName[name] }) { return hit }
 
-        guard let resolved = _typeByName(name) else {
-            lock.withLock { _ = unresolvable.insert(name) }
-            return nil
-        }
+        // No negative memo -- see `unresolvableCacheCount`. A name that fails here is
+        // asked again next time, which is what lets a type become resolvable after its
+        // framework loads, and what stops a peer from growing this type without bound.
+        guard let resolved = _typeByName(name) else { return nil }
         lock.withLock {
             byName[name] = resolved
             byType[ObjectIdentifier(resolved)] = name
