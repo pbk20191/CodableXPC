@@ -64,7 +64,7 @@ final class PacketBodyTests: XCTestCase {
         XCTAssertNil(decoded.contents.protocolStub)
         XCTAssertEqual(decoded.contents.genericSubsitutions, [])
 
-        var arguments = decoded.contents.argumentsContainer
+        var arguments = try XCTUnwrap(decoded.contents.argumentsContainer)
         XCTAssertEqual(try arguments.decode(Int.self), 42)
         XCTAssertEqual(try arguments.decode(String.self), "hello")
     }
@@ -99,9 +99,9 @@ final class PacketBodyTests: XCTestCase {
 
         let payload = try Packet.Payload(
             encoding: request, userInfo: [.xpcActorSession: session])
-        var arguments = try payload
+        var arguments = try XCTUnwrap(try payload
             .decode(as: InboundRequest.self, userInfo: [.xpcActorSession: session])
-            .contents.argumentsContainer
+            .contents.argumentsContainer)
         // The local id was shared dynamically and comes back as a remote proxy id.
         let recovered = try arguments.decode(ActorID.self)
         guard case .remote(let remote) = recovered.raw else {
