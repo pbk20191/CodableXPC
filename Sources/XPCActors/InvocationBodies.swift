@@ -108,7 +108,15 @@ public struct InboundInvocation: Decodable {
     public let returnType: SwiftType?
     /// `var` because decoding an element advances the container's own cursor -- that
     /// cursor is the decoder's entire state, which is why no index is tracked.
-    public var argumentsContainer: any UnkeyedDecodingContainer
+    ///
+    /// **Optional, and an absent `arguments` key is not a decode failure.** Apple's
+    /// `EncodedInvocationDecoder.init(from:)` tests `container.contains(.arguments)` and
+    /// leaves the field `nil` when the key is missing; the refusal comes later, from
+    /// `decodeNextArgument` ("Found no arguments from decoder."), and only if an argument
+    /// is actually asked for. A request with no `arguments` key against a zero-argument
+    /// target therefore *succeeds* against a real peer. This was non-optional until S4 and
+    /// rejected the whole request, which refused traffic Apple accepts.
+    public var argumentsContainer: (any UnkeyedDecodingContainer)?
 
     public init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: InvocationCodingKeys.self)
@@ -117,7 +125,9 @@ public struct InboundInvocation: Decodable {
                                                    forKey: .genericSubsitutions)
         errorType = try container.decodeIfPresent(SwiftType.self, forKey: .errorType)
         returnType = try container.decodeIfPresent(SwiftType.self, forKey: .returnType)
-        argumentsContainer = try container.nestedUnkeyedContainer(forKey: .arguments)
+        argumentsContainer = container.contains(.arguments)
+            ? try container.nestedUnkeyedContainer(forKey: .arguments)
+            : nil
     }
 }
 

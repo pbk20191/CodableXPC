@@ -95,7 +95,7 @@ final class Session: SessionCoding, OutboundSession, InboundSession, @unchecked 
     /// Where a local id is turned into the instance behind it -- the system's table, not
     /// one of our own. Apple's `addSharedActor` likewise calls
     /// `XPCSystem.resolve(id: RawActorID.Local)` on `session.actorSystem`.
-    private var registry: ActorRegistry<Void> { system.registry }
+    private var registry: ActorRegistry<InboundThunk> { system.registry }
 
     /// What we know about an actor we have exported.
     ///
@@ -115,6 +115,11 @@ final class Session: SessionCoding, OutboundSession, InboundSession, @unchecked 
         /// holding a key must not find the actor gone. Released wholesale by
         /// ``cancellationCompleted()``.
         let instance: AnyObject
+        /// How to *call* that instance. Recorded here rather than looked up at execution
+        /// time on purpose: the registry is weak and `resignID` empties it, so an actor
+        /// this table is still keeping alive could otherwise be reachable but uncallable.
+        /// See ``resolveSharedActor(at:)``, which states that window.
+        let thunk: InboundThunk
     }
 
     /// One lock over the whole of the mutable state, taken by both directions of the
@@ -151,6 +156,26 @@ final class Session: SessionCoding, OutboundSession, InboundSession, @unchecked 
     /// Ids run from 1 and an overflow traps, which `+= 1` on a `UInt64` gives for free.
     private var lastID: UInt64 = 0
 
+    /// **Keyed by the request body's `ID64`, never by the envelope's `headerID`.** Apple's
+    /// `Session.pendingInvocationExecutionTasks` (+0xa0), and the id
+    /// `RemoteNotification.invocationCancelled(id:)` names -- which is the whole reason
+    /// the request id is minted from this session's own generator rather than taken from
+    /// the transport.
+    ///
+    /// **Under ``lock``, where Apple's is a bare dictionary with none.** Apple's invariant
+    /// is "called on the transport's serial queue", asserted with a Dispatch precondition
+    /// whose false arm traps. Our `Transport` has no such queue to offer -- packets arrive
+    /// on whatever queue the raw transport delivers on, and the execution task's own
+    /// completion writes here from the cooperative pool -- so reproducing the design
+    /// without the queue would give an unsynchronised dictionary whose invariant nothing
+    /// enforces, which is worse than either half. The lock is the same one the shared-actor
+    /// table takes; folding them costs nothing, because no path takes one and then wants
+    /// the other.
+    ///
+    /// Apple's four accessors trap on a `.local` session. There is no `.local` session here
+    /// -- see ``transport`` -- so there is nothing to trap on.
+    private var pendingInvocationExecutionTasks: [ID64: Task<Void, Never>] = [:]
+
     private var isCancelled = false
 
     /// `fileprivate`: sessions come from ``XPCActorSystem/makeSession(over:)``, which is
@@ -163,10 +188,30 @@ final class Session: SessionCoding, OutboundSession, InboundSession, @unchecked 
         // Weakly, as Apple's initialiser does it (`swift_unknownObjectWeakAssign` into
         // `transport+0x10`). We hold the transport; it must not hold us back.
         transport.install(inboundSession: self)
+        // The receiving half. **Weak captures, and that is the whole point**: a session
+        // holds its transport strongly, so a closure that captured `self` strongly would
+        // make the pair immortal -- the same hazard `InboundSession`'s weak back-pointer
+        // exists to avoid, reappearing one layer up.
+        //
+        // The envelope id the request handler is given is deliberately dropped. Inbound
+        // correlation is the request *body's* id; the envelope's is the transport's own
+        // business and the reply closure already carries it.
+        transport.inboundRequestHandler = { [weak self] _, payload, reply in
+            self?.handleReceivedRequest(payload, replyUsing: reply)
+        }
+        transport.inboundNotificationHandler = { [weak self] payload in
+            self?.handleReceivedNotification(payload)
+        }
     }
 
     /// How many actors this session currently exports.
     var sharedActorCount: Int { lock.withLock { byKey.count } }
+
+    /// Internal for tests: the request ids of the executions this side is running for the
+    /// peer. The set a `RemoteNotification.invocationCancelled(id:)` names into.
+    var pendingInvocationIDs: Set<ID64> {
+        lock.withLock { Set(pendingInvocationExecutionTasks.keys) }
+    }
 
     /// The next number from the session's generator. Callers hold ``lock``.
     private func nextID() -> ID64 {
@@ -214,11 +259,12 @@ final class Session: SessionCoding, OutboundSession, InboundSession, @unchecked 
         // accident. Nothing between here and the insert can invalidate the answer that
         // matters -- we are about to hold the instance strongly ourselves.
         guard let entry = registry.lookup(local) else { return nil }
-        return lock.withLock {
+        return lock.withLock { () -> SharedActorKey? in
             guard !isCancelled else { return nil }
             if let existing = keyForLocal[local] { return existing }
             let key = SharedActorKey.dynamic(nextID())
-            byKey[key] = SharedActor(local: local, instance: entry.instance)
+            byKey[key] = SharedActor(local: local, instance: entry.instance,
+                                     thunk: entry.thunk)
             keyForLocal[local] = key
             return key
         }
@@ -285,10 +331,24 @@ final class Session: SessionCoding, OutboundSession, InboundSession, @unchecked 
     /// because only they have keys in this table.
     ///
     /// `AnyObject` rather than Apple's `any DistributedActor` because that is what the
-    /// table holds; the caller that will need the stronger type is the one that also
-    /// needs the invocation thunk.
+    /// table holds.
+    ///
+    /// **A test seam, and it has no production caller.** The inbound execution path needs
+    /// the invocation thunk as well as the instance, so it goes through
+    /// ``resolveSharedTarget(at:)``; this is what the tests use to ask "is *that* actor the
+    /// one behind this key", which is an identity question the thunk would only get in the
+    /// way of. Kept rather than folded in because splitting it is what lets the execution
+    /// path take one critical section instead of two.
     func resolveSharedActor(at key: SharedActorKey) -> AnyObject? {
         lock.withLock { byKey[key]?.instance }
+    }
+
+    /// The lookup the inbound execution path makes: the instance **and** the invocation
+    /// thunk, in one critical section, so the two cannot come from different states of the
+    /// table.
+    private func resolveSharedTarget(at key: SharedActorKey)
+    -> (instance: AnyObject, thunk: InboundThunk)? {
+        lock.withLock { byKey[key].map { ($0.instance, $0.thunk) } }
     }
 
     // MARK: - Outbound
@@ -407,25 +467,272 @@ final class Session: SessionCoding, OutboundSession, InboundSession, @unchecked 
 
     /// The coder `userInfo` for anything coded against this session.
     ///
-    /// Apple's is two entries -- their session key and
-    /// `Distributed.CodingUserInfoKey.actorSystemKey`. Ours is one, because our
-    /// `ActorID` coding reaches the system *through* the session (`systemID`) and never
-    /// looks the system up separately.
-    private var userInfo: [CodingUserInfoKey: Any] { [.xpcActorSession: self] }
+    /// **Two entries, exactly as Apple's is** -- their session key and
+    /// `Distributed.CodingUserInfoKey.actorSystemKey`, resolved out of the dictionary
+    /// literal `handleReceivedRequest` builds.
+    ///
+    /// The second was absent until S4, on the reasoning that our `ActorID` coding reaches
+    /// the system *through* the session and never looks it up separately. That was true of
+    /// `ActorID` and false of the thing that actually needs it: the stdlib's conditional
+    /// `Codable` conformance on `DistributedActor` decodes an actor value by reading
+    /// `.actorSystemKey` out of the `userInfo` and calling `resolve(id:using:)`. So a
+    /// `distributed func` taking or returning *an actor* -- as opposed to an `ActorID` --
+    /// could not decode without it. That is the case ``SharedActorKey`` exists for, so the
+    /// omission was load-bearing rather than cosmetic.
+    private var userInfo: [CodingUserInfoKey: Any] {
+        [.xpcActorSession: self, .actorSystemKey: system]
+    }
+
+    // MARK: - Inbound
+
+    /// One request from the peer: decode it, find the actor, run the target, reply.
+    ///
+    /// Apple's `Session.handleReceivedRequest(_:replyUsing:)` is a synchronous prologue
+    /// that spawns the execution and registers it, and so is this. The order is theirs:
+    /// build the `userInfo`; decode; resolve the target actor through
+    /// ``resolveSharedTarget(at:)`` -- the strongly held table, not the weak registry;
+    /// build a `RemoteCallTarget` from `remoteCallIdentifier`; clamp the priority; spawn;
+    /// register.
+    ///
+    /// **Every arm replies.** A receiver that dropped a malformed request would park the
+    /// peer forever: there is no timeout in this protocol, and the peer's `RequestTable`
+    /// entry is only resolved by a response or by the pipe dying. That is why the decode
+    /// failure, the missing-actor failure and the duplicate-id failure are answers rather
+    /// than returns, and it is what Apple's six inlined `RemoteInvocationResponse<Never>`
+    /// failure sites are.
+    ///
+    /// **Out of scope, deliberately: the per-actor entitlement check.** Apple's success
+    /// path tests the resolved actor for conformance to
+    /// `XPCSystem.RestrictedAccessDistributedActor` and, if it conforms, checks the peer's
+    /// audit token against that actor's `peerRequirement`. We have no entitlements story
+    /// and no audit token to check against -- an in-process pair has no peer to attest --
+    /// so inventing one here would be worse than its absence. It goes in with the transport
+    /// that can answer `RemoteInterface.auditToken`.
+    ///
+    /// Apple's step 3, `waitForLocalInterfaceActivation()`, is likewise absent: it is the
+    /// `ActivationToken` machinery, which arrives with `InitializationOptions`.
+    func handleReceivedRequest(
+        _ payload: Packet.Payload,
+        replyUsing reply: @escaping @Sendable (Packet.Payload) -> Void
+    ) {
+        let request: InboundRequest
+        do {
+            request = try payload.decode(as: InboundRequest.self, userInfo: userInfo)
+        } catch {
+            // The id is inside the body we could not read, so this failure cannot be
+            // registered as a pending execution -- there is nothing to cancel and nothing
+            // to name. It is still answered.
+            reply(Self.failure("could not decode the invocation request: \(error)"))
+            return
+        }
+
+        guard let target = resolveSharedTarget(at: request.targetedSharedActor) else {
+            reply(Self.failure("""
+                no actor is shared at \(request.targetedSharedActor) in this session, so \
+                \(request.remoteCallIdentifier) has nothing to run on
+                """))
+            return
+        }
+
+        let callTarget = RemoteCallTarget(request.remoteCallIdentifier)
+        // `canThrow` is the presence of `errorType`, which is the only signal the wire
+        // carries. See ``ResultHandler/canThrow``, which records that Apple's own
+        // computation of it is unresolved.
+        let handler = ResultHandler(canThrow: request.contents.errorType != nil,
+                                    userInfo: userInfo)
+        let contents = request.contents
+        let id = request.id
+        let system = self.system
+        let priority = Self.executionPriority(requested: request.basePriority)
+
+        // **Registered before the task can complete, and that is what the lock buys.**
+        // The execution's last act is to remove itself, which takes this same lock -- so
+        // creating the task inside the critical section makes "the task exists" and "the
+        // table knows about it" one step. Registering afterwards would let a fast target
+        // finish, find nothing to remove, and leave its own entry behind forever, where a
+        // later `invocationCancelled` would cancel an execution that had already replied.
+        //
+        // **This rests on `Task {}` not running inline, and that is not a free assumption.**
+        // The spec records Apple spawning with `Task.immediate(name:priority:...)`, which
+        // runs the body synchronously up to the first suspension. Substituting it here
+        // would run `finishPendingInvocationExecutionTask` -- for a target that completes
+        // without suspending -- on *this* thread, re-entering a non-reentrant `NSLock` we
+        // are still holding, and deadlocking the transport's delivery. Aligning with Apple
+        // on that call means restructuring this first: register, then spawn outside the
+        // lock, with the completed-before-registered race handled explicitly.
+        //
+        // **The `id` must not already be in flight.** Our own encoder never reuses one --
+        // it comes from a monotonic per-session counter -- so only a misbehaving or
+        // hostile peer gets here. Overwriting would orphan the first execution: the
+        // survivor of the two would be unreachable from `cancelPendingInvocationExecutionTask`
+        // *and* from `cancelAllPendingInvocationExecutionTasks`, so it would outlive
+        // transport death, never reply, and -- because `ResultHandler.userInfo` holds this
+        // session strongly -- keep the session, its transport and every strongly held
+        // shared actor alive for the life of the process. One leaked session graph per
+        // duplicate. Refusing the *new* request is the same call `RequestTable.waitForReply`
+        // makes about a duplicate seq, and for the same reason: the parked one must not be
+        // displaced by an arrival it cannot see.
+        let accepted = lock.withLock { () -> Bool in
+            guard pendingInvocationExecutionTasks[id] == nil else { return false }
+            pendingInvocationExecutionTasks[id] = Task(priority: priority) { [weak self] in
+                do {
+                    try await target.thunk(target.instance, system, callTarget,
+                                           contents, handler)
+                    // A handler with no reply means the runtime returned without calling
+                    // any of `onReturn`/`onReturnVoid`/`onThrow`. Nothing in the current
+                    // runtime does that; if one ever does, the peer is told rather than
+                    // left waiting.
+                    if let built = handler.reply {
+                        reply(built)
+                    } else {
+                        reply(Self.propagationFailure("""
+                            \(callTarget.identifier) returned without producing a result
+                            """))
+                    }
+                } catch {
+                    // Everything the inbound path can go wrong with lands here: an
+                    // unknown target, an argument that will not decode, a substitution
+                    // that is not a stub, a target that threw out of a non-throwing
+                    // signature. All of them are "the invocation was not executed" from
+                    // the peer's side, which is `.executionFailed`'s own default text.
+                    reply(Self.failure(
+                        "\(callTarget.identifier) failed on the callee: \(error)"))
+                }
+                // `[weak self]` above is honest about intent but buys nothing on its own:
+                // `handler.userInfo` holds this session strongly, the task holds the
+                // handler, and the table holds the task -- so session -> task -> handler
+                // -> session is live for the duration of every execution. That cycle is
+                // closed by this line, which is why the guard above matters so much: an
+                // orphaned execution is a leaked session graph, not just a leaked task.
+                // (The `[weak self]` on the transport handlers in `init` is a different
+                // thing and *is* load-bearing -- the transport outlives nothing there.)
+                self?.finishPendingInvocationExecutionTask(withID: id)
+            }
+            return true
+        }
+        guard accepted else {
+            reply(Self.failure("""
+                request id \(id) is already in flight on this session; ids are minted from \
+                a monotonic per-session counter and are never reused, so \
+                \(callTarget.identifier) was refused rather than displacing the execution \
+                already running under that id
+                """))
+            return
+        }
+    }
+
+    /// The priority to run an inbound execution at.
+    ///
+    /// **Half of Apple's clamp, and the half that is resolved.** The spec records
+    /// `handleReceivedRequest` clamping "against `Task.currentPriority` and
+    /// `TaskPriority.userInitiated` via `Comparable.<`" before
+    /// `Task.immediate(name:priority:executorPreference:operation:)`. What role
+    /// `Task.currentPriority` plays -- floor, tie-break, or the other operand of the same
+    /// `min` -- is **not** resolved, and is deliberately not guessed at: an absent
+    /// `basePriority` runs at the ambient priority, which is what `nil` means to
+    /// `Task(priority:)`.
+    ///
+    /// **The ceiling is not a scheduling nicety; without it a peer can abort this
+    /// process.** `basePriority` arrives as a bare `UInt8` and `TaskPriority.init(rawValue:)`
+    /// is not failable, so a peer can name a priority no Swift constant has -- and handing
+    /// that to `Task(priority:)` is fatal, not merely odd. Measured, by running the mutant
+    /// that removes this `min`: the runner dies on the spot with
+    ///
+    ///     invalid job priority 0xff
+    ///
+    /// on a request whose only unusual field is `"basePriority": 255`. So reading the field
+    /// at all is only safe *because* of this line. Before this slice the field was decoded
+    /// and discarded, which was safe by accident and divergent in silence.
+    private static func executionPriority(requested: TaskPriority?) -> TaskPriority? {
+        guard let requested else { return nil }
+        return min(requested, .userInitiated)
+    }
+
+    /// Apple's `handleReceivedNotification(_:)`: decode, and dispatch the three cases.
+    ///
+    /// A body that is not a notification is dropped. That is not leniency for its own
+    /// sake -- a notification carries no correlation id and nothing acknowledges it, so
+    /// there is no one to report a failure to and no request left waiting on it.
+    func handleReceivedNotification(_ payload: Packet.Payload) {
+        guard let notification = try? payload.decode(as: RemoteNotification.self,
+                                                     userInfo: userInfo)
+        else { return }
+        switch notification {
+        case .invocationCancelled(let id):
+            cancelPendingInvocationExecutionTask(withID: id)
+        case .invocationEscalated, .responseEscalated:
+            // Phase C. The wire format is complete and nothing sends these yet; the
+            // handlers are `escalatePendingInvocationExecution` and
+            // `verifyEscalatedInvocationResponse`, and both need a priority story this
+            // module does not have.
+            break
+        }
+    }
+
+    /// Apple's `cancelPendingInvocationExecutionTask(withID:)`.
+    ///
+    /// Cancelling is a request, not a kill: the target decides what to do about it, and
+    /// the entry stays until the execution actually finishes and removes itself. An
+    /// unknown id is silently ignored -- a peer may cancel a call this side has already
+    /// answered, which is a race rather than an error.
+    private func cancelPendingInvocationExecutionTask(withID id: ID64) {
+        lock.withLock { pendingInvocationExecutionTasks[id] }?.cancel()
+    }
+
+    /// Apple's `cancelAllPendingInvocationExecutionTasks()`.
+    ///
+    /// The tasks are cancelled *outside* the lock: each one's completion takes the same
+    /// lock to remove itself, and `Task.cancel()` can run a cancellation handler inline.
+    private func cancelAllPendingInvocationExecutionTasks() {
+        let tasks = lock.withLock { Array(pendingInvocationExecutionTasks.values) }
+        for task in tasks { task.cancel() }
+    }
+
+    /// The execution is over, however it ended. Ours; Apple's removal happens inside
+    /// `replyToPendingInvocation(withID:replyBlock:)`.
+    private func finishPendingInvocationExecutionTask(withID id: ID64) {
+        lock.withLock { _ = pendingInvocationExecutionTasks.removeValue(forKey: id) }
+    }
+
+    /// `[1, {"executionFailed": {"_0": message}}]`, over `Never` -- a failure carries no
+    /// success value, and `<Never>` is literally the instantiation Apple's eight failure
+    /// sites use.
+    ///
+    /// `userInfo: [:]` because the body is a string: nothing session-bound can reach it,
+    /// and the failure path must not itself be able to fail on a missing session.
+    private static func failure(_ message: String) -> Packet.Payload {
+        payload(RemoteInvocationResponse<Never>(executionFailure: message))
+    }
+
+    private static func propagationFailure(_ message: String) -> Packet.Payload {
+        payload(RemoteInvocationResponse<Never>(resultPropagationFailure: message))
+    }
+
+    private static func payload(_ response: RemoteInvocationResponse<Never>) -> Packet.Payload {
+        do {
+            return try Packet.Payload(encoding: response, userInfo: [:])
+        } catch {
+            // Unreachable: the body is a tag and a string. A trap rather than a dropped
+            // reply, because dropping one parks the peer forever and this is our own code
+            // failing to encode two values, not a message a peer influenced.
+            preconditionFailure("a failure response could not be encoded: \(error)")
+        }
+    }
 
     // MARK: - Cancellation
 
     /// The transport died. Apple's `InboundSessionProtocol` witness.
     ///
     /// Apple's is 40 bytes: `cancelAllPendingInvocationExecutionTasks()` then
-    /// `cancellationCompleted()`. The first half is the *inbound* execution tasks -- work
-    /// this process started on the peer's behalf -- and there is none of that yet, so
-    /// only the second half exists here.
+    /// `cancellationCompleted()`. Both halves exist now -- the first is the *inbound*
+    /// execution tasks, work this process started on the peer's behalf, and there is no
+    /// point finishing a call whose answer can no longer be delivered.
     ///
     /// Note what this is not responsible for: the requests *we* have outstanding. The
     /// transport fails those itself, through `RequestTable.failAll`, and it stays failed
     /// so a caller arriving afterwards is refused rather than parked forever.
     func handleTransportCancellation() {
+        cancelAllPendingInvocationExecutionTasks()
         cancellationCompleted()
     }
 

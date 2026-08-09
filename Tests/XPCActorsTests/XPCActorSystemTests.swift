@@ -3,10 +3,10 @@ import XCTest
 import Distributed
 @testable import XPCActors
 
-/// The identity half of `DistributedActorSystem`, plus what is left knowingly stubbed --
-/// which is now only the inbound trio: `invokeHandlerOnReturn`, `InvocationDecoder` and
-/// `ResultHandler`. The outbound path is real, and is tested in
-/// `OutboundInvocationTests`.
+/// The identity half of `DistributedActorSystem`, plus `invokeHandlerOnReturn`. The
+/// outbound path is tested in `OutboundInvocationTests` and the inbound one -- the
+/// decoder, the result handler and the dispatch that drives them -- in
+/// `InboundInvocationTests`. Nothing is stubbed any more.
 ///
 /// Read the *shape* of the resolve tests as the point: `resolve` has three outcomes and
 /// they are not interchangeable. A `.local` id that is not in the table **throws** --
@@ -25,6 +25,12 @@ final class XPCActorSystemTests: XCTestCase {
     }
 
     private struct TestError: Error {}
+
+    /// A thunk for a registry entry whose invocation path is not what is under test.
+    /// `actorReady` manufactures the real one; this is for entries registered by hand.
+    static let noThunk: InboundThunk = { _, _, target, _, _ in
+        throw SetupError("this registry entry has no invocation thunk: \(target.identifier)")
+    }
 
     private func local(_ id: ActorID) throws -> RawActorID.Local {
         guard case .local(let local) = id.raw else {
@@ -220,7 +226,7 @@ final class XPCActorSystemTests: XCTestCase {
 
         do {
             let doomed = NSObject()
-            system.registry.register(doomed, id: localID, thunk: ())
+            system.registry.register(doomed, id: localID, thunk: Self.noThunk)
             XCTAssertEqual(system.registry.count, 1)
         }
 
@@ -315,39 +321,26 @@ final class XPCActorSystemTests: XCTestCase {
         }
     }
 
-    // MARK: - the stubs that are left, all inbound
+    // MARK: - the eighth requirement
 
-    func testInvokeHandlerOnReturnThrows() async throws {
-        let system = XPCActorSystem("stub")
+    /// `invokeHandlerOnReturn` loads the result out of the buffer *as the metatype says*
+    /// and hands it to the handler. The two stub tests this replaces pinned that it, the
+    /// decoder and the handler all threw "not wired"; they are wired.
+    func testInvokeHandlerOnReturnLoadsTheBufferAtTheMetatype() async throws {
+        let system = XPCActorSystem("return")
         let buffer = UnsafeMutableRawPointer.allocate(
             byteCount: MemoryLayout<Int>.size, alignment: MemoryLayout<Int>.alignment)
         defer { buffer.deallocate() }
         buffer.storeBytes(of: 42, as: Int.self)
-        do {
-            try await system.invokeHandlerOnReturn(
-                handler: ResultHandler(),
-                resultBuffer: UnsafeRawPointer(buffer),
-                metatype: Int.self)
-            XCTFail("invokeHandlerOnReturn returned instead of throwing")
-        } catch {
-            XCTAssertTrue("\(error)".contains("not wired"), "\(error)")
-        }
-    }
 
-    func testTheInvocationDecoderAndResultHandlerAreStubsToo() async throws {
-        var decoder = InvocationDecoder()
-        XCTAssertThrowsError(try decoder.decodeGenericSubstitutions())
-        XCTAssertThrowsError(try decoder.decodeErrorType())
-        XCTAssertThrowsError(try decoder.decodeReturnType())
-        XCTAssertThrowsError(try decoder.decodeNextArgument() as Int)
+        let handler = ResultHandler(canThrow: false, userInfo: [:])
+        try await system.invokeHandlerOnReturn(
+            handler: handler,
+            resultBuffer: UnsafeRawPointer(buffer),
+            metatype: Int.self)
 
-        let handler = ResultHandler()
-        do {
-            try await handler.onReturnVoid()
-            XCTFail("onReturnVoid returned instead of throwing")
-        } catch {
-            XCTAssertTrue("\(error)".contains("not wired"), "\(error)")
-        }
+        let payload = try XCTUnwrap(handler.reply)
+        XCTAssertEqual(try payload.decode(as: RemoteInvocationResponse<Int>.self), .result(42))
     }
 
     func testMakeInvocationEncoderReturnsAFreshEncoder() {

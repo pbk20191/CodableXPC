@@ -200,7 +200,7 @@ final class InvocationBodiesTests: XCTestCase {
 
     func testAnInboundRequestReadsTheHeaderAndLeavesTheArgumentsAlone() throws {
         let object = try XPCEncoder().encode(Self.fullRequest)
-        var inbound = try XPCDecoder().decode(InboundRequest.self, from: object)
+        let inbound = try XPCDecoder().decode(InboundRequest.self, from: object)
 
         XCTAssertEqual(inbound.id, ID64(rawValue: 42))
         XCTAssertEqual(inbound.basePriority, .high)
@@ -213,9 +213,10 @@ final class InvocationBodiesTests: XCTestCase {
         XCTAssertEqual(inbound.contents.errorType, SwiftType(mangledTypeName: "Se"))
         XCTAssertEqual(inbound.contents.returnType, SwiftType(mangledTypeName: "SS"))
 
-        XCTAssertEqual(try inbound.contents.argumentsContainer.decode(Int.self), 7)
-        XCTAssertEqual(try inbound.contents.argumentsContainer.decode(String.self), "hi")
-        XCTAssertTrue(inbound.contents.argumentsContainer.isAtEnd)
+        var arguments = try XCTUnwrap(inbound.contents.argumentsContainer)
+        XCTAssertEqual(try arguments.decode(Int.self), 7)
+        XCTAssertEqual(try arguments.decode(String.self), "hi")
+        XCTAssertTrue(arguments.isAtEnd)
     }
 
     // MARK: tier 1 -- the response
@@ -441,7 +442,7 @@ final class InvocationBodiesTests: XCTestCase {
     }
 
     func testAHandBuiltPeerRequestDecodes() throws {
-        var inbound = try XPCDecoder().decode(InboundRequest.self, from: peerRequest())
+        let inbound = try XPCDecoder().decode(InboundRequest.self, from: peerRequest())
         XCTAssertEqual(inbound.id, ID64(rawValue: 42))
         XCTAssertEqual(inbound.basePriority, .high)
         XCTAssertEqual(inbound.targetedSharedActor, .exportedRawValue("primary"))
@@ -451,8 +452,9 @@ final class InvocationBodiesTests: XCTestCase {
                        [SwiftType(mangledTypeName: "Si")])
         XCTAssertEqual(inbound.contents.errorType, SwiftType(mangledTypeName: "Se"))
         XCTAssertEqual(inbound.contents.returnType, SwiftType(mangledTypeName: "SS"))
-        XCTAssertEqual(try inbound.contents.argumentsContainer.decode(Int.self), 7)
-        XCTAssertEqual(try inbound.contents.argumentsContainer.decode(String.self), "hi")
+        var arguments = try XCTUnwrap(inbound.contents.argumentsContainer)
+        XCTAssertEqual(try arguments.decode(Int.self), 7)
+        XCTAssertEqual(try arguments.decode(String.self), "hi")
     }
 
     /// A peer that sends no optionals at all -- the minimum legal request.

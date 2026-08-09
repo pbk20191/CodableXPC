@@ -34,14 +34,14 @@ final class SessionTests: XCTestCase {
     /// hand one a registry that belongs to somebody else. These tests are about the
     /// coding path and never look at `systemID`; the system is here because the
     /// session's table has to live somewhere.
-    private func makeSession() -> (Session, ActorRegistry<Void>) {
+    private func makeSession() -> (Session, ActorRegistry<InboundThunk>) {
         let system = XPCActorSystem("session-tests")
         return (system.makeDetachedSession(), system.registry)
     }
 
-    private func register(_ instance: AnyObject, in registry: ActorRegistry<Void>) -> RawActorID.Local {
+    private func register(_ instance: AnyObject, in registry: ActorRegistry<InboundThunk>) -> RawActorID.Local {
         let local = RawActorID.Local(systemID: ID64.next(), instanceID: ID64.next())
-        registry.register(instance, id: local, thunk: ())
+        registry.register(instance, id: local, thunk: XPCActorSystemTests.noThunk)
         return local
     }
 
