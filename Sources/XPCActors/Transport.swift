@@ -121,6 +121,13 @@ public final class Transport: @unchecked Sendable {
         set { lock.withLock { _inboundNotificationHandler = newValue } }
     }
 
+    /// What the pipe can prove about the process on the other end, or `nil`.
+    ///
+    /// Forwarded rather than cached: Apple's `Session.RemoteInterface.auditToken` reaches
+    /// through the transport's `rawTransport` existential on every read, and a cached copy
+    /// would answer for a peer that is no longer there.
+    public var peerAttestation: (any PeerAttestation)? { rawTransport.peerAttestation }
+
     /// Internal for tests: teardown has run, from either our own `cancel` or the
     /// raw transport's death channel.
     var isCancelled: Bool { lock.withLock { cancelled } }

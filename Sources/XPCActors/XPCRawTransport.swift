@@ -34,6 +34,34 @@ public final class XPCRawTransport: RawTransportProtocol, @unchecked Sendable {
         self.isAlreadyActive = isAlreadyActive
     }
 
+    /// The peer's Mach audit token, wrapped so ``Session``'s gates can ask it questions.
+    ///
+    /// This is Apple's `Transport.XPCRawTransport.auditToken` (`0x2ad4e122c` forwards to it)
+    /// step for step: read `XPCSession.auditToken`, apply `audit_token_t.isValid`, and
+    /// return `nil` when it fails. Both of those are exported by `libswiftXPC` and declared
+    /// in the SDK's `.tbd`, and neither is in the public `.swiftinterface`; the bridge is in
+    /// `PeerRequirement.swift`, which explains why it is a link-time binding rather than a
+    /// `dlsym`.
+    ///
+    /// Connection-level, not message-level. `XPCDictionary.auditToken` would give the
+    /// sender of one message, which sounds stricter and is not: every message on one
+    /// `XPCSession` comes from the same peer, and a per-message read would have to happen
+    /// inside the delivery handler, where the per-actor gate — which runs after an `await`
+    /// on activation — cannot reach it.
+    ///
+    /// **The `#available` below is load-bearing, not a formality.** It is the only thing
+    /// keeping `XPCSession.auditToken` — a symbol that links *weakly* in this package's
+    /// artifacts, so a missing one binds to zero — off an OS that does not export it. The
+    /// bridge section in `PeerRequirement.swift` has the measurements.
+    public var peerAttestation: (any PeerAttestation)? {
+        #if os(macOS) || targetEnvironment(macCatalyst)
+        guard #available(macOS 26, macCatalyst 26, *) else { return nil }
+        return AuditTokenAttestation(session.xpcBridgedAuditToken())
+        #else
+        return nil
+        #endif
+    }
+
     public func setPacketHandler(_ handler: @escaping @Sendable (Packet) -> Void) {
         lock.withLock { self.handler = handler }
     }

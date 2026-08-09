@@ -49,9 +49,29 @@ public final class XPCActorSystem: Sendable {
     /// that caller.
     let registry = ActorRegistry<InboundThunk>()
 
-    public init(_ debugName: String) {
+    /// What every peer of every session of this system must prove, or `nil` for "anyone".
+    ///
+    /// Apple's `XPCSystem.peerRequirement : XPC.XPCPeerRequirement?` at field offset `0x28`,
+    /// a `let` (field record flags `0x0`). Their four initialisers split two and two: the
+    /// two that take no requirement store the optional's empty case — `nil` — which is why
+    /// an unconfigured system admits everyone and why nothing broke while this gate was
+    /// missing.
+    ///
+    /// **Non-optional on an actor, optional here**: the reconstruction is explicit that
+    /// `RestrictedAccessDistributedActor.peerRequirement` is `XPCPeerRequirement` and this
+    /// one is `XPCPeerRequirement?`. The two gates are separate and both apply; see
+    /// ``Session/handleReceivedRequest(_:replyUsing:)``.
+    public let peerRequirement: PeerRequirement?
+
+    /// Apple has four initialisers rather than one with defaults — the image contains no
+    /// `default argument N of XPCSystem.init…` symbol, and the absence is meaningful
+    /// because `Session.init`'s *does* exist. One with a default is enough here; the four
+    /// exist over there because `preserveSelfIPC` is the other axis and there is no
+    /// in-process path in this module to preserve.
+    public init(_ debugName: String, peerRequirement: PeerRequirement? = nil) {
         self.debugName = debugName
         self.id = ID64.next()
+        self.peerRequirement = peerRequirement
     }
 }
 

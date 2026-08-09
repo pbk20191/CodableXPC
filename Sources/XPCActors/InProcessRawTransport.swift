@@ -17,16 +17,38 @@ public final class InProcessRawTransport: RawTransportProtocol, @unchecked Senda
     private var cancellationHandler: (@Sendable (String) -> Void)?
     private var activated = false
     private var cancellationReason: String?
+    private var _peerAttestation: (any PeerAttestation)?
 
-    private init(debugName: String) {
-        self.queue = DispatchQueue(label: "XPCActors.InProcess.\(debugName)")
+    /// What this end can prove about the other end.
+    ///
+    /// **`nil` by default, and that is the honest answer.** Apple's `.local` session answers
+    /// `LocalSessionState.currentProcessAuditToken()` — "the peer is this process" — because
+    /// a `.local` session *is* an in-process pair. This type is not that: it is a stand-in
+    /// for a real pipe, and what is on the far end of it is whatever a test put there. So it
+    /// attests nothing unless it is told what to attest, and every gate in ``Session`` reads
+    /// that `nil` as refuse.
+    public var peerAttestation: (any PeerAttestation)? {
+        get { lock.withLock { _peerAttestation } }
+        set { lock.withLock { _peerAttestation = newValue } }
     }
 
+    private init(debugName: String, qos: DispatchQoS) {
+        self.queue = DispatchQueue(label: "XPCActors.InProcess.\(debugName)", qos: qos)
+    }
+
+    /// - Parameter qos: the delivery queue's quality of service.
+    ///   `.unspecified` -- the default -- lets Dispatch propagate the *sender's* QoS to the
+    ///   delivery block, which is normally what a test wants and is occasionally exactly
+    ///   what it must not have: an inbound execution's priority floor is read on the
+    ///   delivering context, so a caller at `.background` would otherwise deliver at
+    ///   `.background` and the floor would have nothing to lift. Naming a QoS pins the
+    ///   receiving side independently of the sending one.
     public static func makePair(
-        debugName: String = "pair"
+        debugName: String = "pair",
+        qos: DispatchQoS = .unspecified
     ) -> (InProcessRawTransport, InProcessRawTransport) {
-        let a = InProcessRawTransport(debugName: "\(debugName).a")
-        let b = InProcessRawTransport(debugName: "\(debugName).b")
+        let a = InProcessRawTransport(debugName: "\(debugName).a", qos: qos)
+        let b = InProcessRawTransport(debugName: "\(debugName).b", qos: qos)
         a.lock.withLock { a.remoteEnd = b }
         b.lock.withLock { b.remoteEnd = a }
         return (a, b)

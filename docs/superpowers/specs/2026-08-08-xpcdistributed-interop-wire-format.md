@@ -954,11 +954,34 @@ dictionary"` for a missing key and `"Bug in XPCDistributed: Session conforms to 
 for a failed cast.
 
 **`Session.handleReceivedRequest(_:replyUsing:)`** (`0x2ad512a04`) is 7060 bytes of synchronous
-prologue. In order: build the userInfo; `XPCDictionary.decode(as: RemoteInvocationRequest.self,
-forKey: "payload", withUserInfo:)`; `Session.remoteSatisfiesActorSystemRequirement()`;
-`Session.cancel(because:)` on one failure arm; `RemoteCallTarget.init(_:)` from
-`remoteCallIdentifier`; a priority clamp against `Task.currentPriority` and
-`TaskPriority.userInitiated` via `Comparable.<`; then
+prologue. In order — and an earlier revision of this paragraph had the first two steps the wrong
+way round, which matters because it is a security ordering:
+
+1. **`isBidirectional`** (`+0x920`, `ldrb w8,[x25,#0x70]; cmp #1; b.ne`). A third guard the earlier
+   revision did not mention at all; its failure arm encodes a `RemoteInvocationResponse<Never>`
+   carrying the 31-character `"Session cannot receive requests"`.
+2. **`Session.remoteSatisfiesActorSystemRequirement()`** (`+0x930`) — **before** the decode, not
+   after. Its failure arm at `+0xba8` is a tail branch to `Session.cancel(because:)` with a
+   71-character literal and **no reply encode anywhere on that arm**: the peer learns only
+   indirectly, through its own pending requests failing. So an unentitled peer's bytes are never
+   parsed, which matters because the decoder is a far larger attack surface than the gate.
+3. the `"payload"` key (`+0x938`), then **the decode** (`+0x9a4`).
+4. `RemoteCallTarget.init(_:)` from `remoteCallIdentifier`.
+5. **Two independent priority clamps, not one.** The earlier revision described "a priority clamp
+   against `Task.currentPriority` and `TaskPriority.userInitiated`" as a single three-operand
+   clamp; it is two:
+   - a **ceiling** at `+0x11b4…+0x13bc`, `basePriority.map { min($0, .userInitiated) }`, preserving
+     `nil` — its buffer `[x29-0x100]` is literally the `priority:` argument at the
+     `Task.immediate` call at `+0x1630`;
+   - a **floor** at `+0x13c0…+0x1438`, a separate `min(Task.currentPriority, .userInitiated)`,
+     carried into the closure and applied *inside* it at `0x2ad5154b4` as
+     `withUnsafeCurrentTask { $0!.escalatePriority(to:) }`.
+
+   So `Task.currentPriority` is **not** part of the clamp on the requested value. Composed:
+   `min(max(requested, currentPriority), .userInitiated)`. Which `csel` operand survives was read,
+   not inferred — `x0` goes to the value witness table's `destroy`, `x19` to `initializeWithTake`.
+
+Then
 `Task.immediate(name:priority:executorPreference:operation:)` to spawn the execution task, and
 `Session.addPendingInvocationExecutionTask(_:withID:)` to register it.
 

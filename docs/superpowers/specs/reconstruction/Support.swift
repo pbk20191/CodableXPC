@@ -1142,9 +1142,22 @@ extension ActorBackedByDispatchSerialQueue {
 //     the text of its assertion.
 // 10. `BackpressureManager.disable()` — I confirmed it drains the pending deques through
 //     `reply(to:with:)` but not the `isEnabled = false` store.
-// 11. `OwnedAwaitableEvent.wait()`'s `closure #1 () async -> ()`, and hence what `owningTask` is
-//     awaited for. This is the one gap that directly touches
-//     `Session.waitForLocalInterfaceActivation`.
+// 11. RESOLVED, and the question was wrong. `OwnedAwaitableEvent.wait()`'s
+//     `closure #1 () async -> ()` (`0x2ad4eccb4`, 0x158 bytes) reads `Task.currentPriority`,
+//     loads `owningTask` from `ctx+0x18`, calls `Swift.Task.escalatePriority(to:)`, then loads
+//     the embedded event's `future` into x20 and tail-branches to
+//     `Combine.Future<_, Never>.value.getter`.
+//
+//     So **`owningTask` is never awaited — it is priority-escalated**, so that a waiter's
+//     priority reaches the task that will post the event. `wait()`'s outer body separately
+//     installs a `withTaskPriorityEscalationHandler` and fast-paths on the `posted` Fuse.
+//     "What is `owningTask` awaited for" presupposed a join that does not happen, and
+//     `Session.waitForLocalInterfaceActivation` must be written against
+//     escalate-plus-single-await rather than a join.
+//
+//     Left in this list rather than deleted because this file said it was open for several
+//     rounds after it had been answered elsewhere, and a durable document going stale while a
+//     session note carries the answer is the failure mode this project keeps repeating.
 // 12. `RequestManager.reply(to:with:)`'s assertion text, and whether `withRequest` removes the
 //     request from `activeRequests` on completion (only `replyAll`'s `removeAll` was seen).
 // 13. `"Bug in XPCDistributed: Unexpected suspension/corruption when evaluating fresh request"`
