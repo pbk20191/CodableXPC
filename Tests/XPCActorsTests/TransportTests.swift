@@ -222,15 +222,24 @@ final class TransportTests: XCTestCase {
     func testCancellingTheTransportFailsOutstandingRequests() async throws {
         let (client, server) = try await makePair()
         server.inboundRequestHandler = { _, _, _ in }   // never replies
+        let box = RequestTableTests.OutcomeBox()
         let task = Task {
-            await client.sendRequest(
+            box.outcome = await client.sendRequest(
                 seq: client.allocateSeq(), try! Packet.Payload(encoding: Ping(value: 1), userInfo: [:])
             )
         }
         while await client.pendingRequestCount == 0 { await Task.yield() }
         client.cancel(reason: "shutting down")
-        guard case .failed(.transportCancelled) = await task.value else {
-            return XCTFail("expected a transport failure")
+
+        // Watched, not awaited -- the same discipline as the peer-death test below, and
+        // for the same reason: the regression this guards is "the caller is never
+        // resumed", and `await task.value` would then hang the suite rather than fail.
+        guard await waitUntil({ box.outcome != nil }) else {
+            task.cancel()
+            return XCTFail("the caller was never resumed -- cancelling did not fail it")
+        }
+        guard case .failed(.transportCancelled) = box.outcome else {
+            return XCTFail("expected a transport failure, got \(String(describing: box.outcome))")
         }
     }
 
@@ -240,8 +249,9 @@ final class TransportTests: XCTestCase {
         // so a request whose peer died would wait forever.
         let (client, server) = try await makePair()
         server.inboundRequestHandler = { _, _, _ in }   // never replies
+        let box = RequestTableTests.OutcomeBox()
         let task = Task {
-            await client.sendRequest(
+            box.outcome = await client.sendRequest(
                 seq: client.allocateSeq(), try! Packet.Payload(encoding: Ping(value: 1), userInfo: [:])
             )
         }
@@ -253,12 +263,12 @@ final class TransportTests: XCTestCase {
         // Wait on the observable, not on the request itself: without the death channel
         // `task.value` never returns, and awaiting it would hang the suite instead of
         // failing it.
-        guard await waitUntil({ await client.pendingRequestCount == 0 }) else {
+        guard await waitUntil({ box.outcome != nil }) else {
+            task.cancel()
             return XCTFail("the request was never resolved -- the peer's death never arrived")
         }
-        let outcome = await task.value
-        guard case .failed(.transportCancelled(let message)) = outcome else {
-            return XCTFail("expected .transportCancelled, got \(outcome)")
+        guard case .failed(.transportCancelled(let message)) = box.outcome else {
+            return XCTFail("expected .transportCancelled, got \(String(describing: box.outcome))")
         }
         XCTAssertTrue(message.contains("peer went away"), message)
     }

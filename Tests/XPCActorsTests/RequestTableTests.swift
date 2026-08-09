@@ -121,14 +121,21 @@ final class RequestTableTests: XCTestCase {
 
     func testTaskCancellationUnblocksTheWaiter() async throws {
         let table = RequestTable()
-        let task = Task { await table.waitForReply(seq: 20, sending: {}) }
+        // Polled, not awaited. There is no timeout in this protocol by design, so
+        // `await task.value` on a waiter that is never resumed does not fail this test --
+        // it wedges the whole bundle at zero reported failures. Emptying
+        // `waitForReply`'s `onCancel` body is exactly that regression, and it used to
+        // survive here for that reason.
+        let box = OutcomeBox()
+        let task = Task { box.outcome = await table.waitForReply(seq: 20, sending: {}) }
         while await table.pendingCount == 0 { await Task.yield() }
         task.cancel()
-        // There is no timeout in this protocol by design; Task cancellation is the
-        // only way out of an unanswered request.
-        let outcome = await task.value
-        guard case .failed(.taskCancelled) = outcome else {
-            return XCTFail("expected taskCancelled, got \(outcome)")
+
+        guard await waitUntil({ box.outcome != nil }) else {
+            return XCTFail("cancelling the task never resumed the waiter")
+        }
+        guard case .failed(.taskCancelled) = box.outcome else {
+            return XCTFail("expected taskCancelled, got \(String(describing: box.outcome))")
         }
     }
 }

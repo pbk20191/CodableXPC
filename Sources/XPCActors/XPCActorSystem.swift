@@ -5,10 +5,12 @@ import Foundation
 /// The `DistributedActorSystem`. Apple calls theirs `XPCSystem`; the name is ours, the
 /// behaviour is not.
 ///
-/// **This slice is the identity half.** `assignID`, `actorReady`, `resignID`, `resolve`
-/// and `makeInvocationEncoder` are built for real. `remoteCall`, `remoteCallVoid` and
-/// `invokeHandlerOnReturn` need a `Session` wired to a `Transport`, which does not exist
-/// yet; they throw, visibly, and say so. See ``notWiredYet(_:)``.
+/// **Everything outbound is real.** `assignID`, `actorReady`, `resignID`, `resolve`,
+/// `makeInvocationEncoder`, `remoteCall` and `remoteCallVoid` are built.
+/// `invokeHandlerOnReturn` is not, and it is the only requirement left: it is an
+/// *inbound* helper -- it hands a returning target's result to a `ResultHandler` -- and
+/// it belongs with `InvocationDecoder` and `ResultHandler`, which are also still stubs.
+/// All three throw, visibly, and say so. See ``notWiredYetInbound(_:)``.
 ///
 /// `final`, where Apple's is not: `XPCSystem` has a vtable covering only its four
 /// initialisers, which is what a non-`final` class produces, and subclassing it is not a
@@ -154,25 +156,25 @@ extension XPCActorSystem: DistributedActorSystem {
     /// A fresh encoder. Apple's is 40 bytes of zeroing with no calls.
     public func makeInvocationEncoder() -> InvocationEncoder { InvocationEncoder() }
 
-    // MARK: The call requirements -- stubbed, visibly
+    // MARK: The call requirements
 
-    /// **Not wired yet.** S3 gives a `Session` a `Transport`; at that point this becomes
-    /// Apple's private funnel: read the actor's session out of its `.remote` id, throw
-    /// `RemoteInvocationCancellationError(reason: .executionFailed, message: "Remote call
-    /// on a local actor.")` if there is none, and otherwise hand the encoder to
-    /// `Session.sendInvocation(to:target:invocation:)`, which assembles a
-    /// `RemoteInvocationRequest`, awaits the reply through `RequestTable`, and decodes the
-    /// `Res` out of the response body.
+    /// Send a call to an actor living in a peer, and wait for its result.
     ///
-    /// It throws rather than returning something plausible on purpose. A stub that
-    /// returned a default value would let a caller believe a call had happened.
+    /// Both this and ``remoteCallVoid(on:target:invocation:throwing:)`` are thin: Apple's
+    /// two public entry points tail into one private funnel,
+    /// `XPCSystem.(remoteCall)<Act, Res>(actor:target:invocation:result:)`, which reads
+    /// the actor's session out of its id, throws if there is none, and otherwise
+    /// dispatches `OutboundSessionProtocol.sendInvocation`. ``send(_:to:target:)`` below
+    /// is that funnel.
     ///
     /// **Typed throws, and the asymmetry with `remoteCallVoid` below is Apple's.** Their
     /// `remoteCall` mangles as `throws(RemoteInvocationCancellationError)` while
     /// `remoteCallVoid` mangles as plain `throws`; the reconstruction lists *why* as
     /// unresolved but the manglings themselves are unambiguous. Reproduced rather than
     /// tidied, because a mirror that "fixes" an asymmetry it does not understand is
-    /// guessing.
+    /// guessing. Note the funnel is typed either way -- the private one is
+    /// `throws(RemoteInvocationCancellationError)` in the mangling too -- so
+    /// `remoteCallVoid` widens on the way out and never actually throws anything else.
     public func remoteCall<Act, Err, Res>(
         on actor: Act,
         target: RemoteCallTarget,
@@ -181,11 +183,13 @@ extension XPCActorSystem: DistributedActorSystem {
         returning: Res.Type
     ) async throws(RemoteInvocationCancellationError) -> Res
     where Act: DistributedActor, Act.ID == ActorID, Err: Error, Res: Codable {
-        throw Self.notWiredYet("remoteCall(on:target:invocation:throwing:returning:)")
+        try await Self.send(&invocation, to: actor.id, target: target)
     }
 
-    /// **Not wired yet**, as `remoteCall` above. Apple binds the result type to their
-    /// `Ack` and otherwise takes the same path.
+    /// The void shape. **The result type is bound to ``Ack``**, which is Apple's: a void
+    /// success on the wire is `[0, {}]` because `Void` is not `Codable` and something has
+    /// to occupy the generic parameter. Nothing is returned from it -- the value exists
+    /// only so the response has a type to decode as.
     ///
     /// Plain `throws`, which is Apple's spelling here and not a transcription slip.
     public func remoteCallVoid<Act, Err>(
@@ -195,7 +199,39 @@ extension XPCActorSystem: DistributedActorSystem {
         throwing: Err.Type
     ) async throws
     where Act: DistributedActor, Act.ID == ActorID, Err: Error {
-        throw Self.notWiredYet("remoteCallVoid(on:target:invocation:throwing:)")
+        let _: Ack = try await Self.send(&invocation, to: actor.id, target: target)
+    }
+
+    /// Apple's private funnel, and the one place a local actor is refused.
+    ///
+    /// **The refusal comes before any session is involved**, so nothing is sent. Apple
+    /// spells the lookup as `(extension in XPCDistributed) DistributedActor.session`,
+    /// an `OutboundSessionProtocol?` that is `nil` for a `.local` id, and throws
+    /// `.executionFailed` when it is. The message is their 29-byte literal, verbatim.
+    ///
+    /// The second guard is ours and has no counterpart in Apple's, where
+    /// `Remote.session` is *typed* as the outbound protocol so no cast is needed. Our
+    /// `RawActorID.Remote.session` is `any SessionCoding` -- the narrower protocol the
+    /// identity layer can state without importing `Distributed` -- so a conformer that
+    /// can code ids but cannot send is representable. It is named here rather than
+    /// trapped: it is reached by handing the system a proxy built against a foreign
+    /// session, which is a caller's mistake, not the runtime's.
+    private static func send<Res: Codable>(
+        _ invocation: inout InvocationEncoder,
+        to id: ActorID,
+        target: RemoteCallTarget
+    ) async throws(RemoteInvocationCancellationError) -> Res {
+        guard case .remote(let remote) = id.raw else {
+            throw RemoteInvocationCancellationError.executionFailed(
+                "Remote call on a local actor.")
+        }
+        guard let session = remote.session as? any OutboundSession else {
+            throw RemoteInvocationCancellationError.executionFailed("""
+                the session naming \(remote.key) can code actor ids but cannot send \
+                invocations, so there is nowhere to send \(target.identifier).
+                """)
+        }
+        return try await session.sendInvocation(to: id, target: target, invocation: &invocation)
     }
 
     /// **Not wired yet.** The eighth requirement, and the one most easily missed: the
@@ -212,25 +248,19 @@ extension XPCActorSystem: DistributedActorSystem {
         resultBuffer: UnsafeRawPointer,
         metatype: Any.Type
     ) async throws {
-        throw Self.notWiredYet("invokeHandlerOnReturn(handler:resultBuffer:metatype:)")
+        throw Self.notWiredYetInbound("invokeHandlerOnReturn(handler:resultBuffer:metatype:)")
     }
 
-    /// One spelling for every **outbound** stub, so a caller who hits one gets the same
-    /// sentence and the same reason wherever it came from.
+    /// One spelling for every remaining stub, all of which are now **inbound**.
     ///
-    /// Outbound only, deliberately. The inbound stubs -- the decoder and the result
-    /// handler -- use ``notWiredYetInbound(_:)`` instead, because a decoder that cannot
-    /// decode an argument is not a cancelled remote invocation, and a later slice that
-    /// grows a `catch` on `RemoteInvocationCancellationError` must not catch one.
-    static func notWiredYet(_ what: String) -> RemoteInvocationCancellationError {
-        .executionFailed("""
-            \(what) is not wired yet: it needs an outbound Session over a Transport, \
-            which this slice does not build. Nothing has been sent to the peer.
-            """)
-    }
-
-    /// The inbound counterpart. A different error type on purpose -- see
-    /// ``notWiredYet(_:)``.
+    /// The outbound spelling this sat beside is gone with the outbound stubs. Its
+    /// existence had a reason worth keeping written down: a stub must not throw
+    /// `RemoteInvocationCancellationError` unless it really is one, because a later slice
+    /// that grows a `catch` on that type would swallow it. `SetupError` is what an
+    /// unbuilt inbound path fails with, and `invokeHandlerOnReturn` moved onto it in this
+    /// slice -- the previous one grouped it with the outbound stubs on a reason its own
+    /// report then retracted: it touches no session, and the outbound session it was said
+    /// to be waiting for now exists.
     static func notWiredYetInbound(_ what: String) -> SetupError {
         SetupError("""
             \(what) is not wired yet: it needs the inbound path, which this slice does \

@@ -700,8 +700,16 @@ private writer:
 `shareActor` and `handleActorShared` are byte-identical clones, 96 bytes each: load
 `Session+0x20`, `adds #1`, `b.hs` to a `brk` on overflow, `cas` loop, then build the key. So the
 `dynamic` counter is **`Session.idGenerator`** — a per-session `ID64.Generator`, ids monotonic
-from 1, an overflow traps. This is the same inlining shape the *Envelope* section describes for
-the request id, on a different field.
+from 1, an overflow traps.
+
+**It is the same field as the request id's**, `Session+0x20` — the *Envelope* section reads the
+same `cas` on the same offset. An earlier revision of this sentence said "the same inlining shape
+… on a different field", which read as an assertion that they are two counters; the contrast it
+meant to draw was with the **dead** `Transport.(idGenerator)` at `+0x70`. Left recorded because
+the wrong reading is the one that would make an implementer keep two counters.
+
+The consequence is observable and easy to miss: **the two number spaces interleave.** A session
+that has shared one actor sends its first request under id **2**, because the share took 1.
 
 The two `export` overloads each read `actor.id` through `Identifiable.id.getter`, trap if it is
 `.remote`, and then build their key — `SwiftType.init(B.Type)` for the stub type, or the caller's
