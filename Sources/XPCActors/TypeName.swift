@@ -9,8 +9,13 @@ import Foundation
 public enum TypeName {
 
     private static let lock = NSLock()
-    private static var byName: [String: Any.Type] = [:]
-    private static var byType: [ObjectIdentifier: String] = [:]
+    // `nonisolated(unsafe)` is the honest annotation, not a silencer: every access below is
+    // inside `lock.withLock`, so the synchronization the compiler cannot see is real. The
+    // values are metatypes (`Any.Type`), which are not `Sendable`, so strict concurrency flags
+    // the bare `static var` -- and it is right to, for anyone who reaches them *without* the
+    // lock. The lock is the contract; this marks that the contract is kept by hand.
+    nonisolated(unsafe) private static var byName: [String: Any.Type] = [:]
+    nonisolated(unsafe) private static var byType: [ObjectIdentifier: String] = [:]
     /// **There is no negative cache, deliberately.**
     ///
     /// There used to be: a `Set<String>` of names that failed, so a repeated unknown

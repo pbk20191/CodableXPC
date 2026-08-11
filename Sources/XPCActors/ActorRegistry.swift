@@ -28,7 +28,7 @@ final class ActorRegistry<Thunk>: @unchecked Sendable {
     }
 
     func resign(_ id: RawActorID.Local) {
-        lock.withLock { entries.removeValue(forKey: id) }
+        lock.withLock { _ = entries.removeValue(forKey: id) }
     }
 
     /// Look up a live actor. A slot whose actor has gone is removed as it is found,

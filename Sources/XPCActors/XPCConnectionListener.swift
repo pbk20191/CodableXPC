@@ -52,11 +52,14 @@ public final class XPCConnectionListener: @unchecked Sendable {
                 // messages go to peer connections, never to the listener.
                 return
             }
-            // `unsafeBitCast` rather than a conditional cast: `xpc_object_t` is `any
-            // OS_xpc_object` in Swift and an `XPC_TYPE_CONNECTION` object is an
-            // `OS_xpc_connection`, but the Swift type system has no `xpc_connection_t` case to
-            // test against -- `xpc_get_type` is the test, and it has already been made.
-            let peer = unsafeBitCast(event, to: xpc_connection_t.self)
+            // A plain annotated binding, not a cast: the Swift overlay lowers both
+            // `xpc_object_t` and `xpc_connection_t` to the same existential (`any
+            // OS_xpc_object`), so an `unsafeBitCast` between them is a no-op the compiler now
+            // flags as unnecessary. The real check that this object *is* a connection is
+            // `xpc_get_type(event) == XPC_TYPE_CONNECTION`, made on the line above; the type
+            // system has no `xpc_connection_t` case to narrow to, so the binding stands in for
+            // the narrowing the runtime already did.
+            let peer: xpc_connection_t = event
             box.accept?(XPCConnectionTransport(connection: peer))
         }
         xpc_connection_activate(listener)
