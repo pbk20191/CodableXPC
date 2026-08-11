@@ -27,6 +27,14 @@ protocol SendableLedger: AnyObject, Sendable {
     func total() async throws -> Int
 }
 
+/// Module-qualified harmless names must be admitted too. This protocol exists only to compile:
+/// an exact-string inheritance check refused `Swift.Sendable`, so a regression here is a build
+/// failure, which is the cheapest possible pin.
+@XPCService
+protocol ModuleQualifiedNames: Swift.Sendable {
+    func ping() async throws -> Int
+}
+
 private final class LedgerImpl: ClassBoundLedger, SendableLedger, @unchecked Sendable {
     private let lock = NSLock()
     private var sum = 0

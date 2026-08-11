@@ -285,11 +285,14 @@ public struct XPCServiceMacro: PeerMacro {
         // `NSObjectProtocol` is deliberately **not** on that list: it looks harmless and is not.
         // It requires `isEqual:`, `hash` and the rest, which a plain Swift class does not get
         // for free, so admitting it would trade one confusing generated-code error for another.
+        // Matched on the last dotted component, so a module-qualified spelling
+        // (`Swift.Sendable`) is admitted too -- an exact-string check refused it, which was a
+        // false rejection of a name that carries no requirement.
         let harmlessInheritance: Set<String> = ["AnyObject", "Sendable"]
         let inherited = proto.inheritanceClause?.inheritedTypes.map {
             $0.type.trimmedDescription
         } ?? []
-        for name in inherited where !harmlessInheritance.contains(name) {
+        for name in inherited where !harmlessInheritance.contains(name.split(separator: ".").last.map(String.init) ?? name) {
             // Pointed at the inheritance clause when there is one, so the caret lands on the
             // author's own text rather than on the attribute.
             context.diagnose(Diagnostic(node: proto.inheritanceClause.map(Syntax.init) ?? Syntax(node),
