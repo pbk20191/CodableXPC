@@ -138,7 +138,8 @@ final class XPCServiceMacroBehaviourTests: XCTestCase {
             _ = try await greeter.ping()
             XCTFail("a call on an invalidated connection must not succeed")
         } catch {
-            // This is the path that requires XPCOneShot: the error handler and the
+            // This is the path that requires arbitration (XPCCallResumption in generated
+            // code, XPCOneShot before it): the error handler and the
             // reply block are independent, and resuming a continuation twice traps.
             XCTAssertFalse("\(error)".isEmpty)
         }

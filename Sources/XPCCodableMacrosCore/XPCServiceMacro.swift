@@ -559,30 +559,39 @@ public struct XPCServiceMacro: PeerMacro {
                     ?? (method.returnsMarker
                         ? "XPCCodableMarker(wrappedValue: try box.decode(\(payload).self))"
                         : (method.numberAccessor(returnType).map { "box.\($0)" } ?? "box"))
+                // The Swift type the *declaration* promises, which is what the resumption is
+                // generic over -- `returnType` here is the unwrapped payload, so a marker or a
+                // proxy-marker return would give the resumption the wrong type and the
+                // `succeed(_:)` call would not compile. Same expression as `.syncValue` below.
+                let declared = method.returnsMarker
+                    ? "XPCCodableMarker<\(payload)>"
+                    : (method.returnsProxyService.map { "XPCProxyMarker<\($0)>" } ?? payload)
                 return """
                     \(access)func \(method.name)\(signature) {
-                        try await withCheckedThrowingContinuation { continuation in
-                            let once = XPCOneShot()
-                            guard let proxy = proxy(resumingOnFailure: { error in
-                                if once.claim() { continuation.resume(throwing: error) }
-                            }) else {
-                                if once.claim() { continuation.resume(throwing: XPCServiceError.proxyUnavailable) }
-                                return
+                        let resumption = XPCCallResumption<\(declared)>()
+                        return try await withTaskCancellationHandler {
+                            try await withCheckedThrowingContinuation { continuation in
+                                resumption.park(continuation)
+                                guard let proxy = proxy(resumingOnFailure: { resumption.fail($0) }) else {
+                                    resumption.fail(XPCServiceError.proxyUnavailable)
+                                    return
+                                }
+                                do {
+                                    try proxy.\(call)
+                                        if let error { resumption.fail(error); return }
+                                        guard let box else {
+                                            resumption.fail(XPCServiceError.missingReply)
+                                            return
+                                        }
+                                        do { resumption.succeed(\(rewrapped)) }
+                                        catch { resumption.fail(error) }
+                                    })
+                                } catch {
+                                    resumption.fail(error)
+                                }
                             }
-                            do {
-                                try proxy.\(call)
-                                    guard once.claim() else { return }
-                                    if let error { continuation.resume(throwing: error); return }
-                                    guard let box else {
-                                        continuation.resume(throwing: XPCServiceError.missingReply)
-                                        return
-                                    }
-                                    do { continuation.resume(returning: \(rewrapped)) }
-                                    catch { continuation.resume(throwing: error) }
-                                })
-                            } catch {
-                                if once.claim() { continuation.resume(throwing: error) }
-                            }
+                        } onCancel: {
+                            resumption.cancel()
                         }
                     }
                 """
@@ -590,23 +599,25 @@ public struct XPCServiceMacro: PeerMacro {
                 let call = method.name + "(" + (arguments + ["reply: { error in"]).joined(separator: ", ")
                 return """
                     \(access)func \(method.name)\(signature) {
-                        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
-                            let once = XPCOneShot()
-                            guard let proxy = proxy(resumingOnFailure: { error in
-                                if once.claim() { continuation.resume(throwing: error) }
-                            }) else {
-                                if once.claim() { continuation.resume(throwing: XPCServiceError.proxyUnavailable) }
-                                return
+                        let resumption = XPCCallResumption<Void>()
+                        return try await withTaskCancellationHandler {
+                            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
+                                resumption.park(continuation)
+                                guard let proxy = proxy(resumingOnFailure: { resumption.fail($0) }) else {
+                                    resumption.fail(XPCServiceError.proxyUnavailable)
+                                    return
+                                }
+                                do {
+                                    try proxy.\(call)
+                                        if let error { resumption.fail(error) }
+                                        else { resumption.succeed(()) }
+                                    })
+                                } catch {
+                                    resumption.fail(error)
+                                }
                             }
-                            do {
-                                try proxy.\(call)
-                                    guard once.claim() else { return }
-                                    if let error { continuation.resume(throwing: error) }
-                                    else { continuation.resume() }
-                                })
-                            } catch {
-                                if once.claim() { continuation.resume(throwing: error) }
-                            }
+                        } onCancel: {
+                            resumption.cancel()
                         }
                     }
                 """

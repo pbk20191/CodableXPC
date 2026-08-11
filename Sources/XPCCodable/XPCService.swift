@@ -43,9 +43,20 @@
 ///
 /// ## What this does not do
 ///
-/// **Cancellation does not reach the peer.** The generated calls are `async` but a
-/// cancelled `Task` does not cancel an in-flight NSXPC call — the reply block is the
-/// only thing that can resume the continuation.
+/// **Cancellation ends the call, but does not reach the peer.** A cancelled `Task` makes an
+/// `async throws` call throw `CancellationError` instead of waiting; the service still runs to
+/// completion and its reply is discarded. NSXPC has no way to withdraw an in-flight invocation,
+/// so that half is not a gap that can be closed here.
+///
+/// What it *does* close is the wait. Before, a peer that was alive and simply not answering
+/// parked the caller forever -- the reply block never ran and the connection's error handler
+/// never fired -- so no caller-imposed timeout was possible either. Now one is, with nothing but
+/// `Task.cancel()`; which is why no timeout is baked in, since a deadline is a policy and
+/// policies belong to callers.
+///
+/// **The synchronous shapes are not cancellable.** `throws` and `throws -> T` without `async`
+/// block the calling thread in a semaphore, and a blocked thread has no task to cancel. They end
+/// when the peer replies or the connection dies -- see ``XPCSyncOutcome/wait()``.
 ///
 /// **Thrown error types do not survive.** NSXPC delivers an `NSError`, so a caller
 /// catches that rather than the original Swift error.
@@ -84,8 +95,12 @@ public enum XPCServiceError: Error, Equatable, Sendable {
 ///
 /// NSXPC gives a call two independent ways to finish — the reply block and the
 /// connection's error handler — and nothing stops both from firing. Resuming a
-/// `CheckedContinuation` twice traps, so generated code routes every resume through
-/// one of these.
+/// `CheckedContinuation` twice traps, so a resume has to be arbitrated.
+///
+/// **Generated code no longer uses this**; it uses ``XPCCallResumption``, which arbitrates the
+/// same two callbacks *and* holds the continuation so a cancellation handler can resume it. This
+/// remains for a hand-written client that arbitrates its own continuation and does not need the
+/// third path.
 public final class XPCOneShot: @unchecked Sendable {
     private let lock = NSLock()
     private var claimed = false
@@ -102,6 +117,75 @@ public final class XPCOneShot: @unchecked Sendable {
     }
 }
 
+
+/// The single outcome of an `async` call, resumable from three racing places.
+///
+/// An NSXPC call has two ways to finish -- the reply block and the connection's error handler --
+/// and nothing stops both from firing. ``XPCOneShot`` exists for exactly that. This type adds
+/// the third: **the calling task being cancelled**.
+///
+/// That third one is why `XPCOneShot` is not enough. `withTaskCancellationHandler` runs its
+/// `onCancel` outside the continuation's closure, so the handler needs something that *holds*
+/// the continuation rather than something that merely arbitrates a flag. Without it a call to a
+/// peer that is alive and simply not answering never comes back: the reply block never runs, the
+/// connection is healthy so the error handler never runs, and the continuation is parked forever
+/// -- past its own task's cancellation, which is what makes a caller-imposed timeout impossible.
+///
+/// **`park(_:)` can resume immediately, and must.** `withTaskCancellationHandler` invokes
+/// `onCancel` at once when the task is already cancelled -- before the operation body runs -- so
+/// ``cancel()`` can land before there is any continuation to resume. The outcome is remembered
+/// and handed to whoever parks next.
+public final class XPCCallResumption<Value>: @unchecked Sendable {
+
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Value, any Error>?
+    private var outcome: Result<Value, any Error>?
+    private var resumed = false
+
+    public init() {}
+
+    /// Hand over the continuation. Resumes it at once if an outcome already arrived.
+    public func park(_ continuation: CheckedContinuation<Value, any Error>) {
+        let pending: Result<Value, any Error>? = lock.withLock {
+            guard !resumed else { return nil }
+            if let outcome {
+                resumed = true
+                return outcome
+            }
+            self.continuation = continuation
+            return nil
+        }
+        guard let pending else { return }
+        continuation.resume(with: pending)
+    }
+
+    public func succeed(_ value: Value) { finish(.success(value)) }
+
+    public func fail(_ error: any Error) { finish(.failure(error)) }
+
+    /// The calling task was cancelled. Ends the call with `CancellationError`.
+    ///
+    /// The peer is **not** told, and cannot be: NSXPC has no way to withdraw an in-flight
+    /// invocation, so the service runs to completion and its reply is discarded. What changes is
+    /// that the caller stops waiting -- which is the part a caller can act on.
+    public func cancel() { finish(.failure(CancellationError())) }
+
+    private func finish(_ result: Result<Value, any Error>) {
+        let continuation: CheckedContinuation<Value, any Error>? = lock.withLock {
+            guard !resumed else { return nil }
+            guard let parked = self.continuation else {
+                // Nothing to resume yet. Remember it for `park(_:)`; first writer wins, so a
+                // reply that races cancellation reports whichever actually happened first.
+                if outcome == nil { outcome = result }
+                return nil
+            }
+            resumed = true
+            self.continuation = nil
+            return parked
+        }
+        continuation?.resume(with: result)
+    }
+}
 
 /// Collects the single outcome of a synchronous call.
 ///
