@@ -113,13 +113,26 @@ public final class XPCConnectionTransport: RawTransportProtocol, @unchecked Send
             if isActivated { return (nil, true) }
             isActivated = true
             self.box = box
+            // Published under the *same* lock hold that stores `self.box`, and the ordering is
+            // the point: an earlier revision did this after releasing the lock, which left a
+            // window for `cancel(reason:)` to run in between -- its `box?.transport = nil`
+            // cleared a box this line would then repopulate, reinstating the
+            // transport -> connection -> handler -> box -> transport cycle that the clear
+            // exists to cut. The same race `XPCRawTransport.accepting` documented; the fix is
+            // the same publication order it used.
+            box.transport = self
             return (nil, false)
         }
         if let reason = outcome.cancelled {
             throw RawTransportError.rawTransportCancelled(message: reason)
         }
         guard !outcome.alreadyActive else { return }
-        box.transport = self
+        // These stay outside the lock on purpose. `xpc_connection_set_event_handler` can
+        // deliver on another queue the instant `xpc_connection_activate` runs, and that
+        // delivery path takes this lock (`handleIncoming`); holding it here would be a
+        // lock-order inversion waiting for a queue. A cancel that lands between the lock
+        // release and these two calls is benign now: the box is already cleared, so the
+        // handler installed below dispatches into nothing.
         xpc_connection_set_event_handler(connection) { event in
             box.transport?.handle(event)
         }
