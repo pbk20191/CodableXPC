@@ -15,7 +15,7 @@ import Foundation
 /// initialisers, which is what a non-`final` class produces, and subclassing it is not a
 /// documented extension point. Nothing here needs to be overridable, and `final` is what
 /// lets this be `Sendable` rather than `@unchecked Sendable`.
-@available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
+@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
 public final class XPCActorSystem: Sendable {
 
     /// Diagnostics only. Apple's `XPCSystem.debugName`, never transmitted.
@@ -81,7 +81,7 @@ public final class XPCActorSystem: Sendable {
 
 /// Apple's `XPCSystem` witnesses all eight `DistributedActorSystem` requirements, and so
 /// does this.
-@available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
+@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
 extension XPCActorSystem: DistributedActorSystem {
 
     public typealias ActorID = XPCActors.ActorID
@@ -332,7 +332,7 @@ extension XPCActorSystem: DistributedActorSystem {
 /// The `InboundInvocation` is passed rather than an `InvocationDecoder` because the
 /// decoder is `inout` at the call site, and an `inout` parameter in a stored closure type
 /// buys nothing here -- the decoder is built inside and consumed there.
-@available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
+@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
 typealias InboundThunk = (
     _ instance: AnyObject,
     _ system: XPCActorSystem,
@@ -363,7 +363,7 @@ typealias InboundThunk = (
 /// container was vended by the decoder that read the request, so it carries that decoder's
 /// `userInfo`. There is deliberately no second `userInfo` on this type -- one would be a
 /// copy that could disagree with the one actually in force.
-@available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
+@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
 public struct InvocationDecoder: DistributedTargetInvocationDecoder {
 
     public typealias SerializationRequirement = any Codable
@@ -448,7 +448,7 @@ public struct InvocationDecoder: DistributedTargetInvocationDecoder {
 /// whatever executor the target ran on and the read happens on the execution task, so the
 /// two are ordered by the `await` -- but "ordered in the only way we call it" is not a
 /// property the type can state, and a lock costs one uncontended acquire.
-@available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
+@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
 public final class ResultHandler: DistributedTargetInvocationResultHandler,
                                   @unchecked Sendable {
 
@@ -515,7 +515,7 @@ public final class ResultHandler: DistributedTargetInvocationResultHandler,
                 as non-throwing.
                 """)
         }
-        try write(RemoteInvocationResponse<Never>.failure(.executionFailed("\(error)")))
+        try write(RemoteInvocationResponse<NoSuccess>.failure(.executionFailed("\(error)")))
     }
 
     private func write(_ response: some Encodable) throws {
@@ -539,7 +539,7 @@ public final class ResultHandler: DistributedTargetInvocationResultHandler,
 ///
 /// Only `.executionFailed` is constructed in this slice, by the stubs. The other three
 /// belong to the transport and cancellation paths.
-@available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
+@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
 public struct RemoteInvocationCancellationError: Error, Equatable, Sendable,
                                                  CustomStringConvertible {
 

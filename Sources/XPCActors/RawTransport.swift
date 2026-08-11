@@ -5,7 +5,7 @@ import Foundation
 /// This seam is why the whole stack is testable without XPC, a second process, or
 /// an installed service, and it is where an `xpc_connection_t`-backed transport
 /// would slot in later to lower the deployment floor to macOS 13.
-@available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
+@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
 public protocol RawTransportProtocol: AnyObject, Sendable {
     /// Install the inbound handler. Must be called before `activate()`; packets
     /// that arrive with no handler installed are dropped.
@@ -54,7 +54,7 @@ public protocol RawTransportProtocol: AnyObject, Sendable {
     var peerAttestation: (any PeerAttestation)? { get }
 }
 
-@available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
+@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
 extension RawTransportProtocol {
     public var peerAttestation: (any PeerAttestation)? { nil }
 }

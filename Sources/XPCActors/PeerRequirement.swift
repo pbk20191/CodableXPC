@@ -26,7 +26,7 @@ import XPC
 /// only layer that knows who the peer is. That is Apple's arrangement too:
 /// `RawTransportProtocol.auditToken` → `Session.RemoteInterface.auditToken` →
 /// `audit_token_t.satisfies(requirement:)`.
-@available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
+@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
 public struct PeerRequirement: Sendable, CustomStringConvertible {
 
     /// What this requirement is, in words. Stable, and the only thing a non-token
@@ -37,6 +37,28 @@ public struct PeerRequirement: Sendable, CustomStringConvertible {
     /// stored property cannot carry that availability. `nil` for a requirement built by
     /// ``init(_:)``.
     private let box: (any Sendable)?
+
+    // **There is no C box, and that is a measurement rather than a preference.**
+    //
+    // Now that transports speak to `xpc_connection_t` directly, the obvious move is to carry an
+    // `xpc_peer_requirement_t` and use `xpc_connection_set_peer_requirement` /
+    // `xpc_peer_requirement_match_received_message`. Both were tried. Two things stop it, and
+    // the second is fatal:
+    //
+    // 1. Every function in `<xpc/peer_requirement.h>`, and `xpc_connection_set_peer_requirement`
+    //    with them, is declared `XPC_SWIFT_NOEXPORT` -- the symbols are `XPC_EXPORT` but the
+    //    Swift importer is told to hide them. That alone is routable around: `static inline`
+    //    forwarders in a C target make them callable, and that shim was written and compiled.
+    // 2. The object type cannot be linked. `_OBJC_CLASS_$_OS_xpc_peer_requirement` appears in
+    //    **no** `.tbd` in the SDK -- not `libxpc.tbd`, not `libSystem.B.tbd`, not anywhere under
+    //    `usr/lib` -- so a Swift declaration that so much as casts to `xpc_peer_requirement_t`
+    //    fails to link: *"Undefined symbols for architecture arm64:
+    //    _OBJC_CLASS_$_OS_xpc_peer_requirement"*.
+    //
+    // Only the overlay, built against the real dylib, can hold one. So a requirement is an
+    // `XPCPeerRequirement` here, evaluated by ``AuditTokenAttestation`` -- and a client cannot
+    // ask libxpc to pre-screen a service it dials, which ``Service`` says out loud rather than
+    // connecting unguarded.
 
     /// A requirement named but not expressed in overlay terms.
     ///
@@ -74,7 +96,7 @@ public struct PeerRequirement: Sendable, CustomStringConvertible {
 /// the point: 'unknown' is distinct from 'no'."* A transport with no attestation at all
 /// returns `nil` from this, and every gate in ``Session`` folds `nil` into **refuse** — but
 /// it folds it there, deliberately, rather than losing the distinction here.
-@available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
+@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
 public protocol PeerAttestation: Sendable {
 
     /// `true` / `false` / `nil` — satisfied, not satisfied, cannot tell.
@@ -200,13 +222,11 @@ extension audit_token_t {
     func xpcBridgedIsValid() -> Bool
 }
 
-@available(macOS 26, macCatalyst 26, *)
-extension XPCSession {
-
-    /// `XPC.XPCSession.auditToken.getter : __C.audit_token_t`
-    @_silgen_name("$s3XPC10XPCSessionC10auditTokenSo0C8_token_tavg")
-    func xpcBridgedAuditToken() -> audit_token_t
-}
+// The fourth bridged declaration, `XPC.XPCSession.auditToken.getter`, is **gone** rather than
+// merely unused. It was the connection-level token `XPCRawTransport` read; that transport was
+// replaced by ``XPCConnectionTransport``, which has no `XPCSession` to read it from. Keeping a
+// `@_silgen_name` binding with no caller would be keeping a weakly-linked symbol reference
+// alive to prove a point -- the comment above already records that it exists and works.
 
 @available(macOS 26, macCatalyst 26, *)
 extension XPCDictionary {
@@ -214,10 +234,16 @@ extension XPCDictionary {
     /// `XPC.XPCDictionary.auditToken.getter : __C.audit_token_t`
     ///
     /// The per-*message* token, for a transport that would rather attest to the sender of
-    /// the bytes in hand than to the connection. Unused by ``XPCRawTransport``, which takes
-    /// the connection-level token as Apple's `XPCRawTransport.auditToken` does; kept
-    /// because it is the symbol that makes the two readings distinguishable, and a test
-    /// pins that a dictionary which never crossed a connection has **no** valid token.
+    /// the bytes in hand than to the connection.
+    ///
+    /// **This is now the only reading available, and it is why this declaration was worth
+    /// keeping.** It was written speculatively, beside the `XPCSession` one that
+    /// ``XPCRawTransport`` actually used, on the grounds that it made the two readings
+    /// distinguishable. When the transport dropped to `xpc_connection_t` the session-level
+    /// accessor went with the overlay and the public connection API has no replacement, so
+    /// ``XPCConnectionTransport`` attests from the last message it received. A test pins that a
+    /// dictionary which never crossed a connection has **no** valid token, which is what keeps
+    /// "cannot tell" distinct from "not entitled" on this path.
     @_silgen_name("$s3XPC13XPCDictionaryV10auditTokenSo0C8_token_tavg")
     func xpcBridgedAuditToken() -> audit_token_t
 }
@@ -245,7 +271,7 @@ extension XPCDictionary {
 ///   witness table `swift_conformsToProtocol2` returns, with no `await` — so Apple's is
 ///   nonisolated whether or not their source says the word. An isolated one could not be
 ///   read from the gate at all.
-@available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
+@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
 public protocol RestrictedAccessDistributedActor: DistributedActor
 where ActorSystem == XPCActorSystem {
 

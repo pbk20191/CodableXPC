@@ -18,7 +18,7 @@ import Foundation
 /// Declared here rather than beside `SessionCoding` in `ActorID.swift` on purpose:
 /// `sendInvocation` mentions `RemoteCallTarget` and `InvocationEncoder`, and
 /// `ActorID.swift` is deliberately buildable with no `Distributed` import at all.
-@available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
+@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
 public protocol OutboundSession: SessionCoding {
 
     /// Send one invocation to `id` and wait for its response.
@@ -55,8 +55,8 @@ public protocol OutboundSession: SessionCoding {
 /// an `ActorRegistry<Void>` -- and a generic parameter that can only ever be `Void` buys
 /// nothing but a type argument at every use site. (`ActorRegistry` keeps its own
 /// parameter; narrowing that is a separate change to a separate type.)
-@available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
-final class Session: SessionCoding, OutboundSession, InboundSession, @unchecked Sendable {
+@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
+public final class Session: SessionCoding, OutboundSession, InboundSession, @unchecked Sendable {
 
     /// From the process-global counter, like Apple's `Session.id` -- the same generator
     /// that mints system and instance ids, and deliberately *not* the per-session one
@@ -90,7 +90,7 @@ final class Session: SessionCoding, OutboundSession, InboundSession, @unchecked 
     /// Now derived rather than stored: the previous slice stored an `ID64` beside a
     /// registry and noted that it "becomes `system.id` and stays honest" once a session
     /// is handed a system. It is that now, so the two can no longer disagree.
-    var systemID: ID64 { system.id }
+    public var systemID: ID64 { system.id }
 
     /// Where a local id is turned into the instance behind it -- the system's table, not
     /// one of our own. Apple's `addSharedActor` likewise calls
@@ -200,6 +200,14 @@ final class Session: SessionCoding, OutboundSession, InboundSession, @unchecked 
     /// and it moves to `InitializationOptions` when those arrive.
     private let activationEvent: ActivationEvent
 
+    /// Apple's `Session.cancellationEvent` -- the second of the two promises
+    /// `cancellationCompleted()` fulfils (`ldp x8,x20,[self,#0x48]` is this one; `[self,#0x60]`
+    /// is the activation event, and the comment at `cancellationCompleted()` already named
+    /// both). It exists now because ``LocalInterface/activateThenWaitForCancellation()`` is
+    /// the shape a service process parks in for its whole lifetime, and parking needs
+    /// something to park on.
+    private let cancellationEvent = ActivationEvent(posted: false)
+
     /// `fileprivate`: sessions come from ``XPCActorSystem/makeSession(over:)``, which is
     /// at the bottom of this file. (`private` would not reach it -- Swift extends
     /// `private` to extensions of *the same type* in the same file, and the vending
@@ -277,7 +285,7 @@ final class Session: SessionCoding, OutboundSession, InboundSession, @unchecked 
     /// `InitializationOptions.bidirectional`, and neither the options nor the
     /// initialisers that set them exist yet. A flag with one settable value is a
     /// guard that tests nothing; it goes in with the initialisers.
-    func shareDynamically(_ local: RawActorID.Local) -> SharedActorKey? {
+    public func shareDynamically(_ local: RawActorID.Local) -> SharedActorKey? {
         // Outside our lock, deliberately: `lookup` takes the registry's own lock, and
         // taking two locks in one critical section is how lock orders get invented by
         // accident. Nothing between here and the insert can invalidate the answer that
@@ -293,6 +301,54 @@ final class Session: SessionCoding, OutboundSession, InboundSession, @unchecked 
             return key
         }
     }
+
+    /// Share `local` under a key the *caller* chose, rather than a minted one.
+    ///
+    /// This is the other half of Apple's `Session.(addSharedActor)`: both `export`
+    /// overloads on ``LocalInterface`` build a `SharedActorKey` themselves --
+    /// `.exportedRawValue(name)` or `.exported(SwiftType(stub))` -- and funnel into the
+    /// same table that ``shareDynamically(_:)`` writes. A well-known key is what lets a
+    /// client name an actor it has never been handed a reference to, which is the entire
+    /// bootstrap problem: `.dynamic` keys are useless to a peer that has not yet received
+    /// one.
+    ///
+    /// **`keyForLocal` is deliberately not written here.** That map exists to dedupe
+    /// `shareDynamically`, and it holds one key per actor. An actor can legitimately be
+    /// exported under a well-known name *and* handed out dynamically, and if this wrote the
+    /// map, the later dynamic share would hand the peer the well-known key instead of
+    /// minting one -- a silent aliasing of two different namings. Reading it is likewise
+    /// wrong: a name the caller chose must win over whatever was minted earlier.
+    ///
+    /// Returns `false` when the actor is not registered (deallocated, or never `actorReady`)
+    /// or the session is already cancelled, so a caller can fail loudly rather than export
+    /// nothing and find out at the first call.
+    ///
+    /// The two failure reasons are reported apart because they deserve opposite treatment,
+    /// and collapsing them into one `false` would force the caller to pick wrongly for one of
+    /// them. `notRegistered` is the caller handing us an actor that is not live -- API misuse.
+    /// `sessionCancelled` is the peer having hung up during setup -- a race nobody misused.
+    enum ShareOutcome {
+        case shared
+        case notRegistered
+        case sessionCancelled
+    }
+
+    func addSharedActor(_ local: RawActorID.Local, at key: SharedActorKey) -> ShareOutcome {
+        guard let entry = registry.lookup(local) else { return .notRegistered }
+        return lock.withLock {
+            guard !isCancelled else { return .sessionCancelled }
+            byKey[key] = SharedActor(local: local, instance: entry.instance,
+                                     thunk: entry.thunk)
+            return .shared
+        }
+    }
+
+    /// What the peer's transport can attest about it, if anything.
+    ///
+    /// Exposed so ``Session/RemoteInterface/satisfies(requirement:)`` can ask -- `transport`
+    /// itself stays private, because a caller holding an interface has no business reaching
+    /// the pipe.
+    var peerAttestation: (any PeerAttestation)? { transport.peerAttestation }
 
     /// Turn a key the peer sent us into the id we use for the actor it names.
     ///
@@ -327,7 +383,7 @@ final class Session: SessionCoding, OutboundSession, InboundSession, @unchecked 
     /// `byKey` is still load-bearing -- it is what dedupes a re-share, what holds
     /// exported actors alive, and what the inbound execution path will look an actor up
     /// in. It is simply not something the *decode* path may consult.
-    func remoteID(for key: SharedActorKey) -> ActorID {
+    public func remoteID(for key: SharedActorKey) -> ActorID {
         ActorID(raw: .remote(.init(session: self, key: key)))
     }
 
@@ -396,7 +452,7 @@ final class Session: SessionCoding, OutboundSession, InboundSession, @unchecked 
     /// absence), and a key coming back cannot become a proxy without one. Apple threads
     /// the same dictionary through both halves; `Payload.init(encoding:userInfo:)` has no
     /// default parameter precisely so this cannot be forgotten.
-    func sendInvocation<Res: Codable>(
+    public func sendInvocation<Res: Codable>(
         to id: ActorID,
         target: RemoteCallTarget,
         invocation: inout InvocationEncoder
@@ -533,6 +589,15 @@ final class Session: SessionCoding, OutboundSession, InboundSession, @unchecked 
     /// Internal for tests.
     var isLocalInterfaceActivated: Bool { activationEvent.isPosted }
 
+    /// Park until this session's conversation ends.
+    ///
+    /// One-shot and idempotent, like every other `ActivationEvent`: a session that has
+    /// already been cancelled returns immediately rather than parking forever, which is the
+    /// difference between a service that exits and one that hangs on shutdown.
+    func waitForCancellation() async {
+        await cancellationEvent.waitUnlessCancelled()
+    }
+
     /// Apple's `Session.waitForLocalInterfaceActivation() async`, step 3 of the inbound
     /// success path -- before `Task.isCancelled`, before `resolveSharedActor(at:)`, and so
     /// before either the target or its peer requirement is looked at.
@@ -657,7 +722,7 @@ final class Session: SessionCoding, OutboundSession, InboundSession, @unchecked 
     /// entry is only resolved by a response or by the pipe dying. That is why the decode
     /// failure, the missing-actor failure, the per-actor refusal and the duplicate-id failure
     /// are answers rather than returns, and it is what Apple's six inlined
-    /// `RemoteInvocationResponse<Never>` failure sites are. The exceptions are the
+    /// `RemoteInvocationResponse<NoSuccess>` failure sites are. The exceptions are the
     /// system-wide gate (which cancels the session, so the transport fails the request) and
     /// the post-activation cancellation check (whose caller has already been failed with
     /// `.callingTaskCancelled`). Both are Apple's arms, and both are argued at their sites.
@@ -1021,14 +1086,14 @@ final class Session: SessionCoding, OutboundSession, InboundSession, @unchecked 
     /// `userInfo: [:]` because the body is a string: nothing session-bound can reach it,
     /// and the failure path must not itself be able to fail on a missing session.
     private static func failure(_ message: String) -> Packet.Payload {
-        payload(RemoteInvocationResponse<Never>(executionFailure: message))
+        payload(RemoteInvocationResponse<NoSuccess>(executionFailure: message))
     }
 
     private static func propagationFailure(_ message: String) -> Packet.Payload {
-        payload(RemoteInvocationResponse<Never>(resultPropagationFailure: message))
+        payload(RemoteInvocationResponse<NoSuccess>(resultPropagationFailure: message))
     }
 
-    private static func payload(_ response: RemoteInvocationResponse<Never>) -> Packet.Payload {
+    private static func payload(_ response: RemoteInvocationResponse<NoSuccess>) -> Packet.Payload {
         do {
             return try Packet.Payload(encoding: response, userInfo: [:])
         } catch {
@@ -1051,7 +1116,7 @@ final class Session: SessionCoding, OutboundSession, InboundSession, @unchecked 
     /// Note what this is not responsible for: the requests *we* have outstanding. The
     /// transport fails those itself, through `RequestTable.failAll`, and it stays failed
     /// so a caller arriving afterwards is refused rather than parked forever.
-    func handleTransportCancellation() {
+    public func handleTransportCancellation() {
         cancelAllPendingInvocationExecutionTasks()
         cancellationCompleted()
     }
@@ -1080,6 +1145,7 @@ final class Session: SessionCoding, OutboundSession, InboundSession, @unchecked 
         // same shape as the orphaned-execution leak the duplicate-id guard exists for.
         // Released *after* the table is cleared, so a waker resolves nothing.
         activationEvent.post()
+        cancellationEvent.post()
     }
 }
 
@@ -1087,7 +1153,7 @@ final class Session: SessionCoding, OutboundSession, InboundSession, @unchecked 
 // MARK: - The system vends sessions
 // ===========================================================================================
 
-@available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
+@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
 extension XPCActorSystem {
 
     /// Open a session over `transport`.

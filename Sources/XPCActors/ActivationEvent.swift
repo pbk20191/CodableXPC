@@ -23,12 +23,25 @@ import Foundation
 /// No `Combine.Future` here: this is one latch and a list of parked continuations, which is
 /// what the future is being used as. `Fuse` — Apple's `{ value: Atomic<Bool> }` one-shot —
 /// is the `posted` flag under the same lock.
-@available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
+@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
 final class ActivationEvent: @unchecked Sendable {
 
     private let lock = NSLock()
     private var posted: Bool
     private var waiters: [UnsafeContinuation<Void, Never>] = []
+
+    /// Waiters that gave their own name at the door, so ``waitUnlessCancelled()`` can wake
+    /// exactly one of them without disturbing the rest. Keyed rather than appended because
+    /// cancellation is per-waiter and `post()` is for everybody.
+    private var keyedWaiters: [UInt64: UnsafeContinuation<Void, Never>] = [:]
+
+    /// Waiters whose task was cancelled in the window between taking a ticket and parking.
+    /// Without this the cancellation is simply lost and the waiter parks forever -- the
+    /// classic `withTaskCancellationHandler` race, and the reason the handler cannot just
+    /// look in `keyedWaiters` and give up when it finds nothing.
+    private var cancelledBeforeParking: Set<UInt64> = []
+
+    private var nextWaiterID: UInt64 = 0
 
     /// Apple's `OwnedAwaitableEvent.owningTask`. Escalated by ``wait()``, never awaited.
     ///
@@ -56,15 +69,61 @@ final class ActivationEvent: @unchecked Sendable {
     /// Idempotent, because Apple's `posted` is a `Fuse` — a `caslb` one-shot whose result
     /// `post()` discards.
     func post() {
+        var keyed: [UnsafeContinuation<Void, Never>] = []
         let parked: [UnsafeContinuation<Void, Never>] = lock.withLock {
             guard !posted else { return [] }
             posted = true
+            keyed = Array(keyedWaiters.values)
+            keyedWaiters.removeAll()
             defer { waiters = [] }
             return waiters
         }
         // Resumed outside the lock: a resumed continuation can run inline on this thread and
         // reach straight back into the session, which takes locks of its own.
         for waiter in parked { waiter.resume() }
+        for waiter in keyed { waiter.resume() }
+    }
+
+    /// Wait, but give up if **this** task is cancelled.
+    ///
+    /// ``wait()`` deliberately is not cancellation-aware: an inbound execution parked on the
+    /// activation gate is released by `cancellationCompleted()` posting the event, and it has
+    /// an explicit `Task.isCancelled` check on the far side. That works because something else
+    /// is guaranteed to post.
+    ///
+    /// A peer handler parked in ``Session/waitForCancellation()`` has no such guarantee. It is
+    /// woken either by the session dying or by `TransportReceiver.unwindPeers()`, and unwinding
+    /// is `task.cancel()` followed by `await task.value` -- so if the park ignores cancellation,
+    /// unwinding a peer that is still connected deadlocks. That is not an exotic case; it is
+    /// what shutdown looks like every time.
+    ///
+    /// One waiter, one ticket. `post()` still wakes everyone, and a cancellation wakes only the
+    /// waiter it belongs to.
+    func waitUnlessCancelled() async {
+        let ticket: UInt64 = lock.withLock {
+            nextWaiterID += 1
+            return nextWaiterID
+        }
+        await withTaskCancellationHandler {
+            await withUnsafeContinuation { (continuation: UnsafeContinuation<Void, Never>) in
+                let resumeNow: Bool = lock.withLock {
+                    if posted { return true }
+                    // The handler already fired for this ticket -- park and we never wake.
+                    if cancelledBeforeParking.remove(ticket) != nil { return true }
+                    keyedWaiters[ticket] = continuation
+                    return false
+                }
+                if resumeNow { continuation.resume() }
+            }
+        } onCancel: {
+            let continuation: UnsafeContinuation<Void, Never>? = lock.withLock {
+                if let parked = keyedWaiters.removeValue(forKey: ticket) { return parked }
+                // Cancelled before the body parked. Leave a note; the body will find it.
+                cancelledBeforeParking.insert(ticket)
+                return nil
+            }
+            continuation?.resume()
+        }
     }
 
     /// Escalate the owner, then await the latch. One await.

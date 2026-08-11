@@ -24,7 +24,7 @@ import Foundation
 /// serialises, misspells it, while `DirectInvocationDecoder`, the in-process path that
 /// never touches the wire, spells it correctly. Apple fixed the typo only where it was
 /// free to.
-@available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
+@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
 enum InvocationCodingKeys: String, CodingKey {
     case protocolStub
     case genericSubsitutions
@@ -45,7 +45,7 @@ enum InvocationCodingKeys: String, CodingKey {
 /// `executeDistributedTarget` knows each parameter's type statically from the callee
 /// signature and asks for them in order, so a tag would be pure overhead. Labels are
 /// discarded for the same reason.
-@available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
+@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
 public struct InvocationBody: Encodable {
 
     /// The `_DistributedActorStub` a call goes through when it targets a distributed
@@ -99,7 +99,7 @@ public struct InvocationBody: Encodable {
 /// until `executeDistributedTarget` asks for it by static type. So every header field is
 /// decoded eagerly and the arguments container is *retained unconsumed*, for the
 /// invocation decoder to drive one element at a time.
-@available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
+@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
 public struct InboundInvocation: Decodable {
 
     public let protocolStub: SwiftType?
@@ -138,7 +138,7 @@ public struct InboundInvocation: Decodable {
 /// `contents` holds the invocation dictionary *directly*: this is a nesting relative to
 /// a flattened request, and a flattening relative to what the name `InvocationContents`
 /// suggests.
-@available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
+@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
 public struct RemoteInvocationRequest: Encodable {
 
     /// The correlation id. Coded through `ID64`'s own single-value conformance, so it
@@ -185,7 +185,7 @@ public struct RemoteInvocationRequest: Encodable {
 /// The inbound side of a request. Splits from `RemoteInvocationRequest` for the reason
 /// `InboundInvocation` splits from `InvocationBody`: the arguments cannot be decoded
 /// here.
-@available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
+@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
 public struct InboundRequest: Decodable {
 
     public let id: ID64
@@ -243,7 +243,7 @@ public struct InboundRequest: Decodable {
 /// Synthesized here on purpose. Apple's is synthesized -- it has a `CodingKeys` in the
 /// shipping reflection metadata -- so writing the conformance by hand could only
 /// diverge.
-@available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
+@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
 /// Its decode side accepts anything, and that is correct rather than a hole. Apple's
 /// `Ack.init(from:)` (`0x2ad4ebcdc`) opens no container at all -- it destroys the boxed
 /// decoder existential and returns -- so `[0, 7]`, `[0, "junk"]`, `[0, null]` and
@@ -276,12 +276,44 @@ public struct Ack: Codable, Hashable, Sendable {
 /// whoever knows the return type, which is Apple's arrangement.
 ///
 /// A failure carries no success value, so a failure-only response is spelled
-/// `RemoteInvocationResponse<Never>`, which is literally what Apple instantiates: the
+/// `RemoteInvocationResponse<NoSuccess>` -- Apple spells it `<Never>`, and the substitution is
+/// argued at ``NoSuccess``: the
 /// lazy `Encodable` witness accessor for `RemoteInvocationResponse<Swift.Never>` is a
 /// direct call in `encodeReply`'s failure arm (`0x2ad512738`) and in `encodeReturn`'s
 /// catch path (`0x2ad512298`). `<Never>` is not the void answer -- ``Ack`` is; a
 /// `<Never>` response cannot hold `.result` at all, which is the point of it.
-@available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
+/// The stand-in for `Never` in a failure-only response.
+///
+/// **`Never` is what Apple instantiates and what this module used, until the floor moved.**
+/// `Never`'s `Codable` conformance ships in the macOS 14 runtime; the module now targets macOS
+/// 13, and a conformance that is not there is not a compile-time inconvenience but a missing
+/// witness record. So the *type* changes and nothing else does.
+///
+/// **The wire is byte-identical, and that is checked rather than asserted.** `Success` is
+/// touched in exactly one place -- the `.result` arm of `encode(to:)` and of `init(from:)`. A
+/// failure response writes tag `1` and a ``RemoteInvocationFailure``, and reads the same; the
+/// success type is never instantiated, encoded, or decoded. An uninhabited stand-in therefore
+/// produces the same bytes as `Never` for every message that can actually exist.
+///
+/// Uninhabited, so `encode(to:)` is unreachable by construction rather than by convention --
+/// there is no value of this type to call it on.
+@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
+public enum NoSuccess: Codable, Hashable, Sendable {
+
+    /// Reached only by a peer that sent tag `0` -- a *success* -- in a response we are decoding
+    /// as failure-only. That is a peer disagreeing with us about the shape of the reply, so it
+    /// is a decode failure and not a trap.
+    public init(from decoder: any Decoder) throws {
+        throw DecodingError.dataCorruptedError(
+            in: try decoder.singleValueContainer(),
+            debugDescription: "a failure-only response carried a success value")
+    }
+
+    /// Unreachable: no value of an uninhabited type exists to encode.
+    public func encode(to encoder: any Encoder) throws {}
+}
+
+@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
 public enum RemoteInvocationResponse<Success: Codable> {
 
     case result(Success)
@@ -311,21 +343,21 @@ public enum RemoteInvocationResponse<Success: Codable> {
 }
 
 /// The void reply: `[0, {}]`, tag zero over an ``Ack``.
-@available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
+@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
 extension RemoteInvocationResponse where Success == Ack {
     public static var void: RemoteInvocationResponse<Ack> { .result(Ack()) }
 }
 
-@available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
+@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
 extension RemoteInvocationResponse: Equatable where Success: Equatable {}
 
-@available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
+@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
 extension RemoteInvocationResponse: Hashable where Success: Hashable {}
 
-@available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
+@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
 extension RemoteInvocationResponse: Sendable where Success: Sendable {}
 
-@available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
+@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
 extension RemoteInvocationResponse: Codable {
 
     public func encode(to encoder: any Encoder) throws {
@@ -373,13 +405,13 @@ extension RemoteInvocationResponse: Codable {
 /// payload, and a text fallback -- three-tier typed propagation. Interop deletes it.
 /// Smuggling the extra fields back in would produce a dictionary a real peer cannot
 /// decode.
-@available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
+@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
 public enum RemoteInvocationFailure: Hashable, Sendable {
     case executionFailed(String)
     case resultPropagationFailed(String)
 }
 
-@available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
+@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
 extension RemoteInvocationFailure: Codable {
 
     private enum CodingKeys: String, CodingKey {
@@ -454,14 +486,14 @@ extension RemoteInvocationFailure: Codable {
 /// The escalation cases are Phase C: nothing sends them yet, but the format is complete.
 ///
 /// `Equatable` rather than `Hashable` only because `TaskPriority` is not `Hashable`.
-@available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
+@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
 public enum RemoteNotification: Equatable, Sendable {
     case invocationCancelled(id: ID64)
     case invocationEscalated(id: ID64, priority: TaskPriority)
     case responseEscalated(id: ID64, priority: TaskPriority)
 }
 
-@available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
+@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
 extension RemoteNotification: Codable {
 
     private enum CodingKeys: String, CodingKey {
