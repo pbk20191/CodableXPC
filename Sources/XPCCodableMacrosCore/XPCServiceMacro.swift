@@ -13,6 +13,7 @@ enum XPCServiceDiagnostic: String, DiagnosticMessage {
     case unsupportedRequirement
     case objcNameNotALiteral
     case proxyMarkerArgument
+    case inheritedProtocol
 
     var severity: DiagnosticSeverity { .error }
     var diagnosticID: MessageID { MessageID(domain: "XPCCodableMacros", id: rawValue) }
@@ -49,6 +50,15 @@ enum XPCServiceDiagnostic: String, DiagnosticMessage {
                 @XPCService(objcName:) needs a plain string literal. The name is baked \
                 into the generated @objc attribute at compile time, so it cannot be \
                 computed.
+                """
+        case .inheritedProtocol:
+            return """
+                @XPCService cannot see requirements a protocol inherits. The macro is \
+                syntactic -- it is handed this protocol's own text and nothing else, so an \
+                inherited protocol's methods are invisible to it and would silently not be \
+                carried across the connection. Copy the requirements you need into this \
+                protocol. Only 'AnyObject' and 'Sendable' may be inherited, because neither \
+                adds a requirement to carry.
                 """
         case .unsupportedRequirement:
             return """
@@ -260,6 +270,38 @@ public struct XPCServiceMacro: PeerMacro {
             return []
         }
 
+        // Inheritance, and why it is refused rather than followed.
+        //
+        // The macro is syntactic: it receives this protocol's text and nothing else. It cannot
+        // resolve `Base`, so it cannot generate shim methods for `Base`'s requirements -- and a
+        // generated client that silently did not carry them is the worst available outcome. What
+        // happened before this check was almost as bad: the client failed to conform, and the
+        // error landed *inside macro expansion*, pointing at code the author never wrote
+        // ("type 'DerivedXPCClient' does not conform to protocol 'Base'").
+        //
+        // `AnyObject` and `Sendable` are let through because neither adds a requirement to
+        // carry. `AnyObject` does change what has to be generated, though -- see `isClassBound`.
+        //
+        // `NSObjectProtocol` is deliberately **not** on that list: it looks harmless and is not.
+        // It requires `isEqual:`, `hash` and the rest, which a plain Swift class does not get
+        // for free, so admitting it would trade one confusing generated-code error for another.
+        let harmlessInheritance: Set<String> = ["AnyObject", "Sendable"]
+        let inherited = proto.inheritanceClause?.inheritedTypes.map {
+            $0.type.trimmedDescription
+        } ?? []
+        for name in inherited where !harmlessInheritance.contains(name) {
+            // Pointed at the inheritance clause when there is one, so the caret lands on the
+            // author's own text rather than on the attribute.
+            context.diagnose(Diagnostic(node: proto.inheritanceClause.map(Syntax.init) ?? Syntax(node),
+                                       message: XPCServiceDiagnostic.inheritedProtocol))
+            return []
+        }
+        /// A class-bound protocol cannot be satisfied by a struct, and the generated client was
+        /// one -- so `protocol P: AnyObject` failed with "non-class type 'PXPCClient' cannot
+        /// conform to class protocol 'P'". It is a natural thing to write on a service protocol,
+        /// so the client becomes a `final class` instead of the declaration being refused.
+        let isClassBound = inherited.contains("AnyObject")
+
         // nil means a requirement was rejected and a diagnostic already emitted;
         // an empty array means the protocol simply has no methods, which is legal
         // and yields an empty shim.
@@ -281,7 +323,8 @@ public struct XPCServiceMacro: PeerMacro {
         return [
             DeclSyntax(stringLiteral: shim(name: name, access: access,
                                            objcName: objcName, methods: methods)),
-            DeclSyntax(stringLiteral: client(name: name, access: access, methods: methods)),
+            DeclSyntax(stringLiteral: client(name: name, access: access, methods: methods,
+                                            isClassBound: isClassBound)),
             DeclSyntax(stringLiteral: adapter(name: name, access: access, methods: methods)),
             DeclSyntax(stringLiteral: facade(name: name, access: access, methods: methods)),
         ]
@@ -543,7 +586,8 @@ public struct XPCServiceMacro: PeerMacro {
         """
     }
 
-    private static func client(name: String, access: String, methods: [Method]) -> String {
+    private static func client(name: String, access: String, methods: [Method],
+                               isClassBound: Bool) -> String {
         let implementations = methods.map { method -> String in
             let signature = method.decl.signature.trimmedDescription
             let arguments = method.clientArguments
@@ -702,7 +746,7 @@ public struct XPCServiceMacro: PeerMacro {
 
         return """
         /// Client half generated by `@XPCService`. Obtain one from `\(name)XPC.remote(_:)`.
-        \(access)struct \(name)XPCClient: \(name) {
+        \(access)\(isClassBound ? "final class" : "struct") \(name)XPCClient: \(name) {
             /// Every call below goes through `proxy(resumingOnFailure:)` and none of
             /// them care where the shim came from, which is what lets a proxy handed
             /// over as an argument be driven by exactly the same code as a connection.

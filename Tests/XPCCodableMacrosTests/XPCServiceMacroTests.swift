@@ -26,6 +26,40 @@ final class XPCServiceMacroDiagnosticTests: XCTestCase {
             macros: macros)
     }
 
+    /// A protocol that inherits requirements is refused, with a message about *inheritance*.
+    ///
+    /// Before this, the macro simply ignored the inheritance clause and generated a client that
+    /// did not conform. The error that reached the author was "type 'DerivedXPCClient' does not
+    /// conform to protocol 'Base'", reported *inside macro expansion* -- pointing at code they
+    /// never wrote, and not mentioning the thing they actually did wrong.
+    func testRejectsInheritedRequirements() {
+        assertMacroExpansion(
+            """
+            @XPCService
+            protocol Derived: Base {
+                func f() async throws -> Int
+            }
+            """,
+            expandedSource: """
+            protocol Derived: Base {
+                func f() async throws -> Int
+            }
+            """,
+            diagnostics: [
+                DiagnosticSpec(
+                    message: """
+                        @XPCService cannot see requirements a protocol inherits. The macro is \
+                        syntactic -- it is handed this protocol's own text and nothing else, so \
+                        an inherited protocol's methods are invisible to it and would silently \
+                        not be carried across the connection. Copy the requirements you need \
+                        into this protocol. Only 'AnyObject' and 'Sendable' may be inherited, \
+                        because neither adds a requirement to carry.
+                        """,
+                    line: 2, column: 17)
+            ],
+            macros: macros)
+    }
+
     func testRejectsAValueReturnWithoutThrows() {
         // The important one. Such a method cannot report a dropped connection, so
         // allowing it would mean either trapping or lying.

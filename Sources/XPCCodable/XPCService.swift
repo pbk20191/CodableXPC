@@ -41,6 +41,17 @@
 /// value but does not `throw` is refused: an XPC connection can drop at any moment,
 /// and such a method has no way to say so.
 ///
+/// ## Inheritance
+///
+/// Only `AnyObject` and `Sendable` may be inherited, and anything else is refused at compile
+/// time. The macro is syntactic: it is handed this protocol's text and nothing else, so it cannot
+/// resolve an inherited protocol, cannot see its requirements, and would generate a client that
+/// silently did not carry them. Copy the requirements you need into the protocol.
+///
+/// `AnyObject` is admitted and changes what is generated -- the client becomes a `final class`
+/// rather than a struct, since a class-bound protocol cannot be satisfied by a value type. That
+/// is the one place where the generated client has reference semantics.
+///
 /// ## What this does not do
 ///
 /// **Cancellation ends the call, but does not reach the peer.** A cancelled `Task` makes an
