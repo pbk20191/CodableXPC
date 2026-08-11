@@ -10,7 +10,7 @@ import Foundation
 ///
 /// See `docs/superpowers/specs/2026-08-08-xpcdistributed-interop-wire-format.md`,
 /// "SharedActorKey -- an unkeyed pair, not synthesized coding".
-@available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
+@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
 public enum SharedActorKey: Hashable, Sendable {
     /// The default actor for a type. Pre-agreed: a peer can import it with no round
     /// trip. Payload is a `SwiftType`, never a bare mangled name.
@@ -25,7 +25,7 @@ public enum SharedActorKey: Hashable, Sendable {
     case dynamic(ID64)
 }
 
-@available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
+@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
 extension SharedActorKey: Codable {
 
     /// `RawRepresentable` over `UInt8`, `0, 1, 2` in declaration order -- confirmed by

@@ -4,18 +4,16 @@ import XPC
 
 /// Tier 3: real XPC, one process.
 ///
-/// An anonymous `XPCListener` publishes an endpoint that we dial from this same
-/// process. That exercises the real overlay and real message passing without
-/// needing an installed service or a second process.
+/// An anonymous listener publishes an endpoint that we dial from this same process. That
+/// exercises real message passing without needing an installed service or a second process.
 ///
-/// This class is `@available(macOS 15, ...)`, not the plan's blanket macOS 14 floor:
-/// the anonymous `XPCListener` init, `XPCListener.endpoint`, and `XPCEndpoint` itself
-/// all require macOS 15 / macCatalyst 18 in the real overlay and are `unavailable` on
-/// iOS/tvOS/watchOS. See task-8-report.md for the confirmed signatures.
-@available(macOS 15, macCatalyst 18, *)
-@available(iOS, unavailable)
-@available(tvOS, unavailable)
-@available(watchOS, unavailable)
+/// **This suite used to be `@available(macOS 15, macCatalyst 18, *)` and unavailable on every
+/// other platform**, because the anonymous `XPCListener` init, `XPCListener.endpoint` and
+/// `XPCEndpoint` are macOS 15 and macOS-only. It is now macOS 13 and available everywhere,
+/// which is the clearest single measurement of what dropping to `xpc_connection_t` bought:
+/// `xpc_connection_create(NULL, q)` and `xpc_endpoint_create` are `__MAC_10_7`, and neither is
+/// restricted to macOS.
+@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
 final class XPCRawTransportTests: XCTestCase {
 
     struct Ping: Codable, Equatable { let value: Int }
@@ -29,13 +27,11 @@ final class XPCRawTransportTests: XCTestCase {
         let serverReady = expectation(description: "server transport built")
         let box = ServerBox()
 
-        // `.none` here (matching the brief) actually means "start active on init":
-        // calling `.activate()` afterward makes libxpc trap with "Attempting to
-        // activate an already active listener" (SIGTRAP / api-misuse, confirmed by
-        // stepping through `xpc_listener_activate` in lldb -- see task-8-report.md).
-        // `.inactive` is required to defer activation to the explicit call below.
-        let listener = XPCListener(targetQueue: nil, options: .inactive) { request in
-            let (decision, raw) = XPCRawTransport.accepting(request)
+        // No `.inactive` dance and no double-activation trap to avoid: an
+        // `XPCConnectionListener` is created active, and the peers it hands out are the
+        // suspended things, which is the right way round -- the window in which a peer's
+        // handlers must be installed is the peer's, not the listener's.
+        let listener = XPCConnectionListener.anonymous { raw in
             let transport = Transport(debugName: "server", role: .responder, rawTransport: raw)
             transport.inboundRequestHandler = { _, payload, reply in
                 guard let ping = try? payload.decode(as: Ping.self),
@@ -44,16 +40,14 @@ final class XPCRawTransportTests: XCTestCase {
                 reply(body)
             }
             box.transport = transport
-            // activate() only brings the pipe up; it exchanges nothing and blocks on
-            // nothing. The accepted session is already live, so this is a no-op beyond
-            // installing the handler.
+            // Now it does something: libxpc hands over a *suspended* peer connection, so this
+            // is what resumes it. Under the overlay the accepted session was already live and
+            // this call was a no-op.
             Task { try? await transport.activate() }
             serverReady.fulfill()
-            return decision
         }
-        try listener.activate()
 
-        let clientRaw = try XPCRawTransport.connecting(to: listener.endpoint)
+        let clientRaw = XPCConnectionTransport.connecting(to: listener.endpoint)
         let client = Transport(debugName: "client", role: .initiator, rawTransport: clientRaw)
         try await client.activate()
 
@@ -83,7 +77,7 @@ final class XPCRawTransportTests: XCTestCase {
     /// Keeps the raw transport as well, so the attestation can be read off the accepted
     /// side of a live connection.
     final class RawBox: @unchecked Sendable {
-        var raw: XPCRawTransport?
+        var raw: XPCConnectionTransport?
         var transport: Transport?
     }
 
@@ -107,8 +101,7 @@ final class XPCRawTransportTests: XCTestCase {
         let serverReady = expectation(description: "server transport built")
         let box = RawBox()
 
-        let listener = XPCListener(targetQueue: nil, options: .inactive) { request in
-            let (decision, raw) = XPCRawTransport.accepting(request)
+        let listener = XPCConnectionListener.anonymous { raw in
             let transport = Transport(debugName: "server", role: .responder, rawTransport: raw)
             transport.inboundRequestHandler = { _, payload, reply in
                 guard let ping = try? payload.decode(as: Ping.self),
@@ -121,11 +114,9 @@ final class XPCRawTransportTests: XCTestCase {
             box.transport = transport
             Task { try? await transport.activate() }
             serverReady.fulfill()
-            return decision
         }
-        try listener.activate()
 
-        let clientRaw = try XPCRawTransport.connecting(to: listener.endpoint)
+        let clientRaw = XPCConnectionTransport.connecting(to: listener.endpoint)
         let client = Transport(debugName: "client", role: .initiator, rawTransport: clientRaw)
         try await client.activate()
 

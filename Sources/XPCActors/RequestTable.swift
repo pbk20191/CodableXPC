@@ -8,7 +8,7 @@ import Foundation
 ///
 /// There is no timeout. A request waits until the peer replies, the calling task
 /// is cancelled, or the transport dies.
-@available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
+@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
 public actor RequestTable {
 
     public enum Outcome: Sendable {

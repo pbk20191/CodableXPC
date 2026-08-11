@@ -8,7 +8,7 @@ import XPC
 /// dialled out and a responder was accepted, and that is the whole of the difference.
 /// Kept because it is still a true and useful fact about a transport -- every debug
 /// message and every future asymmetry wants it -- not because anything branches on it.
-@available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
+@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
 public enum TransportRole: Sendable {
     /// Dialled out to a peer.
     case initiator
@@ -28,7 +28,7 @@ public enum TransportRole: Sendable {
 /// knowing what a session is -- and so it can hold it **weakly**, which a stored closure
 /// could not do: a session holds its transport strongly, so a closure capturing the
 /// session would make the pair immortal.
-@available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
+@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
 public protocol InboundSession: AnyObject, Sendable {
     /// The pipe died, from either end. Apple's does two things -- cancel the invocation
     /// executions this process started for the peer, and complete the cancellation,
@@ -48,7 +48,7 @@ public protocol InboundSession: AnyObject, Sendable {
 /// `XPCDistributed`, so sending them would put a packet category on the wire that no
 /// real peer can decode. What that costs is written down where the version key used to
 /// be, in `EnvelopeKey`.
-@available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
+@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
 public final class Transport: @unchecked Sendable {
 
     /// Handles one inbound request: `(id, body, reply)`.

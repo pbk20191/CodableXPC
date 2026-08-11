@@ -6,7 +6,7 @@ import Foundation
 /// This exists to break a cycle: `ActorID` needs a session, and `Session` is built on
 /// `ActorID`. Naming only the two operations identity needs also keeps `Distributed`
 /// out of this file, and lets identity be tested with no transport at all.
-@available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
+@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
 public protocol SessionCoding: AnyObject, Sendable {
     /// Make a local actor reachable to the peer and return the key naming it.
     /// `nil` when the actor is not registered -- it was deallocated, or was never ready.
@@ -50,7 +50,7 @@ public protocol SessionCoding: AnyObject, Sendable {
     var systemID: ID64 { get }
 }
 
-@available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
+@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
 extension CodingUserInfoKey {
     /// The `SessionCoding` an `ActorID` codes itself against.
     public static let xpcActorSession = CodingUserInfoKey(rawValue: "XPCActors.session")!
@@ -60,7 +60,7 @@ extension CodingUserInfoKey {
 ///
 /// Drawn from a process-global monotonic counter -- neither random nor pid-derived,
 /// and it never needs to be unique across processes, because it is never transmitted.
-@available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
+@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
 public struct ID64: Hashable, Sendable, Codable, CustomStringConvertible {
     public let rawValue: UInt64
     public init(rawValue: UInt64) { self.rawValue = rawValue }
@@ -92,7 +92,7 @@ public struct ID64: Hashable, Sendable, Codable, CustomStringConvertible {
 
 /// A monotonic counter. `OSAllocatedUnfairLock` rather than an atomics package so the
 /// target keeps its single dependency on `CodableXPC`.
-@available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
+@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
 private final class ManagedAtomicCounter: @unchecked Sendable {
     private let lock = NSLock()
     private var value: UInt64 = 0
@@ -104,7 +104,7 @@ private final class ManagedAtomicCounter: @unchecked Sendable {
     }
 }
 
-@available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
+@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
 public enum RawActorID: Hashable, @unchecked Sendable {
 
     case local(Local)
@@ -131,7 +131,7 @@ public enum RawActorID: Hashable, @unchecked Sendable {
     }
 }
 
-@available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
+@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
 extension RawActorID.Remote: Hashable {
     /// The session is compared by identity: the same key reached through two different
     /// sessions names two different actors.
@@ -148,13 +148,13 @@ extension RawActorID.Remote: Hashable {
 ///
 /// Its `Codable` conformance is the load-bearing part of the design: what goes on the
 /// wire is a `SharedActorKey` in a single-value container, never the id's own contents.
-@available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
+@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
 public struct ActorID: Hashable, @unchecked Sendable {
     public let raw: RawActorID
     public init(raw: RawActorID) { self.raw = raw }
 }
 
-@available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
+@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
 extension ActorID: Codable {
 
     public func encode(to encoder: any Encoder) throws {

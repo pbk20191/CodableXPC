@@ -14,7 +14,7 @@ import Distributed
 /// name only means anything wrapped, and keeping the wrapper here rather than at the
 /// boundary is what stops a display string from being spelled the same way as a mangled
 /// one. See `docs/superpowers/specs/2026-08-08-xpcdistributed-interop-wire-format.md`.
-@available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
+@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
 public struct InvocationEncoder: DistributedTargetInvocationEncoder {
 
     public typealias SerializationRequirement = any Codable
