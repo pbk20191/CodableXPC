@@ -103,35 +103,6 @@ public final class XPCOneShot: @unchecked Sendable {
 }
 
 
-extension NSXPCConnection {
-    @objc(remoteObjectProxyWithTimeout:errorHandler:)
-    @NSManaged func remoteObjectProxy(with timeout: TimeInterval, errorHandler: @convention(block) @escaping (Error) -> Void) -> NSObjectProtocol
-    
-    @objc(remoteObjectProxyWithUserInfo:errorHandler:)
-    @NSManaged func remoteObjectProxy(with userInfo: NSObjectProtocol?, errorHandler: @convention(block) @escaping (Error) -> Void) -> NSObjectProtocol
-    @NSManaged weak var delegate: NSXPCConnectionDelegate?
-    
-//    +(void)_handoffCurrentReplyToQueue:(id)arg1 block:(/*^block*/id)arg2 ;
-    
-    func asdf() {
-//        NSXPCConnection.trans
-    }
-
-}
-
-
-
-
-@objc(NSXPCConnectionDelegate)
-protocol NSXPCConnectionDelegate {
-    @available(*, unavailable)
-    @objc(connection:handleInvocation:isReply:)
-    optional func connection(_ connection: NSXPCConnection, handleInvocation: NSInvocation, isReply: Bool)
-    
-    @objc(replacementObjectForXPCConnection:encoder:object:)
-    optional func replacementObject(for: NSXPCConnection, encoder: NSXPCCoder, object: Any) -> Any?
-}
-
 /// Collects the single outcome of a synchronous call.
 ///
 /// `synchronousRemoteObjectProxyWithErrorHandler` runs the reply block — or the
