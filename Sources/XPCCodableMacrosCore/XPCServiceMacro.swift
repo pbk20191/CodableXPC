@@ -229,7 +229,7 @@ private struct Method {
                 return parameter.labelled("a\(index)")
             }
             return parameter.labelled(
-                "XPCCodableMarker(wrappedValue: try a\(index).decode(\(boxed.trimmedDescription).self))")
+                "XPCCodableMarker<\(boxed.trimmedDescription)>(wrappedValue: try a\(index).decode())")
         }
     }
 
@@ -604,7 +604,7 @@ public struct XPCServiceMacro: PeerMacro {
                 let rewrapped = method.returnsProxyService
                     .map { _ in "XPCProxyMarker(wrappedValue: box, lifetime: sourceLifetime)" }
                     ?? (method.returnsMarker
-                        ? "XPCCodableMarker(wrappedValue: try box.decode(\(payload).self))"
+                        ? "XPCCodableMarker<\(payload)>(wrappedValue: try box.decode())"
                         : (method.numberAccessor(returnType).map { "box.\($0)" } ?? "box"))
                 // The Swift type the *declaration* promises, which is what the resumption is
                 // generic over -- `returnType` here is the unwrapped payload, so a marker or a
@@ -613,17 +613,14 @@ public struct XPCServiceMacro: PeerMacro {
                 let declared = method.returnsMarker
                     ? "XPCCodableMarker<\(payload)>"
                     : (method.returnsProxyService.map { "XPCProxyMarker<\($0)>" } ?? payload)
-                return """
-                    \(access)func \(method.name)\(signature) {
-                        let resumption = XPCCallResumption<\(declared)>()
-                        return try await withTaskCancellationHandler {
-                            try await withCheckedThrowingContinuation { continuation in
-                                resumption.park(continuation)
-                                guard let proxy = proxy(resumingOnFailure: { resumption.fail($0) }) else {
-                                    resumption.fail(XPCServiceError.proxyUnavailable)
-                                    return
-                                }
-                                do {
+                // The shim call itself never throws; only argument boxing does, and only when a
+                // parameter is boxed. Emitting `try` + `do/catch` unconditionally left an
+                // unnecessary `try` and an unreachable `catch` in every no-argument method --
+                // both warnings under strict concurrency, and errors in the Swift 6 language
+                // mode that a consumer would inherit through the expansion.
+                let sendCall = method.hasBoxedParameter
+                    ? """
+                        do {
                                     try proxy.\(call)
                                         if let error { resumption.fail(error); return }
                                         guard let box else {
@@ -636,6 +633,29 @@ public struct XPCServiceMacro: PeerMacro {
                                 } catch {
                                     resumption.fail(error)
                                 }
+                    """
+                    : """
+                        proxy.\(call)
+                                    if let error { resumption.fail(error); return }
+                                    guard let box else {
+                                        resumption.fail(XPCServiceError.missingReply)
+                                        return
+                                    }
+                                    do { resumption.succeed(\(rewrapped)) }
+                                    catch { resumption.fail(error) }
+                                })
+                    """
+                return """
+                    \(access)func \(method.name)\(signature) {
+                        let resumption = XPCCallResumption<\(declared)>()
+                        return try await withTaskCancellationHandler {
+                            try await withCheckedThrowingContinuation { continuation in
+                                resumption.park(continuation)
+                                guard let proxy = proxy(resumingOnFailure: { resumption.fail($0) }) else {
+                                    resumption.fail(XPCServiceError.proxyUnavailable)
+                                    return
+                                }
+                                \(sendCall)
                             }
                         } onCancel: {
                             resumption.cancel()
@@ -644,6 +664,23 @@ public struct XPCServiceMacro: PeerMacro {
                 """
             case .twoWayVoid:
                 let call = method.name + "(" + (arguments + ["reply: { error in"]).joined(separator: ", ")
+                let sendCall = method.hasBoxedParameter
+                    ? """
+                        do {
+                                    try proxy.\(call)
+                                        if let error { resumption.fail(error) }
+                                        else { resumption.succeed(()) }
+                                    })
+                                } catch {
+                                    resumption.fail(error)
+                                }
+                    """
+                    : """
+                        proxy.\(call)
+                                    if let error { resumption.fail(error) }
+                                    else { resumption.succeed(()) }
+                                })
+                    """
                 return """
                     \(access)func \(method.name)\(signature) {
                         let resumption = XPCCallResumption<Void>()
@@ -654,14 +691,7 @@ public struct XPCServiceMacro: PeerMacro {
                                     resumption.fail(XPCServiceError.proxyUnavailable)
                                     return
                                 }
-                                do {
-                                    try proxy.\(call)
-                                        if let error { resumption.fail(error) }
-                                        else { resumption.succeed(()) }
-                                    })
-                                } catch {
-                                    resumption.fail(error)
-                                }
+                                \(sendCall)
                             }
                         } onCancel: {
                             resumption.cancel()
@@ -674,7 +704,7 @@ public struct XPCServiceMacro: PeerMacro {
                 let rewrapped = method.returnsProxyService
                     .map { _ in "XPCProxyMarker(wrappedValue: box, lifetime: sourceLifetime)" }
                     ?? (method.returnsMarker
-                        ? "XPCCodableMarker(wrappedValue: try box.decode(\(payload).self))"
+                        ? "XPCCodableMarker<\(payload)>(wrappedValue: try box.decode())"
                         : (method.numberAccessor(returnType).map { "box.\($0)" } ?? "box"))
                 let declared = method.returnsMarker
                     ? "XPCCodableMarker<\(payload)>"
@@ -690,7 +720,7 @@ public struct XPCServiceMacro: PeerMacro {
                         }) else {
                             throw XPCServiceError.proxyUnavailable
                         }
-                        try proxy.\(call)
+                        \(method.hasBoxedParameter ? "try " : "")proxy.\(call)
                             if let error { outcome.set(.failure(error)); return }
                             guard let box else {
                                 outcome.set(.failure(XPCServiceError.missingReply)); return
@@ -712,7 +742,7 @@ public struct XPCServiceMacro: PeerMacro {
                         }) else {
                             throw XPCServiceError.proxyUnavailable
                         }
-                        try proxy.\(call)
+                        \(method.hasBoxedParameter ? "try " : "")proxy.\(call)
                             outcome.set(error.map { .failure($0) } ?? .success(()))
                         })
                         outcome.wait()
