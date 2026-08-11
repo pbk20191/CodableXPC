@@ -107,9 +107,13 @@ final class ActivationEvent: @unchecked Sendable {
         await withTaskCancellationHandler {
             await withUnsafeContinuation { (continuation: UnsafeContinuation<Void, Never>) in
                 let resumeNow: Bool = lock.withLock {
-                    if posted { return true }
-                    // The handler already fired for this ticket -- park and we never wake.
-                    if cancelledBeforeParking.remove(ticket) != nil { return true }
+                    // Drain the note unconditionally, even when `posted` also wins the race:
+                    // otherwise a ticket that was cancelled-before-parking *and* then posted
+                    // leaves its entry behind, because `post()` never touches this set. Bounded
+                    // per one-shot event, but a set that only grows is still a set that only
+                    // grows.
+                    let wasCancelledEarly = cancelledBeforeParking.remove(ticket) != nil
+                    if posted || wasCancelledEarly { return true }
                     keyedWaiters[ticket] = continuation
                     return false
                 }
