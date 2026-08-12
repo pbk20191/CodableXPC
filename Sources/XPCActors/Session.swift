@@ -770,7 +770,13 @@ public final class Session: SessionCoding, OutboundSession, InboundSession, @unc
             return
         }
 
-        let callTarget = RemoteCallTarget(request.remoteCallIdentifier)
+        // Captured as the String it is built from, not as the `RemoteCallTarget` itself.
+        // `RemoteCallTarget` is not `Sendable` (it is the runtime's own type), and the
+        // execution task below is a `sending` closure, so capturing the value would be a
+        // non-Sendable capture -- an error in the Swift 6 language mode. The identifier is a
+        // `String`, and the target is reconstructed from it inside the task, where it is used;
+        // it is never touched on this delivering context, so nothing is lost.
+        let callTargetIdentifier = request.remoteCallIdentifier
         // `canThrow` is the presence of `errorType`, which is the only signal the wire
         // carries. See ``ResultHandler/canThrow``, which records that Apple's own
         // computation of it is unresolved.
@@ -819,6 +825,8 @@ public final class Session: SessionCoding, OutboundSession, InboundSession, @unc
         let accepted = lock.withLock { () -> Bool in
             guard pendingInvocationExecutionTasks[id] == nil else { return false }
             pendingInvocationExecutionTasks[id] = Task(priority: priority) { [weak self] in
+                // Rebuilt here rather than captured -- see `callTargetIdentifier` above.
+                let callTarget = RemoteCallTarget(callTargetIdentifier)
                 // The floor, applied the way Apple applies it: not as the spawn priority
                 // but as an escalation of the task that is already running, which is why it
                 // can only ever raise. See ``executionFloorPriority()``.
@@ -927,7 +935,7 @@ public final class Session: SessionCoding, OutboundSession, InboundSession, @unc
             reply(Self.failure("""
                 request id \(id) is already in flight on this session; ids are minted from \
                 a monotonic per-session counter and are never reused, so \
-                \(callTarget.identifier) was refused rather than displacing the execution \
+                \(callTargetIdentifier) was refused rather than displacing the execution \
                 already running under that id
                 """))
             return
