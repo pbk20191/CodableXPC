@@ -572,9 +572,9 @@ public struct XPCServiceMacro: PeerMacro {
             switch method.shape {
             case .twoWayValue(let returnType), .syncValue(let returnType):
                 let replyType = method.replyType(returnType)
-                return "    func \(method.name)(\((parameters + ["reply: @escaping (\(replyType), (any Error)?) -> Void"]).joined(separator: ", ")))"
+                return "    func \(method.name)(\((parameters + ["reply: @Sendable @escaping (\(replyType), (any Error)?) -> Void"]).joined(separator: ", ")))"
             case .twoWayVoid, .syncVoid:
-                return "    func \(method.name)(\((parameters + ["reply: @escaping ((any Error)?) -> Void"]).joined(separator: ", ")))"
+                return "    func \(method.name)(\((parameters + ["reply: @Sendable @escaping ((any Error)?) -> Void"]).joined(separator: ", ")))"
             case .oneWay:
                 return "    func \(method.name)(\(parameters.joined(separator: ", ")))"
             }
@@ -647,7 +647,7 @@ public struct XPCServiceMacro: PeerMacro {
                     """
                 return """
                     \(access)func \(method.name)\(signature) {
-                        let resumption = XPCCallResumption<\(declared)>()
+                        \(method.returnsProxyService != nil ? "let sourceLifetime = self.sourceLifetime\n                        " : "")let resumption = XPCCallResumption<\(declared)>()
                         return try await withTaskCancellationHandler {
                             try await withCheckedThrowingContinuation { continuation in
                                 resumption.park(continuation)
@@ -714,7 +714,7 @@ public struct XPCServiceMacro: PeerMacro {
                         // The synchronous proxy runs the reply block, or the error
                         // handler, before this call returns -- so the outcome is
                         // already there to be read on the line after.
-                        let outcome = XPCSyncOutcome<\(declared)>()
+                        \(method.returnsProxyService != nil ? "let sourceLifetime = self.sourceLifetime\n                        " : "")let outcome = XPCSyncOutcome<\(declared)>()
                         guard let proxy = synchronousProxy(reportingFailureTo: {
                             outcome.set(.failure($0))
                         }) else {
@@ -887,7 +887,7 @@ public struct XPCServiceMacro: PeerMacro {
                             ? "NSNumber(value: result)"
                             : "result"))
                 return """
-                    \(access)func \(method.name)(\((parameters + ["reply: @escaping (\(replyType), (any Error)?) -> Void"]).joined(separator: ", "))) {
+                    \(access)func \(method.name)(\((parameters + ["reply: @Sendable @escaping (\(replyType), (any Error)?) -> Void"]).joined(separator: ", "))) {
                         \(captureLifetime)let implementation = self.implementation
                         Task {
                             do {
@@ -899,7 +899,7 @@ public struct XPCServiceMacro: PeerMacro {
                 """
             case .twoWayVoid:
                 return """
-                    \(access)func \(method.name)(\((parameters + ["reply: @escaping ((any Error)?) -> Void"]).joined(separator: ", "))) {
+                    \(access)func \(method.name)(\((parameters + ["reply: @Sendable @escaping ((any Error)?) -> Void"]).joined(separator: ", "))) {
                         \(captureLifetime)let implementation = self.implementation
                         Task {
                             do { try await implementation.\(method.name)(\(arguments)); reply(nil) }
@@ -916,7 +916,7 @@ public struct XPCServiceMacro: PeerMacro {
                             ? "NSNumber(value: result)"
                             : "result"))
                 return """
-                    \(access)func \(method.name)(\((parameters + ["reply: @escaping (\(replyType), (any Error)?) -> Void"]).joined(separator: ", "))) {
+                    \(access)func \(method.name)(\((parameters + ["reply: @Sendable @escaping (\(replyType), (any Error)?) -> Void"]).joined(separator: ", "))) {
                         \(captureLifetime)// No Task: the implementation is synchronous too, and the caller
                         // is blocked on this reply running before the call returns.
                         do {
@@ -927,7 +927,7 @@ public struct XPCServiceMacro: PeerMacro {
                 """
             case .syncVoid:
                 return """
-                    \(access)func \(method.name)(\((parameters + ["reply: @escaping ((any Error)?) -> Void"]).joined(separator: ", "))) {
+                    \(access)func \(method.name)(\((parameters + ["reply: @Sendable @escaping ((any Error)?) -> Void"]).joined(separator: ", "))) {
                         \(captureLifetime)do { try implementation.\(method.name)(\(arguments)); reply(nil) }
                         catch { reply(error) }
                     }
@@ -955,7 +955,7 @@ public struct XPCServiceMacro: PeerMacro {
         /// `@unchecked Sendable` because NSXPC delivers calls on arbitrary queues: the
         /// implementation must already tolerate that, which is a property of the service
         /// rather than of this wrapper.
-        \(access)final class \(name)XPCAdapter<T: \(name)>: \(name)XPCShim, @unchecked Sendable {
+        \(access)final class \(name)XPCAdapter<T: \(name) & Sendable>: \(name)XPCShim, @unchecked Sendable {
             private let implementation: T
 
             \(access)init(_ implementation: T) {
@@ -1040,7 +1040,7 @@ public struct XPCServiceMacro: PeerMacro {
             /// Generic over the implementation, so the adapter holds it concretely
             /// rather than boxed. An existential still works at the call site --
             /// Swift opens it into `T` implicitly.
-            \(access)static func exported<T: \(name)>(_ implementation: T) -> any \(name)XPCShim {
+            \(access)static func exported<T: \(name) & Sendable>(_ implementation: T) -> any \(name)XPCShim {
                 \(name)XPCAdapter(implementation)
             }
         }
