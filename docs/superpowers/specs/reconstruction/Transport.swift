@@ -871,9 +871,15 @@ extension XPCSystem {
         /// [disasm] builds `Session(actorSystem:transport:options:)`, takes
         /// `session.debugDescription` as a task name, starts the peer handler with
         /// `Task.immediate(name:priority:executorPreference:operation:)` producing a
-        /// `Task<Session.LocalInterface.ActivationToken, Never>`, registers that task in
+        /// `Task<Session.LocalInterface.ActivationToken, Never>`, records it in
         /// `peerHandlingTasks` under the session's `ID64`, and calls
         /// `session.readyToReceive(task)` [all four calls resolved by symbol].
+        ///
+        /// **[corrected — see `Slot`]** What the table records is the running task's
+        /// `UnsafeCurrentTask`, not the `Task` value, and the slot passes `initial →
+        /// task(_)`. `Task.immediate` runs the handler synchronously up to its first
+        /// suspension, which is what lets its exports land before this returns and is the
+        /// natural place for the running task to record its own current-task handle.
         func attachTransport(_ transport: Transport) throws(SetupError)
 
         /// [sym] `0x2ad4e91dc`, 764 bytes. Returns the newly created peer-side session.
@@ -898,12 +904,19 @@ extension XPCSystem {
         func cancel()
 
         /// [sym] `0x2ad4e952c`, `async`, with three resume partial functions.
-        /// [disasm] collects the live tasks out of `peerHandlingTasks` under its mutex
-        /// into a `[Task<ActivationToken, Never>]`, then for each task calls
-        /// `Task.cancel()` and awaits `Task.result` — so it waits for every peer handler
-        /// to finish. UNRESOLVED: whether the log line
-        /// `"%s handler did not wait for cancellation."` (`0x2ad52c360`) is emitted from
-        /// here or from `Session`; I did not cross-reference that format string.
+        /// [disasm] under the mutex it walks `peerHandlingTasks` and cancels each running
+        /// slot (`UnsafeCurrentTask.cancel()`), then awaits — so it cancels every peer and
+        /// then waits for them.
+        ///
+        /// **[UNRESOLVED — what it awaits]** The first read said it collected
+        /// `[Task<ActivationToken, Never>]` and awaited each `.result`. That cannot be
+        /// right given the corrected `Slot`: the slot holds an `UnsafeCurrentTask`, which
+        /// has no `.result`/`.value` to await. So the await is on *something else* — a
+        /// per-session completion event, a keeper task, or a live-count reaching zero. This
+        /// is the deciding question (see `Slot`): it is what tells us whether the shutdown
+        /// join is hand-rolled or structured. Also UNRESOLVED: whether the log line
+        /// `"%s handler did not wait for cancellation."` (`0x2ad52c360`) is emitted here or
+        /// from `Session`.
         func unwindPeers() async
 
         deinit
@@ -925,13 +938,21 @@ extension XPCSystem.TransportReceiver {
         let storage: Mutex<[ID64: Slot]>
 
         /// [sym] `0x2ad4ea1d4`, 284 bytes.
-        /// [disasm] under the lock: `__RawDictionaryStorage.find(id)`; a found
-        /// `.tombstone` is removed and the registration proceeds; a found `.live` hits
-        /// `_assertionFailure` with
-        /// `"Bug in XPCDistributed: duplicate sessionID in PeerTaskTable"`; otherwise
-        /// `storage[id] = .live(task)`.
-        func register(_ task: Task<XPCSystem.Session.LocalInterface.ActivationToken, Never>,
-                      for id: ID64)
+        /// [disasm] under the lock: `__RawDictionaryStorage.find(id)`; a found terminal
+        /// slot (`.doneOrCancelled`) is removed and the registration proceeds; a found
+        /// running slot (`.task`) hits `_assertionFailure` with
+        /// `"Bug in XPCDistributed: duplicate sessionID in PeerTaskTable"`; otherwise the
+        /// slot advances into the running state.
+        ///
+        /// **[corrected — see `Slot`]** An earlier reading had this as `storage[id] =
+        /// .live(task)` with a `Task` payload. The slot actually holds an
+        /// `UnsafeCurrentTask` and moves `initial → task(_) → doneOrCancelled`, so this
+        /// records the running task's *current-task* handle, which implies the running
+        /// task registers itself (the handle only exists inside `withUnsafeCurrentTask`),
+        /// not that a `Task` value is handed in from the spawner. The exact parameter type
+        /// is therefore **[UNRESOLVED]** pending a re-read of the operands; what is firm is
+        /// the slot's payload type and its three states.
+        func register(for id: ID64)
 
         /// [sym] the method itself has no symbol — it is inlined into its callers — but
         /// its closure does:
@@ -949,16 +970,50 @@ extension XPCSystem.TransportReceiver {
 
         deinit
 
-        /// [fieldmd] `0x2ad52a3d0`: `live` with payload
-        /// `ScTy{Session.LocalInterface.ActivationToken}{Swift.Never}G`
-        /// (`Task<ActivationToken, Never>`), `tombstone` with no payload record.
-        /// [measured] size 8, stride 8, `NonPOD`, extra inhabitants 2147483646 — a
-        /// single class reference, with `tombstone` as the null pointer.
+        /// **[CORRECTED]** This was first read as a two-case `live(Task<…>)/tombstone`.
+        /// The slot is a **three-state machine over an `UnsafeCurrentTask`**:
+        ///
+        /// ```
+        /// enum Slot { case initial; case task(UnsafeCurrentTask); case doneOrCancelled }
+        /// ```
+        ///
+        /// [measured] size 8, stride 8, `NonPOD`, extra inhabitants 2147483646 — one
+        /// pointer-width payload with **two** payload-less cases. `UnsafeCurrentTask` wraps
+        /// a single `Builtin.NativeObject`, so `task(_)` is that pointer and `initial` /
+        /// `doneOrCancelled` occupy two extra inhabitants. That EI count, `2^31 − 2`, is
+        /// *more* consistent with two spare-inhabitant cases than with the single one a
+        /// `live/tombstone` pair would consume — the measurement corroborates the
+        /// correction rather than merely permitting it.
+        ///
+        /// **Why `UnsafeCurrentTask`, not `Task`.** An `UnsafeCurrentTask` offers `cancel()`,
+        /// `escalatePriority(to:)` (26+), `isCancelled`, `priority` — control only. It does
+        /// **not** retain, and it has no `.value`/`.result`: the handler's result cannot be
+        /// awaited through it. So the table holds a *control* handle and the result
+        /// (`ActivationToken`) is discarded — a genuinely discarding model, which is why the
+        /// result type never leaves the peer handler.
+        ///
+        /// **Why three states.** An `UnsafeCurrentTask` must not be used after its task
+        /// ends, and it is obtained only inside `withUnsafeCurrentTask`. The states bracket
+        /// its validity: `initial` is the reserved-but-not-yet-recorded window (id reserved
+        /// before the running task records its own handle); `task(_)` is the only state in
+        /// which cancel/escalate is sound; `doneOrCancelled` invalidates the handle before
+        /// the task deallocates. That bracket is the whole reason a bare `Task` handle was
+        /// *not* used — a `Task` would retain and be awaitable but heavier; Apple took the
+        /// lighter handle and paid for it with this state machine.
+        ///
+        /// **[UNRESOLVED, and it is the one that matters]** `unwindPeers` (0x2ad4e952c) is
+        /// `async` and was read as awaiting each task's `.result` — but an
+        /// `UnsafeCurrentTask` cannot be awaited. So either that read is wrong, or the wait
+        /// is on a separate completion signal (a per-session event, a keeper, a counter).
+        /// Resolving *what `unwindPeers` awaits after cancel* is the deciding evidence for
+        /// whether Apple's shutdown is a hand-rolled join or a structured one.
+        ///
         /// Not itself spelled with a discriminator, so it is `internal` to a `private`
         /// enclosing type.
         enum Slot {
-            case live(Task<XPCSystem.Session.LocalInterface.ActivationToken, Never>)
-            case tombstone
+            case initial
+            case task(UnsafeCurrentTask)
+            case doneOrCancelled
         }
     }
 }

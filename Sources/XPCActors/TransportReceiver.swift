@@ -41,6 +41,34 @@ extension XPCActorSystem {
         private var cancellationHandler: (@Sendable () -> Void)?
 
         /// [fieldmd] `{TransportReceiver.(PeerTaskTable)}`, private in Apple's too.
+        ///
+        /// **How this stands against Apple's, reviewed.** Apple's `PeerTaskTable` is a
+        /// `Mutex<[ID64: Slot]>` whose `Slot` is a three-state machine over an
+        /// **`UnsafeCurrentTask`** (`initial → task(_) → doneOrCancelled`) — a *control*
+        /// handle (cancel + escalate, no retain, no await), so the handler's result is
+        /// discarded and the three states bracket the unsafe handle's validity. See the
+        /// reconstruction's `Slot`.
+        ///
+        /// We deliberately hold a **`Task`** instead. It retains and, unlike an
+        /// `UnsafeCurrentTask`, it can be **awaited** — which is exactly what
+        /// ``unwindPeers()`` needs (`await task.value`). That sidesteps the one thing the
+        /// reconstruction could not resolve about Apple's version: *what `unwindPeers`
+        /// awaits*, since an `UnsafeCurrentTask` has no result to await. Our shape is
+        /// heavier (a retained `Task` per peer) but its shutdown join is plain and provable,
+        /// where Apple's is an open question. The `initial`/`doneOrCancelled` bracket has no
+        /// analogue here because we never hold an unsafe handle; a key present-or-absent is
+        /// the whole state we need.
+        ///
+        /// **Why a table at all, and not a `(Discarding)TaskGroup`** — decided, with the
+        /// evidence in the design notes. Three properties keep the table: `unwindPeers` is
+        /// *re-enterable* (it drains the current peers without shutting the receiver down,
+        /// and a group's `cancelAll`/host-cancel poisons it permanently — measured); both
+        /// serving paths (`accept`, `runXPCServiceMain` via `xpc_main`) are *synchronous*
+        /// callbacks, so a group would need an async host scope plus a sync→async bridge;
+        /// and any per-id need (dedup, state) forces a side `[ID64: State]` table *alongside*
+        /// the group, reintroducing the very thing the group was meant to replace. A group
+        /// wins only for a single async entry point with terminal-only shutdown and no
+        /// per-id need — which this is not. So the table owns the tasks directly.
         private var peerHandlingTasks: [ID64: Task<Session.LocalInterface.ActivationToken, Never>] = [:]
 
         /// [sym] 0x2ad4e99f0.
