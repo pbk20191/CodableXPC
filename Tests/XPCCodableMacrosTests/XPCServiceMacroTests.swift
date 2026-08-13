@@ -60,6 +60,64 @@ final class XPCServiceMacroDiagnosticTests: XCTestCase {
             macros: macros)
     }
 
+    /// A `static func` is a `FunctionDeclSyntax`, so it sailed past the members guard; its
+    /// modifier lives on the declaration, not in the signature the client copies, so the
+    /// generated client declared an *instance* method and failed to conform -- an error inside
+    /// the expansion. Now it is the same diagnostic every other non-method requirement gets.
+    func testRejectsAStaticMethod() {
+        assertMacroExpansion(
+            """
+            @XPCService
+            protocol S {
+                static func ping()
+            }
+            """,
+            expandedSource: """
+            protocol S {
+                static func ping()
+            }
+            """,
+            diagnostics: [
+                DiagnosticSpec(
+                    message: """
+                        @XPCService supports method requirements only. NSXPC has no way to express \
+                        a property, initializer, subscript, or static member across a connection.
+                        """,
+                    line: 3, column: 5)
+            ],
+            macros: macros)
+    }
+
+    /// The reply slot's own optionality is the failure channel, so `-> String?` became
+    /// `String??` in the shim -- unrepresentable in Objective-C, reported from inside the
+    /// expansion. Refused with a message that says what to do instead.
+    func testRejectsAnOptionalReturn() {
+        assertMacroExpansion(
+            """
+            @XPCService
+            protocol S {
+                func f() async throws -> String?
+            }
+            """,
+            expandedSource: """
+            protocol S {
+                func f() async throws -> String?
+            }
+            """,
+            diagnostics: [
+                DiagnosticSpec(
+                    message: """
+                        @XPCService cannot return an optional. The reply block's slot is already \
+                        optional -- nil there means "the peer failed to reply", and it is how a \
+                        thrown error crosses -- so an optional return would make a legitimate nil \
+                        indistinguishable from a missing reply. Return a non-optional, or wrap the \
+                        optional in a Codable type and mark it XPCCodableMarker.
+                        """,
+                    line: 3, column: 30)
+            ],
+            macros: macros)
+    }
+
     func testRejectsAValueReturnWithoutThrows() {
         // The important one. Such a method cannot report a dropped connection, so
         // allowing it would mean either trapping or lying.

@@ -14,6 +14,7 @@ enum XPCServiceDiagnostic: String, DiagnosticMessage {
     case objcNameNotALiteral
     case proxyMarkerArgument
     case inheritedProtocol
+    case optionalReturn
 
     var severity: DiagnosticSeverity { .error }
     var diagnosticID: MessageID { MessageID(domain: "XPCCodableMacros", id: rawValue) }
@@ -50,6 +51,14 @@ enum XPCServiceDiagnostic: String, DiagnosticMessage {
                 @XPCService(objcName:) needs a plain string literal. The name is baked \
                 into the generated @objc attribute at compile time, so it cannot be \
                 computed.
+                """
+        case .optionalReturn:
+            return """
+                @XPCService cannot return an optional. The reply block's slot is already \
+                optional -- nil there means "the peer failed to reply", and it is how a \
+                thrown error crosses -- so an optional return would make a legitimate nil \
+                indistinguishable from a missing reply. Return a non-optional, or wrap the \
+                optional in a Codable type and mark it XPCCodableMarker.
                 """
         case .inheritedProtocol:
             return """
@@ -220,10 +229,13 @@ private struct Method {
         parameters.enumerated().map { index, parameter in
             // A proxy arrives as the peer's shim; wrap it so the implementation still
             // sees the Swift protocol it declared.
-            if let service = parameter.proxyService {
-                _ = service
-                return parameter.labelled(
-                    "XPCProxyMarker(wrappedValue: a\(index), lifetime: lifetime)")
+            if parameter.proxyService != nil {
+                // `m\(index)` is built in the adapter's synchronous prologue -- see
+                // `proxyMarkerPrologue`. Built there rather than here so the adapter's
+                // `Task` captures the marker (Sendable) instead of the bare `any Shim`
+                // existential (not), which was a strict-concurrency error in every
+                // consumer's expansion.
+                return parameter.labelled("m\(index)")
             }
             guard let boxed = parameter.boxedType else {
                 return parameter.labelled("a\(index)")
@@ -231,6 +243,16 @@ private struct Method {
             return parameter.labelled(
                 "XPCCodableMarker<\(boxed.trimmedDescription)>(wrappedValue: try a\(index).decode())")
         }
+    }
+
+    /// The adapter's synchronous prologue for proxy parameters: wrap each incoming
+    /// `any Shim` in its marker *before* the `Task`, so the task captures the Sendable
+    /// marker rather than the bare existential.
+    var proxyMarkerPrologue: String {
+        parameters.enumerated().compactMap { index, parameter -> String? in
+            guard parameter.isProxy else { return nil }
+            return "let m\(index) = XPCProxyMarker(wrappedValue: a\(index), lifetime: lifetime)\n                        "
+        }.joined()
     }
 
     /// What the client passes into the shim.
@@ -303,7 +325,13 @@ public struct XPCServiceMacro: PeerMacro {
         /// one -- so `protocol P: AnyObject` failed with "non-class type 'PXPCClient' cannot
         /// conform to class protocol 'P'". It is a natural thing to write on a service protocol,
         /// so the client becomes a `final class` instead of the declaration being refused.
-        let isClassBound = inherited.contains("AnyObject")
+        // Last-component match, for the same reason as `harmlessInheritance` above -- and
+        // measured: `protocol P: Swift.AnyObject` passed the harmless check but missed this
+        // exact-match, so the client came out a struct and the author got "non-class type
+        // 'PXPCClient' cannot conform to class protocol" from inside the expansion.
+        let isClassBound = inherited.contains {
+            ($0.split(separator: ".").last.map(String.init) ?? $0) == "AnyObject"
+        }
 
         // nil means a requirement was rejected and a diagnostic already emitted;
         // an empty array means the protocol simply has no methods, which is legal
@@ -479,6 +507,18 @@ public struct XPCServiceMacro: PeerMacro {
                                             message: XPCServiceDiagnostic.unsupportedRequirement))
                 return nil
             }
+            // A `static func` IS a `FunctionDeclSyntax`, so it sails past the guard above --
+            // and its modifier lives on the declaration, not in the signature the client
+            // copies, so the generated client declared an *instance* method and failed to
+            // conform ("type 'S1XPCClient' does not conform to protocol 'S1'", measured).
+            // The diagnostic message already names static members; this makes it fire.
+            // `mutating` is refused on the same evidence class: the modifier would be
+            // dropped from the conformance the same way.
+            if fn.modifiers.contains(where: { ["static", "class", "mutating"].contains($0.name.text) }) {
+                context.diagnose(Diagnostic(node: fn,
+                                            message: XPCServiceDiagnostic.unsupportedRequirement))
+                return nil
+            }
 
             let effects = fn.signature.effectSpecifiers
             let isAsync = effects?.asyncSpecifier != nil
@@ -498,6 +538,20 @@ public struct XPCServiceMacro: PeerMacro {
                 returnsProxyService = proxy
             } else {
                 returnsProxyService = nil
+            }
+
+            // An optional return cannot cross: the reply slot's own optionality is the
+            // failure channel, so `-> String?` becomes `String??` in the shim -- not
+            // representable in Objective-C, and the error landed inside the expansion
+            // ("parameter cannot be represented in Objective-C", measured). A marker's
+            // *payload* may be optional -- the box is what crosses, and it is non-optional.
+            if returnsValue, let returnType,
+               markerPayload(returnType) == nil, returnsProxyService == nil,
+               returnType.as(OptionalTypeSyntax.self) != nil
+                || returnType.as(IdentifierTypeSyntax.self)?.name.text == "Optional" {
+                context.diagnose(Diagnostic(node: returnType,
+                                            message: XPCServiceDiagnostic.optionalReturn))
+                return nil
             }
 
             let shape: Shape
@@ -621,14 +675,16 @@ public struct XPCServiceMacro: PeerMacro {
                 let sendCall = method.hasBoxedParameter
                     ? """
                         do {
-                                    try proxy.\(call)
+                                    proxy.\(call)
                                         if let error { resumption.fail(error); return }
                                         guard let box else {
                                             resumption.fail(XPCServiceError.missingReply)
                                             return
                                         }
+                                        \(method.returnsMarker ? """
                                         do { resumption.succeed(\(rewrapped)) }
-                                        catch { resumption.fail(error) }
+                                                catch { resumption.fail(error) }
+                                        """ : "resumption.succeed(\(rewrapped))")
                                     })
                                 } catch {
                                     resumption.fail(error)
@@ -641,8 +697,10 @@ public struct XPCServiceMacro: PeerMacro {
                                         resumption.fail(XPCServiceError.missingReply)
                                         return
                                     }
+                                    \(method.returnsMarker ? """
                                     do { resumption.succeed(\(rewrapped)) }
-                                    catch { resumption.fail(error) }
+                                            catch { resumption.fail(error) }
+                                    """ : "resumption.succeed(\(rewrapped))")
                                 })
                     """
                 return """
@@ -651,7 +709,7 @@ public struct XPCServiceMacro: PeerMacro {
                         return try await withTaskCancellationHandler {
                             try await withCheckedThrowingContinuation { continuation in
                                 resumption.park(continuation)
-                                guard let proxy = proxy(resumingOnFailure: { resumption.fail($0) }) else {
+                                guard let proxy = proxy(boundTo: resumption, resumingOnFailure: { resumption.fail($0) }) else {
                                     resumption.fail(XPCServiceError.proxyUnavailable)
                                     return
                                 }
@@ -667,7 +725,7 @@ public struct XPCServiceMacro: PeerMacro {
                 let sendCall = method.hasBoxedParameter
                     ? """
                         do {
-                                    try proxy.\(call)
+                                    proxy.\(call)
                                         if let error { resumption.fail(error) }
                                         else { resumption.succeed(()) }
                                     })
@@ -687,7 +745,7 @@ public struct XPCServiceMacro: PeerMacro {
                         return try await withTaskCancellationHandler {
                             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
                                 resumption.park(continuation)
-                                guard let proxy = proxy(resumingOnFailure: { resumption.fail($0) }) else {
+                                guard let proxy = proxy(boundTo: resumption, resumingOnFailure: { resumption.fail($0) }) else {
                                     resumption.fail(XPCServiceError.proxyUnavailable)
                                     return
                                 }
@@ -715,18 +773,20 @@ public struct XPCServiceMacro: PeerMacro {
                         // handler, before this call returns -- so the outcome is
                         // already there to be read on the line after.
                         \(method.returnsProxyService != nil ? "let sourceLifetime = self.sourceLifetime\n                        " : "")let outcome = XPCSyncOutcome<\(declared)>()
-                        guard let proxy = synchronousProxy(reportingFailureTo: {
+                        guard let proxy = synchronousProxy(boundTo: outcome, reportingFailureTo: {
                             outcome.set(.failure($0))
                         }) else {
                             throw XPCServiceError.proxyUnavailable
                         }
-                        \(method.hasBoxedParameter ? "try " : "")proxy.\(call)
+                        proxy.\(call)
                             if let error { outcome.set(.failure(error)); return }
                             guard let box else {
                                 outcome.set(.failure(XPCServiceError.missingReply)); return
                             }
+                            \(method.returnsMarker ? """
                             do { outcome.set(.success(\(rewrapped))) }
-                            catch { outcome.set(.failure(error)) }
+                                    catch { outcome.set(.failure(error)) }
+                            """ : "outcome.set(.success(\(rewrapped)))")
                         })
                         outcome.wait()
                         return try outcome.take()
@@ -737,12 +797,12 @@ public struct XPCServiceMacro: PeerMacro {
                 return """
                     \(access)func \(method.name)\(signature) {
                         let outcome = XPCSyncOutcome<Void>()
-                        guard let proxy = synchronousProxy(reportingFailureTo: {
+                        guard let proxy = synchronousProxy(boundTo: outcome, reportingFailureTo: {
                             outcome.set(.failure($0))
                         }) else {
                             throw XPCServiceError.proxyUnavailable
                         }
-                        \(method.hasBoxedParameter ? "try " : "")proxy.\(call)
+                        proxy.\(call)
                             outcome.set(error.map { .failure($0) } ?? .success(()))
                         })
                         outcome.wait()
@@ -758,7 +818,7 @@ public struct XPCServiceMacro: PeerMacro {
                     \(access)func \(method.name)\(signature) {
                         precondition(deadPeer == nil,
                             "\(label): one-way call on a dead peer -- \\(deadPeer!)")
-                        guard let proxy = proxy(resumingOnFailure: { _ in }) else {
+                        guard let proxy = proxy(boundTo: nil, resumingOnFailure: { _ in }) else {
                             preconditionFailure(
                                 "\(label): one-way call with no proxy -- the connection's "
                                 + "remoteObjectInterface is unset or names another service")
@@ -803,7 +863,13 @@ public struct XPCServiceMacro: PeerMacro {
                 self.source = .proxy(proxy, lifetime)
             }
 
+            /// `boundTo` is what keeps the failure registration *withdrawable*: the host
+            /// holds it while the call is in flight and drops it on completion, so the
+            /// lifetime's registry is bounded by in-flight calls instead of growing by
+            /// one closure per call forever. nil (the one-way shapes) registers nothing:
+            /// a call with no reply has nothing a failure could resolve.
             private func proxy(
+                boundTo host: (any XPCFailureObservationHost)?,
                 resumingOnFailure onFailure: @escaping @Sendable (any Error) -> Void
             ) -> (any \(name)XPCShim)? {
                 switch source {
@@ -814,7 +880,7 @@ public struct XPCServiceMacro: PeerMacro {
                     // adapter recorded stands in for one. Registering here means an
                     // in-flight call is resolved when the connection dies rather
                     // than waiting for a reply that cannot arrive.
-                    lifetime.onFailure(onFailure)
+                    if let host { host.retainUntilFinished(lifetime.observe(onFailure)) }
                     return shim
                 }
             }
@@ -834,9 +900,13 @@ public struct XPCServiceMacro: PeerMacro {
             /// The failure channel to attach to a proxy that arrives in a *reply*.
             /// Its lifetime is this client's own connection, since that is what the
             /// object came over.
+            /// `.watching` is the shared per-connection lifetime -- building a fresh
+            /// `XPCProxyLifetime(watching:)` here chained one more layer onto the
+            /// connection's single invalidationHandler slot per proxy-returning call,
+            /// with no way to unchain, forever.
             private var sourceLifetime: XPCProxyLifetime {
                 switch source {
-                case .connection(let connection): return XPCProxyLifetime(watching: connection)
+                case .connection(let connection): return XPCProxyLifetime.watching(connection)
                 case .proxy(_, let lifetime): return lifetime
                 }
             }
@@ -846,13 +916,14 @@ public struct XPCServiceMacro: PeerMacro {
             /// already local, and its adapter replies inline for these shapes, so the
             /// same code reads the outcome either way.
             private func synchronousProxy(
+                boundTo host: any XPCFailureObservationHost,
                 reportingFailureTo onFailure: @escaping @Sendable (any Error) -> Void
             ) -> (any \(name)XPCShim)? {
                 switch source {
                 case .connection(let connection):
                     return connection.synchronousRemoteObjectProxyWithErrorHandler(onFailure) as? any \(name)XPCShim
                 case .proxy(let shim, let lifetime):
-                    lifetime.onFailure(onFailure)
+                    host.retainUntilFinished(lifetime.observe(onFailure))
                     return shim
                 }
             }
@@ -873,7 +944,8 @@ public struct XPCServiceMacro: PeerMacro {
             // Folded into the first line of the body so the interpolation keeps the
             // literal's indentation; an empty string leaves that line untouched.
             let captureLifetime = method.hasProxyParameter
-                ? "let lifetime = XPCProxyLifetime(watching: NSXPCConnection.current())\n                        "
+                ? "let lifetime = XPCProxyLifetime.watching(NSXPCConnection.current())\n                        "
+                    + method.proxyMarkerPrologue
                 : ""
 
             switch method.shape {

@@ -35,6 +35,14 @@ protocol ModuleQualifiedNames: Swift.Sendable {
     func ping() async throws -> Int
 }
 
+/// The class-bound half of the same pin: `Swift.AnyObject` must produce a *class* client. The
+/// harmless-inheritance check matched last components but `isClassBound` exact-matched, so this
+/// spelling got a struct client and "non-class type cannot conform" from inside the expansion.
+@XPCService
+protocol ModuleQualifiedClassBound: Swift.AnyObject {
+    func ping() async throws -> Int
+}
+
 private final class LedgerImpl: ClassBoundLedger, SendableLedger, @unchecked Sendable {
     private let lock = NSLock()
     private var sum = 0

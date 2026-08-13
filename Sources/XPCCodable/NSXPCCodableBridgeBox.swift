@@ -53,7 +53,7 @@ import CodableXPC
 /// into every archive the box appears in, and both peers of a connection have to
 /// agree on it. Changing it after anything ships makes old archives unreadable.
 @objc(CXPCCodableBridgeBox)
-public final class NSXPCCodableBridgeBox: NSObject, NSSecureCoding {
+public final class NSXPCCodableBridgeBox: NSObject, NSSecureCoding, @unchecked Sendable {
 
     /// What the box is holding, which depends on where it came from and where it
     /// is going.
@@ -73,6 +73,13 @@ public final class NSXPCCodableBridgeBox: NSObject, NSSecureCoding {
         case data(Data)
     }
 
+    /// `let`, and it is what makes the class `@unchecked Sendable` above honest: a box is
+    /// immutable after `init`. The `.xpc` and `.data` cases are plainly so. The `.pending`
+    /// case holds closures over the caller's `Encodable` value, and those already run on
+    /// whatever thread NSXPC encodes on -- crossing the connection *is* crossing threads, so
+    /// annotating the box changes nothing about where that value is touched; it only lets the
+    /// compiler see what the wire already required. This is the same argument that made
+    /// `exported(_:)` require `Sendable` of the implementation.
     private let storage: Storage
 
     public class var supportsSecureCoding: Bool { true }
@@ -300,7 +307,7 @@ extension XPCCodableMarker: BitwiseCopyable where T: BitwiseCopyable {}
 /// was for the macro to assume every named protocol was `@XPCService` and emit
 /// `<Name>XPCShim` on faith, which no type could check and which shut out every
 /// `@objc` protocol anyone already had.
-public struct XPCProxyMarker<Service: AnyObject> {
+public struct XPCProxyMarker<Service: AnyObject>: @unchecked Sendable {
     public var wrappedValue: Service
 
     /// The failure channel the proxy itself does not have.
@@ -317,3 +324,10 @@ public struct XPCProxyMarker<Service: AnyObject> {
         self.lifetime = lifetime
     }
 }
+
+// `@unchecked Sendable` (on the declaration above), argued rather than waved through:
+// `lifetime` is itself `@unchecked Sendable`, and `wrappedValue` is either an NSXPC distant
+// object -- proxies are documented thread-safe -- or, on the sending side, the caller's own
+// object *about to be vended over NSXPC*, where the peer will message it from arbitrary
+// queues. Anything a marker can legitimately hold must already tolerate cross-thread use;
+// the annotation states the wire's requirement, it does not add one.
