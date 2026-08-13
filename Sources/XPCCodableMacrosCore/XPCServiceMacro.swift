@@ -706,10 +706,12 @@ public struct XPCServiceMacro: PeerMacro {
                 return """
                     \(access)func \(method.name)\(signature) {
                         \(method.returnsProxyService != nil ? "let sourceLifetime = self.sourceLifetime\n                        " : "")let resumption = XPCCallResumption<\(declared)>()
+                        let observation = proxyFailureObservation { resumption.fail($0) }
+                        defer { observation?.cancel() }
                         return try await withTaskCancellationHandler {
                             try await withCheckedThrowingContinuation { continuation in
                                 resumption.park(continuation)
-                                guard let proxy = proxy(boundTo: resumption, resumingOnFailure: { resumption.fail($0) }) else {
+                                guard let proxy = proxy(resumingOnFailure: { resumption.fail($0) }) else {
                                     resumption.fail(XPCServiceError.proxyUnavailable)
                                     return
                                 }
@@ -742,10 +744,12 @@ public struct XPCServiceMacro: PeerMacro {
                 return """
                     \(access)func \(method.name)\(signature) {
                         let resumption = XPCCallResumption<Void>()
+                        let observation = proxyFailureObservation { resumption.fail($0) }
+                        defer { observation?.cancel() }
                         return try await withTaskCancellationHandler {
                             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
                                 resumption.park(continuation)
-                                guard let proxy = proxy(boundTo: resumption, resumingOnFailure: { resumption.fail($0) }) else {
+                                guard let proxy = proxy(resumingOnFailure: { resumption.fail($0) }) else {
                                     resumption.fail(XPCServiceError.proxyUnavailable)
                                     return
                                 }
@@ -773,7 +777,9 @@ public struct XPCServiceMacro: PeerMacro {
                         // handler, before this call returns -- so the outcome is
                         // already there to be read on the line after.
                         \(method.returnsProxyService != nil ? "let sourceLifetime = self.sourceLifetime\n                        " : "")let outcome = XPCSyncOutcome<\(declared)>()
-                        guard let proxy = synchronousProxy(boundTo: outcome, reportingFailureTo: {
+                        let observation = proxyFailureObservation { outcome.set(.failure($0)) }
+                        defer { observation?.cancel() }
+                        guard let proxy = synchronousProxy(reportingFailureTo: {
                             outcome.set(.failure($0))
                         }) else {
                             throw XPCServiceError.proxyUnavailable
@@ -797,7 +803,9 @@ public struct XPCServiceMacro: PeerMacro {
                 return """
                     \(access)func \(method.name)\(signature) {
                         let outcome = XPCSyncOutcome<Void>()
-                        guard let proxy = synchronousProxy(boundTo: outcome, reportingFailureTo: {
+                        let observation = proxyFailureObservation { outcome.set(.failure($0)) }
+                        defer { observation?.cancel() }
+                        guard let proxy = synchronousProxy(reportingFailureTo: {
                             outcome.set(.failure($0))
                         }) else {
                             throw XPCServiceError.proxyUnavailable
@@ -818,7 +826,7 @@ public struct XPCServiceMacro: PeerMacro {
                     \(access)func \(method.name)\(signature) {
                         precondition(deadPeer == nil,
                             "\(label): one-way call on a dead peer -- \\(deadPeer!)")
-                        guard let proxy = proxy(boundTo: nil, resumingOnFailure: { _ in }) else {
+                        guard let proxy = proxy(resumingOnFailure: { _ in }) else {
                             preconditionFailure(
                                 "\(label): one-way call with no proxy -- the connection's "
                                 + "remoteObjectInterface is unset or names another service")
@@ -863,24 +871,34 @@ public struct XPCServiceMacro: PeerMacro {
                 self.source = .proxy(proxy, lifetime)
             }
 
-            /// `boundTo` is what keeps the failure registration *withdrawable*: the host
-            /// holds it while the call is in flight and drops it on completion, so the
-            /// lifetime's registry is bounded by in-flight calls instead of growing by
-            /// one closure per call forever. nil (the one-way shapes) registers nothing:
-            /// a call with no reply has nothing a failure could resolve.
+            /// The failure registration for a proxy-source client, or nil for a
+            /// connection source, whose failure channel is the per-proxy error handler.
+            ///
+            /// The caller binds this to a local and lets `defer` withdraw it -- the async
+            /// (or blocking) frame spans the whole call, so scope *is* the call's
+            /// lifetime. That is what keeps the lifetime's registry bounded by in-flight
+            /// calls, and it is lexical: the registration and its withdrawal sit in the
+            /// same generated method, two lines apart.
+            private func proxyFailureObservation(
+                _ onFailure: @escaping @Sendable (any Error) -> Void
+            ) -> XPCFailureObservation? {
+                guard case .proxy(_, let lifetime) = source else { return nil }
+                // A proxy has no error handler of its own, so the lifetime the adapter
+                // recorded stands in for one. Registering means an in-flight call is
+                // resolved when the connection dies rather than waiting for a reply
+                // that cannot arrive.
+                return lifetime.observe(onFailure)
+            }
+
             private func proxy(
-                boundTo host: (any XPCFailureObservationHost)?,
                 resumingOnFailure onFailure: @escaping @Sendable (any Error) -> Void
             ) -> (any \(name)XPCShim)? {
                 switch source {
                 case .connection(let connection):
                     return connection.remoteObjectProxyWithErrorHandler(onFailure) as? any \(name)XPCShim
-                case .proxy(let shim, let lifetime):
-                    // A proxy has no error handler of its own, so the lifetime the
-                    // adapter recorded stands in for one. Registering here means an
-                    // in-flight call is resolved when the connection dies rather
-                    // than waiting for a reply that cannot arrive.
-                    if let host { host.retainUntilFinished(lifetime.observe(onFailure)) }
+                case .proxy(let shim, _):
+                    // The failure channel is the caller's observation -- see
+                    // `proxyFailureObservation`.
                     return shim
                 }
             }
@@ -916,14 +934,12 @@ public struct XPCServiceMacro: PeerMacro {
             /// already local, and its adapter replies inline for these shapes, so the
             /// same code reads the outcome either way.
             private func synchronousProxy(
-                boundTo host: any XPCFailureObservationHost,
                 reportingFailureTo onFailure: @escaping @Sendable (any Error) -> Void
             ) -> (any \(name)XPCShim)? {
                 switch source {
                 case .connection(let connection):
                     return connection.synchronousRemoteObjectProxyWithErrorHandler(onFailure) as? any \(name)XPCShim
-                case .proxy(let shim, let lifetime):
-                    host.retainUntilFinished(lifetime.observe(onFailure))
+                case .proxy(let shim, _):
                     return shim
                 }
             }

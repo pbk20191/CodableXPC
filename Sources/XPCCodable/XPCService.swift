@@ -146,16 +146,12 @@ public final class XPCOneShot: @unchecked Sendable {
 /// `onCancel` at once when the task is already cancelled -- before the operation body runs -- so
 /// ``cancel()`` can land before there is any continuation to resume. The outcome is remembered
 /// and handed to whoever parks next.
-public final class XPCCallResumption<Value>: XPCFailureObservationHost, @unchecked Sendable {
+public final class XPCCallResumption<Value>: @unchecked Sendable {
 
     private let lock = NSLock()
     private var continuation: CheckedContinuation<Value, any Error>?
     private var outcome: Result<Value, any Error>?
     private var resumed = false
-    /// Failure observations kept alive while the call is in flight. Dropped -- which
-    /// withdraws them -- on the resumed transition, in `park` or `finish`, whichever
-    /// delivers. See ``XPCFailureObservationHost``.
-    private var observations: [XPCFailureObservation] = []
 
     public init() {}
 
@@ -165,7 +161,6 @@ public final class XPCCallResumption<Value>: XPCFailureObservationHost, @uncheck
             guard !resumed else { return nil }
             if let outcome {
                 resumed = true
-                observations = []
                 return outcome
             }
             self.continuation = continuation
@@ -199,16 +194,6 @@ public final class XPCCallResumption<Value>: XPCFailureObservationHost, @uncheck
         let continuation: CheckedContinuation<Value, any Error>
     }
 
-    public func retainUntilFinished(_ observation: XPCFailureObservation) {
-        let alreadyFinished: Bool = lock.withLock {
-            guard !resumed else { return true }
-            observations.append(observation)
-            return false
-        }
-        // Dropping it here runs its deinit, which withdraws the registration.
-        if alreadyFinished { observation.cancel() }
-    }
-
     private func finish(_ result: Result<Value, any Error>) {
         let handoff: Handoff? = lock.withLock {
             guard !resumed else { return nil }
@@ -220,7 +205,6 @@ public final class XPCCallResumption<Value>: XPCFailureObservationHost, @uncheck
             }
             resumed = true
             self.continuation = nil
-            observations = []
             return Handoff(result: result, continuation: parked)
         }
         guard let handoff else { return }
@@ -236,34 +220,19 @@ public final class XPCCallResumption<Value>: XPCFailureObservationHost, @uncheck
 /// that replies while the connection is failing reaches both paths. First write
 /// wins, matching ``XPCOneShot``, so the caller sees whichever outcome actually
 /// happened first rather than the last one to be written.
-public final class XPCSyncOutcome<Value>: XPCFailureObservationHost, @unchecked Sendable {
+public final class XPCSyncOutcome<Value>: @unchecked Sendable {
     private let lock = NSLock()
     private var stored: Result<Value, any Error>?
     private let arrived = DispatchSemaphore(value: 0)
-    /// See ``XPCFailureObservationHost`` -- dropped, and thereby withdrawn, on the
-    /// first `set`.
-    private var observations: [XPCFailureObservation] = []
 
     public init() {}
 
     public func set(_ result: Result<Value, any Error>) {
         lock.lock()
         let first = stored == nil
-        if first {
-            stored = result
-            observations = []
-        }
+        if first { stored = result }
         lock.unlock()
         if first { arrived.signal() }
-    }
-
-    public func retainUntilFinished(_ observation: XPCFailureObservation) {
-        let alreadyFinished: Bool = lock.withLock {
-            guard stored == nil else { return true }
-            observations.append(observation)
-            return false
-        }
-        if alreadyFinished { observation.cancel() }
     }
 
     /// Blocks until something is written.
@@ -318,7 +287,6 @@ public final class XPCProxyLifetime: @unchecked Sendable {
 
     private let lock = NSLock()
     private var failure: (any Error)?
-    private var waiting: [(any Error) -> Void] = []
 
     /// A lifetime for a proxy whose connection is unknown. It never fails, which
     /// is the old behaviour, and is what a locally constructed client gets.
@@ -341,20 +309,15 @@ public final class XPCProxyLifetime: @unchecked Sendable {
 
     public func fail(_ error: any Error) {
         lock.lock()
-        let callbacks: [(any Error) -> Void]
         let drained: [@Sendable (any Error) -> Void]
         if failure == nil {
             failure = error
-            callbacks = waiting
-            waiting = []
             drained = Array(observed.values)
             observed = [:]
         } else {
-            callbacks = []
             drained = []
         }
         lock.unlock()
-        for callback in callbacks { callback(error) }
         for callback in drained { callback(error) }
     }
 
@@ -368,37 +331,19 @@ public final class XPCProxyLifetime: @unchecked Sendable {
         return failure
     }
 
-    /// Registers `onFailure`, calling it immediately if the connection is already
-    /// gone. Every call over the proxy registers, so an in-flight one is resolved
-    /// rather than left waiting forever.
-    ///
-    /// **The registration is permanent** -- there is no way to withdraw it, so a
-    /// long-lived proxy making many calls grows this lifetime's list by one closure
-    /// per call, forever. That is why generated code no longer uses this entry
-    /// point: it uses ``observe(_:)``, whose registration is withdrawn when the
-    /// call completes. This stays for a hand-written observer that genuinely wants
-    /// to be told once, whenever the failure comes.
-    public func onFailure(_ onFailure: @escaping (any Error) -> Void) {
-        lock.lock()
-        if let failure {
-            lock.unlock()
-            onFailure(failure)
-            return
-        }
-        waiting.append(onFailure)
-        lock.unlock()
-    }
-
     /// Registers `onFailure` and hands back the registration, so it can be
     /// withdrawn when the call it protects completes.
     ///
-    /// This is what bounds the lifetime's footprint by *in-flight* calls rather
-    /// than by all calls ever made: ``onFailure(_:)`` above appends a closure that
-    /// nothing removes, so every completed call left its callback -- and everything
-    /// the callback captured, a whole `XPCCallResumption` and its continuation
-    /// environment -- pinned until the connection died. Measured against the shape
-    /// generated code actually has: one registration per call, withdrawal on
-    /// completion via ``XPCFailureObservationHost/retainUntilFinished(_:)``.
+    /// **This is the only way to register, and it is withdrawable on purpose.** An
+    /// earlier `onFailure(_:)` appended a closure that nothing removed, so every
+    /// completed call left its callback -- and everything it captured, a whole
+    /// `XPCCallResumption` and its continuation environment -- pinned until the
+    /// connection died. Generated code binds the observation to a local and lets
+    /// `defer` withdraw it: the call's frame spans the call, so scope *is* the
+    /// call's lifetime, and the registry stays bounded by in-flight calls.
+    ///
+    ///     let observation = lifetime.observe { resumption.fail($0) }
+    ///     defer { observation.cancel() }
     ///
     /// The closure is held **strongly** until withdrawn, deliberately. A weak
     /// registration was considered and rejected: the failure callback is what
@@ -494,11 +439,3 @@ public final class XPCFailureObservation: @unchecked Sendable {
     deinit { lifetime?.withdraw(key) }
 }
 
-/// Something that can keep failure observations alive until its call completes.
-///
-/// ``XPCCallResumption`` and ``XPCSyncOutcome`` conform: they hold the
-/// observation strongly while the call is in flight and drop it on the first
-/// resume -- dropping is withdrawal, via ``XPCFailureObservation``'s deinit.
-public protocol XPCFailureObservationHost: AnyObject {
-    func retainUntilFinished(_ observation: XPCFailureObservation)
-}
