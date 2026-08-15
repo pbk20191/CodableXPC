@@ -170,7 +170,7 @@ private final class ServedLink: @unchecked Sendable {
     let clientSystem = XPCActorSystem("client")
     let receiver: XPCActorSystem.TransportReceiver
 
-    private let listener: XPCConnectionListener
+    private let listener: XPCListener
     private var clientTransport: Transport!
     let client: Session
 
@@ -186,12 +186,14 @@ private final class ServedLink: @unchecked Sendable {
         receiver = XPCActorSystem.TransportReceiver(actorSystem: system, peerHandler: peerHandler)
 
         let receiver = self.receiver
-        listener = XPCConnectionListener.anonymous { raw in
+        listener = try XPCListener { request in
+            let (decision, raw) = XPCRawTransport.accepting(request)
             receiver.accept(raw, debugName: "served")
+            return decision
         }
         receiver.setCancellationHandler { [listener] in listener.cancel() }
 
-        let raw = XPCConnectionTransport.connecting(to: listener.endpoint)
+        let raw = try XPCRawTransport.connecting(to: listener.endpoint)
         clientTransport = Transport(debugName: "client", role: .initiator, rawTransport: raw)
         client = clientSystem.makeSession(over: clientTransport)
         try raw.activate()

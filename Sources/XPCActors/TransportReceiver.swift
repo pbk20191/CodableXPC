@@ -225,22 +225,21 @@ extension XPCActorSystem {
 @available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 extension XPCActorSystem.TransportReceiver {
 
-    /// Accept one inbound peer connection and start its handler.
+    /// Accept one inbound peer and start its handler.
     ///
-    /// Wire this to ``XPCConnectionListener``'s accept closure, or to
-    /// ``runXPCServiceMain(accepting:)`` in a bundled service. A receiver that has already been
-    /// cancelled hangs up on the peer rather than half-serving it.
-    public func accept(_ raw: XPCConnectionTransport, debugName: String = "peer") {
+    /// Wire this to an ``XPCListener``'s incoming-session handler (see ``listen(as:targetQueue:peerHandler:)``)
+    /// or to ``runXPCServiceMain(accepting:)`` in a bundled service. A receiver that has
+    /// already been cancelled hangs up on the peer rather than half-serving it.
+    ///
+    /// **Nothing is activated here, and that is Apple's shape.** `IncomingSessionRequest.accept`
+    /// returns a *live* `XPCSession` -- the transport is built `isAlreadyActive: true` -- so
+    /// unlike the suspended-connection path there is nothing left to start; the session, its
+    /// handlers and its peer task are all in place, and the local-interface gate carries the
+    /// export-then-serve ordering.
+    public func accept(_ raw: XPCRawTransport, debugName: String = "peer") {
         let transport = Transport(debugName: debugName, role: .responder, rawTransport: raw)
         do {
             try attachTransport(transport)
-            // **Activated here, not in `attachTransport`.** libxpc hands a listener a
-            // *suspended* peer connection, so unlike the overlay -- where
-            // `IncomingSessionRequest.accept` returned a live session and Apple's
-            // `attachTransport` therefore had nothing to start -- somebody has to resume it.
-            // It happens after `attachTransport` so the session, its handlers and its peer task
-            // are all in place before the first message can arrive.
-            try raw.activate()
         } catch {
             raw.cancel(reason: "\(error)")
         }
@@ -261,10 +260,10 @@ extension XPCActorSystem {
     public final class ServiceListener: @unchecked Sendable {
 
         public let receiver: TransportReceiver
-        private let listener: XPCConnectionListener
+        private let listener: XPCListener
         private let stopped = ActivationEvent(posted: false)
 
-        fileprivate init(receiver: TransportReceiver, listener: XPCConnectionListener) {
+        fileprivate init(receiver: TransportReceiver, listener: XPCListener) {
             self.receiver = receiver
             self.listener = listener
         }
@@ -307,10 +306,21 @@ extension XPCActorSystem {
                 + "from a synchronous main instead.")
         }
         let receiver = TransportReceiver(actorSystem: self, peerHandler: peerHandler)
-        let listener = XPCConnectionListener.machService(
-            service.name, targetQueue: targetQueue
-        ) { [receiver] raw in
-            receiver.accept(raw, debugName: service.debugName)
+        let listener: XPCListener
+        do {
+            listener = try XPCListener(
+                service: service.name, targetQueue: targetQueue
+            ) { [receiver] request in
+                // Apple's shape: accept the peer, wrap its live session as a transport, and
+                // attach it -- all before returning the decision, so the session's packet
+                // handler is installed before any inbound message can be delivered on the
+                // same serial queue.
+                let (decision, transport) = XPCRawTransport.accepting(request)
+                receiver.accept(transport, debugName: service.debugName)
+                return decision
+            }
+        } catch {
+            throw SetupError("could not create an XPCListener for \(service.debugName): \(error)")
         }
         receiver.setCancellationHandler { [listener] in listener.cancel() }
         return ServiceListener(receiver: receiver, listener: listener)
