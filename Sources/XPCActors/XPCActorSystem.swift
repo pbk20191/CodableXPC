@@ -133,14 +133,14 @@ extension XPCActorSystem: DistributedActorSystem {
         // The one place `Act` is concrete. Nothing is captured but the type: the instance
         // is passed back in, so the closure does not pin the actor and the registry's weak
         // hold keeps meaning what it says.
-        let thunk: InboundThunk = { instance, system, target, invocation, handler in
+        let thunk: InboundThunk = { instance, system, target, decoder, handler in
             guard let target1 = instance as? Act else {
                 throw SetupError("""
                     the actor registered for \(local) is a \(type(of: instance)), not a \
                     \(Act.self); the invocation thunk and the instance have come apart
                     """)
             }
-            var decoder = InvocationDecoder(invocation)
+            var decoder = decoder
             try await system.executeDistributedTarget(
                 on: target1, target: target, invocationDecoder: &decoder, handler: handler)
         }
@@ -338,7 +338,7 @@ typealias InboundThunk = (
     _ instance: AnyObject,
     _ system: XPCActorSystem,
     _ target: RemoteCallTarget,
-    _ invocation: InboundInvocation,
+    _ decoder: InvocationDecoder,
     _ handler: ResultHandler
 ) async throws -> Void
 
@@ -535,29 +535,64 @@ public final class ResultHandler: DistributedTargetInvocationResultHandler,
     /// Carried forward from the request's own decode, so that a *returned* actor reference
     /// can encode itself. Apple's `RemoteInvocationReplyEncoder` stores the same
     /// dictionary for the same reason.
-    private let userInfo: [CodingUserInfoKey: Any]
+    /// Apple's `ResultHandler` is `{ encoded | direct }`, and it must be: the system's
+    /// `ResultHandler` associated type is a **single** class, so `executeDistributedTarget`
+    /// takes one type -- the two modes live in it. Encoded carries the `userInfo` needed to
+    /// encode a *returned* actor reference; direct (same-process) captures the raw outcome
+    /// and crosses no byte.
+    private enum Mode {
+        case encoded(userInfo: [CodingUserInfoKey: Any])
+        case direct
+    }
+    private let mode: Mode
 
     private let _reply = Mutex<Packet.Payload?>(nil)
+    private let _captured = Mutex<DirectOutcome?>(nil)
 
-    /// The reply to send, or `nil` if the target produced no outcome. Apple's
+    /// The captured outcome of a direct invocation. `value` boxes the concrete `Success` the
+    /// target returned; the direct send casts it back to the caller's static return type.
+    enum DirectOutcome {
+        case value(any Codable)
+        case void
+        case failure(any Error)
+    }
+
+    /// The reply to send (encoded mode), or `nil` if the target produced no outcome. Apple's
     /// `EncodedResultHandler.reply`.
     public var reply: Packet.Payload? { _reply.withLock { $0 } }
 
+    /// The captured outcome (direct mode), or `nil`. Apple's `DirectResultHandler.capturedResult`.
+    var capturedResult: DirectOutcome? { _captured.withLock { $0 } }
+
     init(canThrow: Bool, userInfo: [CodingUserInfoKey: Any]) {
         self.canThrow = canThrow
-        self.userInfo = userInfo
+        self.mode = .encoded(userInfo: userInfo)
+    }
+
+    /// The direct (same-process) handler: it captures the raw outcome instead of encoding
+    /// it, so the caller reads its own return type back without a byte crossing.
+    init(directCanThrow canThrow: Bool) {
+        self.canThrow = canThrow
+        self.mode = .direct
     }
 
     /// `[0, <value>]`. `Failure` is bound to `Never` in Apple's `Result`; ours does not
-    /// need the parameter at all because the response enum carries the tag itself.
+    /// need the parameter at all because the response enum carries the tag itself. Direct
+    /// mode captures the value instead of encoding a response.
     public func onReturn<Success: Codable>(value: Success) async throws {
-        try write(RemoteInvocationResponse(result: value))
+        switch mode {
+        case .encoded: try write(RemoteInvocationResponse(result: value))
+        case .direct: _captured.withLock { $0 = .value(value) }
+        }
     }
 
     /// `[0, {}]` -- tag zero over an ``Ack``, because `Void` is not `Codable` and something
     /// has to occupy the generic parameter.
     public func onReturnVoid() async throws {
-        try write(RemoteInvocationResponse<Ack>.void)
+        switch mode {
+        case .encoded: try write(RemoteInvocationResponse<Ack>.void)
+        case .direct: _captured.withLock { $0 = .void }
+        }
     }
 
     /// `[1, {"executionFailed": {"_0": "<description>"}}]`.
@@ -581,52 +616,18 @@ public final class ResultHandler: DistributedTargetInvocationResultHandler,
                 as non-throwing.
                 """)
         }
-        try write(RemoteInvocationResponse<NoSuccess>.failure(.executionFailed("\(error)")))
+        switch mode {
+        case .encoded:
+            try write(RemoteInvocationResponse<NoSuccess>.failure(.executionFailed("\(error)")))
+        case .direct:
+            _captured.withLock { $0 = .failure(error) }
+        }
     }
 
     private func write(_ response: some Encodable) throws {
+        guard case .encoded(let userInfo) = mode else { return }
         let payload = try Packet.Payload(encoding: response, userInfo: userInfo)
         _reply.withLock { $0 = payload }
-    }
-}
-
-// ===========================================================================================
-// MARK: - The direct result handler
-// ===========================================================================================
-
-/// Apple's `DirectResultHandler`: the same-process counterpart of ``ResultHandler``. Where
-/// that one encodes the target's outcome into a `RemoteInvocationResponse` body,
-/// this one **captures the raw value** -- Apple's `DirectResultHandler.capturedResult` --
-/// so the caller reads its own return type back without a byte crossing.
-///
-/// A class for the same reason ``ResultHandler`` is: the runtime takes the handler into
-/// `executeDistributedTarget` and writes the outcome from inside.
-@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
-final class DirectResultHandler: DistributedTargetInvocationResultHandler, @unchecked Sendable {
-
-    public typealias SerializationRequirement = any Codable
-
-    /// The captured outcome. `value` boxes the concrete `Success` the target returned; the
-    /// direct send casts it back to the caller's static return type.
-    enum Outcome {
-        case value(any Codable)
-        case void
-        case failure(any Error)
-    }
-
-    private let outcome = Mutex<Outcome?>(nil)
-    var capturedResult: Outcome? { outcome.withLock { $0 } }
-
-    func onReturn<Success: Codable>(value: Success) async throws {
-        outcome.withLock { $0 = .value(value) }
-    }
-
-    func onReturnVoid() async throws {
-        outcome.withLock { $0 = .void }
-    }
-
-    func onThrow<Err: Error>(error: Err) async throws {
-        outcome.withLock { $0 = .failure(error) }
     }
 }
 

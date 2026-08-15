@@ -151,6 +151,31 @@ extension XPCActorSystem {
             // is nothing left to start.
         }
 
+        /// Serve a same-process peer: run the handler against an already-created `.local`
+        /// server session, so it exports its actors and opens its gate for a client that
+        /// resolves them directly. The direct-invocation counterpart of ``attachTransport``,
+        /// used by ``ServiceRegistry/lookUpAndConnect(to:from:options:)``.
+        func acceptLocal(_ session: Session) {
+            guard !fuse.load(ordering: .acquiring) else {
+                session.cancel(because: "the receiver was cancelled before the local peer attached")
+                return
+            }
+            let task = Task.immediate { [peerHandler] in
+                await peerHandler(session.local).token
+            }
+            session.setActivationOwner { priority in task.escalatePriority(to: priority) }
+            let registered = peerHandlingTasks.withLock { table -> Bool in
+                guard !fuse.load(ordering: .acquiring) else { return false }
+                table[session.id] = task
+                return true
+            }
+            guard registered else {
+                task.cancel()
+                session.cancel(because: "the receiver was cancelled while the local peer attached")
+                return
+            }
+        }
+
         /// [sym] 0x2ad4e90f4. [disasm] stores the closure, releasing whatever was there. The
         /// parameter is not optional.
         public func setCancellationHandler(_ handler: @escaping @Sendable () -> Void) {

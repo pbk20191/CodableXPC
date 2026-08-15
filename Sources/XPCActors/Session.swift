@@ -56,6 +56,37 @@ public protocol OutboundSession: SessionCoding {
 /// an `ActorRegistry<Void>` -- and a generic parameter that can only ever be `Void` buys
 /// nothing but a type argument at every use site. (`ActorRegistry` keeps its own
 /// parameter; narrowing that is a separate change to a separate type.)
+/// Apple's `LocalSessionState`: a `.local` session's own state. The client end holds the
+/// server end here -- **strongly**, so the direct-invocation path can resolve a target in
+/// the server's shared-actor table, and so the server stays alive as long as a client can
+/// call it -- with the server end's `peer` left `nil` (it is pushed to, not reaching out),
+/// which is what keeps the pair from a strong cycle. Plus a one-shot cancellation fuse.
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
+final class LocalSessionState: @unchecked Sendable {
+    let peer: Session?
+    let isCancelled = Atomic<Bool>(false)
+    init(peer: Session?) { self.peer = peer }
+
+    /// "The peer is this process" -- Apple's `LocalSessionState.currentProcessAuditToken()`,
+    /// `task_info` with `TASK_AUDIT_TOKEN`, which is what a `.local` session attests instead
+    /// of reaching through a transport that is not there.
+    static func currentProcessAuditToken() -> audit_token_t? {
+        #if canImport(Darwin)
+        var token = audit_token_t()
+        var count = mach_msg_type_number_t(
+            MemoryLayout<audit_token_t>.size / MemoryLayout<natural_t>.size)
+        let status = withUnsafeMutablePointer(to: &token) { pointer in
+            pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { rebound in
+                task_info(mach_task_self_, task_flavor_t(TASK_AUDIT_TOKEN), rebound, &count)
+            }
+        }
+        return status == KERN_SUCCESS ? token : nil
+        #else
+        return nil
+        #endif
+    }
+}
+
 @available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 public final class Session: SessionCoding, OutboundSession, InboundSession, @unchecked Sendable {
 
@@ -73,18 +104,27 @@ public final class Session: SessionCoding, OutboundSession, InboundSession, @unc
     /// keeps an in-flight call's `resolve` answerable.
     let system: XPCActorSystem
 
-    /// Where this session speaks. Apple reaches it through `Session.Kind.xpc(Transport)`.
-    ///
-    /// **Not modelled as a `Kind` enum, deliberately.** Apple's `Kind` is
-    /// `xpc(Transport) | local(LocalSessionState)` and every consumer of it is a branch
-    /// on the tag bit -- `transport`, `local`, `isCancelled`, `optimizeSelfIPC`,
-    /// `updatePeerSession`, `activateTransport`. The `.local` case is an entire
-    /// subsystem (a peer session, a direct-invocation path that never encodes anything,
-    /// `LocalSessionState`'s own cancellation fuse) and none of it exists here. A
-    /// one-case enum would model no choice, give nothing to branch on, and make
-    /// `Session.transport` a trapping accessor for a trap that cannot fire. When the
-    /// in-process path lands, this becomes the `Kind` it is then actually a case of.
-    private let transport: Transport
+    /// Where this session speaks. Apple's `Session.Kind`, `xpc(Transport) |
+    /// local(LocalSessionState)` -- and now that the same-process path has landed, this is
+    /// the enum it always was a case of. `xpc` goes over a real transport; `local` short-
+    /// circuits to the direct-invocation path against a peer session in this same process,
+    /// never encoding a byte.
+    enum Kind {
+        case xpc(Transport)
+        case local(LocalSessionState)
+    }
+    private let kind: Kind
+
+    /// The transport, for the `xpc` paths that only ever run on an `xpc` session -- the
+    /// inbound wiring in `init`, the reply channel, the wire send. A `.local` session reaches
+    /// none of them, so the trap here names a genuine bug (Apple's four accessors trap on a
+    /// `.local` session too), not a case that cannot fire.
+    private var transport: Transport {
+        guard case .xpc(let transport) = kind else {
+            preconditionFailure("an xpc-only path was taken on a .local session")
+        }
+        return transport
+    }
 
     /// Which actor system this session belongs to. See ``SessionCoding/systemID``.
     ///
@@ -243,7 +283,7 @@ public final class Session: SessionCoding, OutboundSession, InboundSession, @unc
     fileprivate init(system: XPCActorSystem, transport: Transport,
                      localInterfaceActivated: Bool) {
         self.system = system
-        self.transport = transport
+        self.kind = .xpc(transport)
         self.activationEvent = ActivationEvent(posted: localInterfaceActivated)
         // Weakly, as Apple's initialiser does it (`swift_unknownObjectWeakAssign` into
         // `transport+0x10`). We hold the transport; it must not hold us back.
@@ -262,6 +302,17 @@ public final class Session: SessionCoding, OutboundSession, InboundSession, @unc
         transport.inboundNotificationHandler = { [weak self] payload in
             self?.handleReceivedNotification(payload)
         }
+    }
+
+    /// A `.local` session: no transport, no inbound wiring. It either exports actors that a
+    /// same-process peer resolves directly (the server end, `peer == nil`), or originates
+    /// direct calls against such a peer (the client end, `peer` set). See ``send`` and the
+    /// pairing in ``ServiceRegistry``.
+    fileprivate init(system: XPCActorSystem, local: LocalSessionState,
+                     localInterfaceActivated: Bool) {
+        self.system = system
+        self.kind = .local(local)
+        self.activationEvent = ActivationEvent(posted: localInterfaceActivated)
     }
 
     /// How many actors this session currently exports.
@@ -370,7 +421,14 @@ public final class Session: SessionCoding, OutboundSession, InboundSession, @unc
     /// Exposed so ``Session/RemoteInterface/satisfies(requirement:)`` can ask -- `transport`
     /// itself stays private, because a caller holding an interface has no business reaching
     /// the pipe.
-    var peerAttestation: (any PeerAttestation)? { transport.peerAttestation }
+    var peerAttestation: (any PeerAttestation)? {
+        switch kind {
+        case .xpc(let transport): transport.peerAttestation
+        // A `.local` peer is this process: it attests its own audit token, exactly as
+        // Apple's `LocalSessionState` does, rather than reaching through a transport.
+        case .local: LocalSessionState.currentProcessAuditToken().flatMap(AuditTokenAttestation.init)
+        }
+    }
 
     /// Turn a key the peer sent us into the id we use for the actor it names.
     ///
@@ -490,6 +548,13 @@ public final class Session: SessionCoding, OutboundSession, InboundSession, @unc
                 + "only meaningful to the session that minted it.")
         }
 
+        // Apple's `.local` send: resolve and run the target in the peer's own process,
+        // capturing its outcome, and never encoding a byte.
+        if case .local(let local) = kind {
+            return try await directSend(
+                key: remote.key, target: target, invocation: &invocation, peer: local.peer)
+        }
+
         let request = invocation.makeRequest(
             id: sharedActors.withLock { $0.nextID() },
             targetedSharedActor: remote.key,
@@ -545,6 +610,66 @@ public final class Session: SessionCoding, OutboundSession, InboundSession, @unc
             case .failure(.resultPropagationFailed(let message)):
                 throw RemoteInvocationCancellationError.resultPropagationFailed(message)
             }
+        }
+    }
+
+    /// The direct-invocation send: the same-process counterpart of the wire path above.
+    ///
+    /// It mirrors the inbound execution -- park on the peer's activation gate, resolve the
+    /// target in the peer's shared-actor table, check its per-actor requirement -- but runs
+    /// the target through the **direct** decoder and result handler, so the caller's argument
+    /// values go in and the target's return value comes back with nothing encoded.
+    private func directSend<Res: Codable>(
+        key: SharedActorKey, target: RemoteCallTarget,
+        invocation: inout InvocationEncoder, peer: Session?
+    ) async throws(RemoteInvocationCancellationError) -> Res {
+        guard let peer else {
+            throw RemoteInvocationCancellationError.executionFailed(
+                "a server-side .local session cannot originate a call")
+        }
+        // Park until the peer has exported its actors and opened its gate -- the same
+        // ordering the wire path gets, so a call that beats the server's setup waits rather
+        // than failing to resolve.
+        await peer.waitForLocalInterfaceActivation()
+        guard let resolved = peer.resolveSharedTarget(at: key) else {
+            throw RemoteInvocationCancellationError.executionFailed(
+                "no actor is shared at \(key) in the peer session, so \(target.identifier) "
+                + "has nothing to run on")
+        }
+        guard peer.peerSatisfiesRequirement(of: resolved.instance) else {
+            throw RemoteInvocationCancellationError.executionFailed(
+                "Failed actor's peer requirement check")
+        }
+        let decoder = InvocationDecoder(direct: invocation)
+        let handler = ResultHandler(directCanThrow: invocation.errorType != nil)
+        do {
+            try await resolved.thunk(resolved.instance, peer.system, target, decoder, handler)
+        } catch let error as RemoteInvocationCancellationError {
+            throw error
+        } catch {
+            throw RemoteInvocationCancellationError.executionFailed(
+                "\(target.identifier) failed on the callee: \(error)")
+        }
+        switch handler.capturedResult {
+        case .value(let value):
+            guard let typed = value as? Res else {
+                throw RemoteInvocationCancellationError.resultPropagationFailed(
+                    "\(target.identifier) returned \(type(of: value)), not \(Res.self)")
+            }
+            return typed
+        case .void:
+            // A void target: the wire path returns an `Ack`, and `Res` is bound to `Ack` for
+            // a `remoteCallVoid`. Hand back the same stand-in.
+            guard let ack = Ack() as? Res else {
+                throw RemoteInvocationCancellationError.resultPropagationFailed(
+                    "\(target.identifier) returned void where \(Res.self) was expected")
+            }
+            return ack
+        case .failure(let error):
+            throw RemoteInvocationCancellationError.executionFailed("\(error)")
+        case nil:
+            throw RemoteInvocationCancellationError.resultPropagationFailed(
+                "\(target.identifier) produced no result")
         }
     }
 
@@ -691,7 +816,7 @@ public final class Session: SessionCoding, OutboundSession, InboundSession, @unc
     /// and refusing is the only answer that is not either a lie or an abort.
     func remoteSatisfiesActorSystemRequirement() -> Bool {
         guard let requirement = system.peerRequirement else { return true }
-        return transport.peerAttestation?.satisfies(requirement) == true
+        return peerAttestation?.satisfies(requirement) == true
     }
 
     /// **Gate two: does the peer satisfy *this actor's* requirement?**
@@ -717,14 +842,24 @@ public final class Session: SessionCoding, OutboundSession, InboundSession, @unc
     private func peerSatisfiesRequirement(of instance: AnyObject) -> Bool {
         guard let restricted = instance as? any RestrictedAccessDistributedActor
         else { return true }
-        return transport.peerAttestation?.satisfies(restricted.peerRequirement) == true
+        return peerAttestation?.satisfies(restricted.peerRequirement) == true
     }
 
     /// Apple's `Session.cancel(because:)`, at the width this module has: tearing the
     /// transport down is what runs `handleTransportCancellation()`, which cancels the
     /// in-flight executions and empties the exported-actor table.
     func cancel(because reason: String) {
-        transport.cancel(reason: reason)
+        switch kind {
+        case .xpc(let transport):
+            transport.cancel(reason: reason)
+        case .local(let local):
+            // A `.local` session has no transport to tear down: trip its own one-shot fuse
+            // (Apple's `LocalSessionState`'s) and release the exported actors.
+            guard local.isCancelled.compareExchange(
+                expected: false, desired: true, ordering: .sequentiallyConsistent).exchanged
+            else { return }
+            cancellationCompleted()
+        }
     }
 
     // MARK: - Inbound
@@ -937,7 +1072,7 @@ public final class Session: SessionCoding, OutboundSession, InboundSession, @unc
 
             do {
                 try await target.thunk(target.instance, system, callTarget,
-                                       contents, handler)
+                                       InvocationDecoder(contents), handler)
                 // A handler with no reply means the runtime returned without calling
                 // any of `onReturn`/`onReturnVoid`/`onThrow`. Nothing in the current
                 // runtime does that; if one ever does, the peer is told rather than
@@ -1222,6 +1357,14 @@ extension XPCActorSystem {
     func makeSession(over transport: Transport,
                      localInterfaceActivated: Bool = true) -> Session {
         Session(system: self, transport: transport,
+                localInterfaceActivated: localInterfaceActivated)
+    }
+
+    /// Vend a `.local` session -- no transport. The server end passes `peer: nil` and
+    /// exports actors a same-process client resolves directly; the client end passes the
+    /// server session as `peer` and originates direct calls against it. See ``ServiceRegistry``.
+    func makeLocalSession(peer: Session?, localInterfaceActivated: Bool) -> Session {
+        Session(system: self, local: LocalSessionState(peer: peer),
                 localInterfaceActivated: localInterfaceActivated)
     }
 }
