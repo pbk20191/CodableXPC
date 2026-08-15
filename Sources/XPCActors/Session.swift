@@ -657,7 +657,9 @@ public final class Session: SessionCoding, OutboundSession, InboundSession, @unc
                 "Failed actor's peer requirement check")
         }
         let decoder = InvocationDecoder(direct: invocation)
-        let handler = ResultHandler(directCanThrow: invocation.errorType != nil)
+        // The direct handler is ungated: Apple's `DirectResultHandler.init()` takes no
+        // `canThrow`, and same-process capture has no peer-written request to defend against.
+        let handler = ResultHandler.direct()
         do {
             try await resolved.thunk(resolved.instance, peer.system, target, decoder, handler)
         } catch let error as RemoteInvocationCancellationError {

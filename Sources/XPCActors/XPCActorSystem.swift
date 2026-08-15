@@ -524,27 +524,32 @@ public final class ResultHandler: DistributedTargetInvocationResultHandler,
 
     public typealias SerializationRequirement = any Codable
 
-    /// Apple's `EncodedResultHandler.canThrow`, and its only resolved consumer is
-    /// ``onThrow(error:)``.
+    /// Apple's `ResultHandler` is a wrapper over `{ EncodedResultHandler | DirectResultHandler }`
+    /// -- **confirmed, not inferred.** The live `XPCDistributed` image carries both inner
+    /// classes (each conforming to `DistributedTargetInvocationResultHandler` in its own
+    /// right) and the two wrapper initializers
+    /// `ResultHandler.init(_: EncodedResultHandler.ReplyHandler, canThrow: Bool)` and
+    /// `ResultHandler.init(direct: DirectResultHandler)`. This reconstruction represents that
+    /// wrapper-over-two-modes shape as one class with an enum ``Mode`` -- the same
+    /// representational choice ``InvocationDecoder`` makes for Apple's
+    /// `{ EncodedInvocationDecoder | DirectInvocationDecoder }`, applied consistently.
     ///
-    /// **How it is computed is an inference, and it is marked as one in the
-    /// reconstruction** (`Invocation.swift`, UNRESOLVED 4): no direct caller of the
-    /// handler's initializer survives in Apple's image, so nothing reads out what feeds
-    /// the byte. `errorType != nil` is the reading the reconstruction calls obvious --
-    /// `recordErrorType` is not called at all for a non-throwing target, so the field's
-    /// presence is exactly the signal -- and it is what ``Session`` passes.
-    let canThrow: Bool
-
-    /// Carried forward from the request's own decode, so that a *returned* actor reference
-    /// can encode itself. Apple's `RemoteInvocationReplyEncoder` stores the same
-    /// dictionary for the same reason.
-    /// Apple's `ResultHandler` is `{ encoded | direct }`, and it must be: the system's
-    /// `ResultHandler` associated type is a **single** class, so `executeDistributedTarget`
-    /// takes one type -- the two modes live in it. Encoded carries the `userInfo` needed to
-    /// encode a *returned* actor reference; direct (same-process) captures the raw outcome
-    /// and crosses no byte.
+    /// The **encoded** mode carries the `userInfo` needed to encode a *returned* actor
+    /// reference (Apple's `RemoteInvocationReplyEncoder` stores the same dictionary for the
+    /// same reason) together with `canThrow`; the **direct** (same-process) mode captures the
+    /// raw outcome and crosses no byte.
+    ///
+    /// **`canThrow` lives on the encoded mode only, because Apple's does.** The dump places it
+    /// as a parameter of the *encoded* wrapper initializer (`init(_:canThrow:)`), while the
+    /// direct side (`init(direct:)`, and `DirectResultHandler.init()` under it) takes no such
+    /// flag: a same-process capture has no *peer*-written request to defend against, so it is
+    /// ungated. How the encoded byte is *computed* is still not read out of the image -- its
+    /// only caller, `handleReceivedRequest`, survives just as fragmented async partials -- but
+    /// the reading the reconstruction takes is `errorType != nil`: `recordErrorType` is not
+    /// called for a non-throwing target, so the field's presence is exactly the signal, and it
+    /// is what ``Session`` passes on the encoded path.
     private enum Mode {
-        case encoded(userInfo: [CodingUserInfoKey: Any])
+        case encoded(userInfo: [CodingUserInfoKey: Any], canThrow: Bool)
         case direct
     }
     private let mode: Mode
@@ -568,16 +573,15 @@ public final class ResultHandler: DistributedTargetInvocationResultHandler,
     var capturedResult: DirectOutcome? { _captured.withLock { $0 } }
 
     init(canThrow: Bool, userInfo: [CodingUserInfoKey: Any]) {
-        self.canThrow = canThrow
-        self.mode = .encoded(userInfo: userInfo)
+        self.mode = .encoded(userInfo: userInfo, canThrow: canThrow)
     }
 
-    /// The direct (same-process) handler: it captures the raw outcome instead of encoding
-    /// it, so the caller reads its own return type back without a byte crossing.
-    init(directCanThrow canThrow: Bool) {
-        self.canThrow = canThrow
-        self.mode = .direct
-    }
+    /// The direct (same-process) handler: it captures the raw outcome instead of encoding it,
+    /// so the caller reads its own return type back without a byte crossing. Apple's
+    /// `ResultHandler.init(direct: DirectResultHandler)`; the inner `DirectResultHandler.init()`
+    /// takes no `canThrow`, so this side is ungated.
+    static func direct() -> ResultHandler { ResultHandler(directMode: ()) }
+    private init(directMode _: Void) { self.mode = .direct }
 
     /// `[0, <value>]`. `Failure` is bound to `Never` in Apple's `Result`; ours does not
     /// need the parameter at all because the response enum carries the tag itself. Direct
@@ -612,23 +616,27 @@ public final class ResultHandler: DistributedTargetInvocationResultHandler,
     /// demand. This is the same trade `ActorID.encode(to:)` already makes against the same
     /// binary, and the reason is written there at length.
     public func onThrow<Err: Error>(error: Err) async throws {
-        guard canThrow else {
-            throw RemoteInvocationCancellationError.executionFailed("""
-                API violation: Swift threw \(error) in a distributed func that doesn't \
-                throw. The invocation carried no errorType, so this target was announced \
-                as non-throwing.
-                """)
-        }
         switch mode {
-        case .encoded:
+        case .encoded(_, let canThrow):
+            guard canThrow else {
+                throw RemoteInvocationCancellationError.executionFailed("""
+                    API violation: Swift threw \(error) in a distributed func that doesn't \
+                    throw. The invocation carried no errorType, so this target was announced \
+                    as non-throwing.
+                    """)
+            }
             try write(RemoteInvocationResponse<NoSuccess>.failure(.executionFailed("\(error)")))
         case .direct:
+            // Apple's `DirectResultHandler` carries no `canThrow`: a same-process capture has
+            // no peer-written request to guard against, so a throw is captured unconditionally
+            // and the direct caller (``Session/directSend(key:target:invocation:peer:)``)
+            // rethrows it.
             _captured.withLock { $0 = .failure(error) }
         }
     }
 
     private func write(_ response: some Encodable) throws {
-        guard case .encoded(let userInfo) = mode else { return }
+        guard case .encoded(let userInfo, _) = mode else { return }
         let payload = try Packet.Payload(encoding: response, userInfo: userInfo)
         _reply.withLock { $0 = payload }
     }
