@@ -1,4 +1,4 @@
-import Foundation
+import Synchronization
 
 /// The system's table of actors living in this process.
 ///
@@ -18,23 +18,24 @@ final class ActorRegistry<Thunk>: @unchecked Sendable {
         let thunk: Thunk
     }
 
-    private let lock = NSLock()
-    private var entries: [RawActorID.Local: Entry] = [:]
+    /// Apple's `actorTable: Mutex<[RawActorID.Local: WeakActorRef]>` -- the same
+    /// `Synchronization.Mutex` over the weak-entry table, now that the floor is macOS 26.
+    private let entries = Mutex<[RawActorID.Local: Entry]>([:])
 
-    var count: Int { lock.withLock { entries.count } }
+    var count: Int { entries.withLock { $0.count } }
 
     func register(_ instance: AnyObject, id: RawActorID.Local, thunk: Thunk) {
-        lock.withLock { entries[id] = Entry(instance: instance, thunk: thunk) }
+        entries.withLock { $0[id] = Entry(instance: instance, thunk: thunk) }
     }
 
     func resign(_ id: RawActorID.Local) {
-        lock.withLock { _ = entries.removeValue(forKey: id) }
+        entries.withLock { _ = $0.removeValue(forKey: id) }
     }
 
     /// Look up a live actor. A slot whose actor has gone is removed as it is found,
     /// so the table does not accumulate one dead entry per actor ever created.
     func lookup(_ id: RawActorID.Local) -> (instance: AnyObject, thunk: Thunk)? {
-        lock.withLock {
+        entries.withLock { entries in
             guard let entry = entries[id] else { return nil }
             guard let instance = entry.instance else {
                 entries.removeValue(forKey: id)

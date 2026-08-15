@@ -1,6 +1,7 @@
 // Sources/XPCActors/XPCActorSystem.swift
 import Distributed
 import Foundation
+import Synchronization
 
 /// The `DistributedActorSystem`. Apple calls theirs `XPCSystem`; the name is ours, the
 /// behaviour is not.
@@ -470,12 +471,11 @@ public final class ResultHandler: DistributedTargetInvocationResultHandler,
     /// dictionary for the same reason.
     private let userInfo: [CodingUserInfoKey: Any]
 
-    private let lock = NSLock()
-    private var _reply: Packet.Payload?
+    private let _reply = Mutex<Packet.Payload?>(nil)
 
     /// The reply to send, or `nil` if the target produced no outcome. Apple's
     /// `EncodedResultHandler.reply`.
-    public var reply: Packet.Payload? { lock.withLock { _reply } }
+    public var reply: Packet.Payload? { _reply.withLock { $0 } }
 
     init(canThrow: Bool, userInfo: [CodingUserInfoKey: Any]) {
         self.canThrow = canThrow
@@ -520,7 +520,7 @@ public final class ResultHandler: DistributedTargetInvocationResultHandler,
 
     private func write(_ response: some Encodable) throws {
         let payload = try Packet.Payload(encoding: response, userInfo: userInfo)
-        lock.withLock { _reply = payload }
+        _reply.withLock { $0 = payload }
     }
 }
 
