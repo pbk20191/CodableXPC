@@ -67,9 +67,13 @@ final class SameProcessOptimizationTests: XCTestCase {
         _ = try await proxy.greet(name: "x")   // establish the pair; the server handler parks
         XCTAssertFalse(released.isSet, "the server handler released before the client went away")
 
+        XCTAssertEqual(receiver.peerTaskCount, 1, "the server handler was not registered")
         session.cancel(because: "test over")
         let torn = await waitUntil { released.isSet }
         XCTAssertTrue(torn, "cancelling the client never released the paired server handler")
+        // The released handler self-reaps, so its entry does not linger until unwindPeers.
+        let reaped = await waitUntil { receiver.peerTaskCount == 0 }
+        XCTAssertTrue(reaped, "the completed server handler was not reaped from the table")
     }
 
     func testADirectThrowComesBack() async throws {

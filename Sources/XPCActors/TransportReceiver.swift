@@ -117,8 +117,13 @@ extension XPCActorSystem {
             // gate depends on. Spawned **outside any lock**: the immediate prologue is user
             // code (exports, activation) and must never run under a lock it -- or a
             // synchronously-completing handler -- could re-enter.
-            let task = Task.immediate { [peerHandler] in
-                await peerHandler(session.local).token
+            let task = Task.immediate { [weak self, peerHandler] in
+                let token = await peerHandler(session.local).token
+                // Self-reap: a completed handler removes its own entry rather than lingering
+                // until unwindPeers. Safe because the handler parks until cancelled, so this
+                // runs after the store below; ids are never reused, so it removes only this task.
+                self?.peerHandlingTasks.withLock { $0[session.id] = nil }
+                return token
             }
 
             // Apple's `readyToReceive(_:)`: the handler's task becomes the activation event's
@@ -160,8 +165,13 @@ extension XPCActorSystem {
                 session.cancel(because: "the receiver was cancelled before the local peer attached")
                 return
             }
-            let task = Task.immediate { [peerHandler] in
-                await peerHandler(session.local).token
+            let task = Task.immediate { [weak self, peerHandler] in
+                let token = await peerHandler(session.local).token
+                // Self-reap: a completed handler removes its own entry rather than lingering
+                // until unwindPeers. Safe because the handler parks until cancelled, so this
+                // runs after the store below; ids are never reused, so it removes only this task.
+                self?.peerHandlingTasks.withLock { $0[session.id] = nil }
+                return token
             }
             session.setActivationOwner { priority in task.escalatePriority(to: priority) }
             let registered = peerHandlingTasks.withLock { table -> Bool in
