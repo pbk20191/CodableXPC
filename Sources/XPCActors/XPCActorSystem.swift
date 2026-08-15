@@ -591,6 +591,46 @@ public final class ResultHandler: DistributedTargetInvocationResultHandler,
 }
 
 // ===========================================================================================
+// MARK: - The direct result handler
+// ===========================================================================================
+
+/// Apple's `DirectResultHandler`: the same-process counterpart of ``ResultHandler``. Where
+/// that one encodes the target's outcome into a `RemoteInvocationResponse` body,
+/// this one **captures the raw value** -- Apple's `DirectResultHandler.capturedResult` --
+/// so the caller reads its own return type back without a byte crossing.
+///
+/// A class for the same reason ``ResultHandler`` is: the runtime takes the handler into
+/// `executeDistributedTarget` and writes the outcome from inside.
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
+final class DirectResultHandler: DistributedTargetInvocationResultHandler, @unchecked Sendable {
+
+    public typealias SerializationRequirement = any Codable
+
+    /// The captured outcome. `value` boxes the concrete `Success` the target returned; the
+    /// direct send casts it back to the caller's static return type.
+    enum Outcome {
+        case value(any Codable)
+        case void
+        case failure(any Error)
+    }
+
+    private let outcome = Mutex<Outcome?>(nil)
+    var capturedResult: Outcome? { outcome.withLock { $0 } }
+
+    func onReturn<Success: Codable>(value: Success) async throws {
+        outcome.withLock { $0 = .value(value) }
+    }
+
+    func onReturnVoid() async throws {
+        outcome.withLock { $0 = .void }
+    }
+
+    func onThrow<Err: Error>(error: Err) async throws {
+        outcome.withLock { $0 = .failure(error) }
+    }
+}
+
+// ===========================================================================================
 // MARK: - RemoteInvocationCancellationError
 // ===========================================================================================
 
