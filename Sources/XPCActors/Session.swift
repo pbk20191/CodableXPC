@@ -174,7 +174,24 @@ public final class Session: SessionCoding, OutboundSession, InboundSession, @unc
     ///
     /// Apple's four accessors trap on a `.local` session. There is no `.local` session here
     /// -- see ``transport`` -- so there is nothing to trap on.
-    private var pendingInvocationExecutionTasks: [ID64: Task<Void, Never>] = [:]
+    private var pendingInvocationExecutionTasks: [ID64: ExecutionSlot] = [:]
+
+    /// The three states an inbound execution's table entry moves through, so a
+    /// `Task.immediate` execution can be spawned **outside** ``lock`` -- its last act,
+    /// `finishPendingInvocationExecutionTask`, re-enters the lock, and a target that
+    /// completes without suspending would deadlock if the spawn still held it -- while a
+    /// body that finishes *inline*, before its handle is stored, is still reaped exactly
+    /// once. Apple's `Slot` is the same machine over an `UnsafeCurrentTask`; ours holds a
+    /// retained `Task`, which these executions never await, only cancel.
+    private enum ExecutionSlot {
+        /// Registered, but the handler task's handle is not stored yet -- it is running
+        /// its inline prologue, or about to.
+        case reserved
+        /// The handle is stored; cancellation can reach it.
+        case running(Task<Void, Never>)
+        /// The task finished (or was reaped) inline, before its handle was stored.
+        case done
+    }
 
     private var isCancelled = false
 
@@ -822,113 +839,14 @@ public final class Session: SessionCoding, OutboundSession, InboundSession, @unc
         // duplicate. Refusing the *new* request is the same call `RequestTable.waitForReply`
         // makes about a duplicate seq, and for the same reason: the parked one must not be
         // displaced by an arrival it cannot see.
+        // Reserve the id before the task can exist: registration must precede completion
+        // (the execution's last act removes its own entry). With `Task.immediate` the body
+        // runs synchronously here, so we reserve now, spawn outside the lock, then store the
+        // handle -- and the ``ExecutionSlot`` machine reconciles a body that finished inline
+        // before its handle landed.
         let accepted = lock.withLock { () -> Bool in
             guard pendingInvocationExecutionTasks[id] == nil else { return false }
-            pendingInvocationExecutionTasks[id] = Task(priority: priority) { [weak self] in
-                // Rebuilt here rather than captured -- see `callTargetIdentifier` above.
-                let callTarget = RemoteCallTarget(callTargetIdentifier)
-                // The floor, applied the way Apple applies it: not as the spawn priority
-                // but as an escalation of the task that is already running, which is why it
-                // can only ever raise. See ``executionFloorPriority()``.
-                //
-                // `UnsafeCurrentTask.escalatePriority(to:)` is SE-0462 and macOS 26+, above
-                // this module's floor. Below it the same value is folded into the spawn
-                // priority instead -- see ``spawnPriority(requested:floor:)``, which is why
-                // `floor` is still read on every path.
-                if #available(macOS 26, iOS 26, tvOS 26, watchOS 26, *) {
-                    withUnsafeCurrentTask { $0?.escalatePriority(to: floor) }
-                }
-
-                guard let self else {
-                    // The session went away between registration and the first hop. Nothing
-                    // can resolve, and the peer is still owed an answer.
-                    reply(Self.failure("""
-                        the session that received \(callTarget.identifier) was released \
-                        before the invocation could be executed
-                        """))
-                    return
-                }
-
-                // Apple's step 3, and the reason resolution is inside this task at all.
-                await self.waitForLocalInterfaceActivation()
-
-                // **Apple's step 4, and it is load-bearing precisely because step 3 is not
-                // cancellation-aware.** `closure #2 +0x358` reads `Task.isCancelled`,
-                // releases the `os_transaction`, and returns -- no reply, no target.
-                //
-                // The window it closes is one S5 *opened*. Before the activation gate,
-                // nothing suspended unboundedly between registering the execution and
-                // running it, so a cancellation that arrived in between had nowhere to land.
-                // Now a peer can park a request on a not-yet-activated session, abandon its
-                // caller (which sends `invocationCancelled`, so this task really is
-                // cancelled), and the target would still run on activation -- side effects
-                // and all -- for a call whose caller was already failed.
-                //
-                // `ActivationEvent.wait()` deliberately does not observe cancellation, which
-                // is Apple's shape too (`await future.value` does not either). That is what
-                // makes the check here the thing doing the work rather than a second belt.
-                //
-                // **No reply, and that is Apple's arm rather than an oversight.** The caller
-                // has already been failed with `.callingTaskCancelled` -- sending it a
-                // response now would be answering a question nobody is still asking, and the
-                // only other listener for this id is a `RequestTable` entry that is gone.
-                // The pending-table entry still has to be drained.
-                guard !Task.isCancelled else {
-                    self.finishPendingInvocationExecutionTask(withID: id)
-                    return
-                }
-
-                guard let target = self.resolveSharedTarget(at: key) else {
-                    reply(Self.failure("""
-                        no actor is shared at \(key) in this session, so \
-                        \(callTarget.identifier) has nothing to run on
-                        """))
-                    self.finishPendingInvocationExecutionTask(withID: id)
-                    return
-                }
-
-                // Gate two. Per resolved target, so a restricted actor and an unrestricted
-                // one on the same session are answered differently for the same peer.
-                guard self.peerSatisfiesRequirement(of: target.instance) else {
-                    // Apple's literal, `0x2ad5262b0`, 37 bytes.
-                    reply(Self.failure("Failed actor's peer requirement check"))
-                    self.finishPendingInvocationExecutionTask(withID: id)
-                    return
-                }
-
-                do {
-                    try await target.thunk(target.instance, system, callTarget,
-                                           contents, handler)
-                    // A handler with no reply means the runtime returned without calling
-                    // any of `onReturn`/`onReturnVoid`/`onThrow`. Nothing in the current
-                    // runtime does that; if one ever does, the peer is told rather than
-                    // left waiting.
-                    if let built = handler.reply {
-                        reply(built)
-                    } else {
-                        reply(Self.propagationFailure("""
-                            \(callTarget.identifier) returned without producing a result
-                            """))
-                    }
-                } catch {
-                    // Everything the inbound path can go wrong with lands here: an
-                    // unknown target, an argument that will not decode, a substitution
-                    // that is not a stub, a target that threw out of a non-throwing
-                    // signature. All of them are "the invocation was not executed" from
-                    // the peer's side, which is `.executionFailed`'s own default text.
-                    reply(Self.failure(
-                        "\(callTarget.identifier) failed on the callee: \(error)"))
-                }
-                // `[weak self]` above is honest about intent but buys nothing on its own:
-                // `handler.userInfo` holds this session strongly, the task holds the
-                // handler, and the table holds the task -- so session -> task -> handler
-                // -> session is live for the duration of every execution. That cycle is
-                // closed by this line, which is why the guard above matters so much: an
-                // orphaned execution is a leaked session graph, not just a leaked task.
-                // (The `[weak self]` on the transport handlers in `init` is a different
-                // thing and *is* load-bearing -- the transport outlives nothing there.)
-                self.finishPendingInvocationExecutionTask(withID: id)
-            }
+            pendingInvocationExecutionTasks[id] = .reserved
             return true
         }
         guard accepted else {
@@ -939,6 +857,125 @@ public final class Session: SessionCoding, OutboundSession, InboundSession, @unc
                 already running under that id
                 """))
             return
+        }
+        // Apple's `Task.immediate(priority:)`, the real one -- the body runs to its first
+        // suspension right here. Spawned **outside** the lock: its last act,
+        // `finishPendingInvocationExecutionTask`, re-enters the lock, and a target that
+        // completes without suspending would run it inline and deadlock if we held it.
+        let task = Task.immediate(priority: priority) { [weak self] in
+            // Rebuilt here rather than captured -- see `callTargetIdentifier` above.
+            let callTarget = RemoteCallTarget(callTargetIdentifier)
+            // The floor, applied the way Apple applies it: not as the spawn priority
+            // but as an escalation of the task that is already running, which is why it
+            // can only ever raise. See ``executionFloorPriority()``.
+            //
+            // `UnsafeCurrentTask.escalatePriority(to:)` is SE-0462 and macOS 26+, above
+            // this module's floor. Below it the same value is folded into the spawn
+            // priority instead -- see ``spawnPriority(requested:floor:)``, which is why
+            // `floor` is still read on every path.
+            if #available(macOS 26, iOS 26, tvOS 26, watchOS 26, *) {
+                withUnsafeCurrentTask { $0?.escalatePriority(to: floor) }
+            }
+
+            guard let self else {
+                // The session went away between registration and the first hop. Nothing
+                // can resolve, and the peer is still owed an answer.
+                reply(Self.failure("""
+                    the session that received \(callTarget.identifier) was released \
+                    before the invocation could be executed
+                    """))
+                return
+            }
+
+            // Apple's step 3, and the reason resolution is inside this task at all.
+            await self.waitForLocalInterfaceActivation()
+
+            // **Apple's step 4, and it is load-bearing precisely because step 3 is not
+            // cancellation-aware.** `closure #2 +0x358` reads `Task.isCancelled`,
+            // releases the `os_transaction`, and returns -- no reply, no target.
+            //
+            // The window it closes is one S5 *opened*. Before the activation gate,
+            // nothing suspended unboundedly between registering the execution and
+            // running it, so a cancellation that arrived in between had nowhere to land.
+            // Now a peer can park a request on a not-yet-activated session, abandon its
+            // caller (which sends `invocationCancelled`, so this task really is
+            // cancelled), and the target would still run on activation -- side effects
+            // and all -- for a call whose caller was already failed.
+            //
+            // `ActivationEvent.wait()` deliberately does not observe cancellation, which
+            // is Apple's shape too (`await future.value` does not either). That is what
+            // makes the check here the thing doing the work rather than a second belt.
+            //
+            // **No reply, and that is Apple's arm rather than an oversight.** The caller
+            // has already been failed with `.callingTaskCancelled` -- sending it a
+            // response now would be answering a question nobody is still asking, and the
+            // only other listener for this id is a `RequestTable` entry that is gone.
+            // The pending-table entry still has to be drained.
+            guard !Task.isCancelled else {
+                self.finishPendingInvocationExecutionTask(withID: id)
+                return
+            }
+
+            guard let target = self.resolveSharedTarget(at: key) else {
+                reply(Self.failure("""
+                    no actor is shared at \(key) in this session, so \
+                    \(callTarget.identifier) has nothing to run on
+                    """))
+                self.finishPendingInvocationExecutionTask(withID: id)
+                return
+            }
+
+            // Gate two. Per resolved target, so a restricted actor and an unrestricted
+            // one on the same session are answered differently for the same peer.
+            guard self.peerSatisfiesRequirement(of: target.instance) else {
+                // Apple's literal, `0x2ad5262b0`, 37 bytes.
+                reply(Self.failure("Failed actor's peer requirement check"))
+                self.finishPendingInvocationExecutionTask(withID: id)
+                return
+            }
+
+            do {
+                try await target.thunk(target.instance, system, callTarget,
+                                       contents, handler)
+                // A handler with no reply means the runtime returned without calling
+                // any of `onReturn`/`onReturnVoid`/`onThrow`. Nothing in the current
+                // runtime does that; if one ever does, the peer is told rather than
+                // left waiting.
+                if let built = handler.reply {
+                    reply(built)
+                } else {
+                    reply(Self.propagationFailure("""
+                        \(callTarget.identifier) returned without producing a result
+                        """))
+                }
+            } catch {
+                // Everything the inbound path can go wrong with lands here: an
+                // unknown target, an argument that will not decode, a substitution
+                // that is not a stub, a target that threw out of a non-throwing
+                // signature. All of them are "the invocation was not executed" from
+                // the peer's side, which is `.executionFailed`'s own default text.
+                reply(Self.failure(
+                    "\(callTarget.identifier) failed on the callee: \(error)"))
+            }
+            // `[weak self]` above is honest about intent but buys nothing on its own:
+            // `handler.userInfo` holds this session strongly, the task holds the
+            // handler, and the table holds the task -- so session -> task -> handler
+            // -> session is live for the duration of every execution. That cycle is
+            // closed by this line, which is why the guard above matters so much: an
+            // orphaned execution is a leaked session graph, not just a leaked task.
+            // (The `[weak self]` on the transport handlers in `init` is a different
+            // thing and *is* load-bearing -- the transport outlives nothing there.)
+            self.finishPendingInvocationExecutionTask(withID: id)
+        }
+        // Store the handle unless the body already finished inline. `.reserved` -> the body
+        // suspended, so store the handle for cancellation to reach; `.done` -> it finished
+        // inline before we got here, so drop the transient entry.
+        lock.withLock {
+            switch pendingInvocationExecutionTasks[id] {
+            case .reserved: pendingInvocationExecutionTasks[id] = .running(task)
+            case .done: pendingInvocationExecutionTasks[id] = nil
+            case .running, .none: break
+            }
         }
     }
 
@@ -1069,7 +1106,11 @@ public final class Session: SessionCoding, OutboundSession, InboundSession, @unc
     /// unknown id is silently ignored -- a peer may cancel a call this side has already
     /// answered, which is a race rather than an error.
     private func cancelPendingInvocationExecutionTask(withID id: ID64) {
-        lock.withLock { pendingInvocationExecutionTasks[id] }?.cancel()
+        let task: Task<Void, Never>? = lock.withLock {
+            if case .running(let task) = pendingInvocationExecutionTasks[id] { return task }
+            return nil
+        }
+        task?.cancel()
     }
 
     /// Apple's `cancelAllPendingInvocationExecutionTasks()`.
@@ -1077,14 +1118,28 @@ public final class Session: SessionCoding, OutboundSession, InboundSession, @unc
     /// The tasks are cancelled *outside* the lock: each one's completion takes the same
     /// lock to remove itself, and `Task.cancel()` can run a cancellation handler inline.
     private func cancelAllPendingInvocationExecutionTasks() {
-        let tasks = lock.withLock { Array(pendingInvocationExecutionTasks.values) }
+        let tasks: [Task<Void, Never>] = lock.withLock {
+            pendingInvocationExecutionTasks.values.compactMap {
+                if case .running(let task) = $0 { return task }
+                return nil
+            }
+        }
         for task in tasks { task.cancel() }
     }
 
     /// The execution is over, however it ended. Ours; Apple's removal happens inside
     /// `replyToPendingInvocation(withID:replyBlock:)`.
     private func finishPendingInvocationExecutionTask(withID id: ID64) {
-        lock.withLock { _ = pendingInvocationExecutionTasks.removeValue(forKey: id) }
+        lock.withLock {
+            switch pendingInvocationExecutionTasks[id] {
+            // Normal removal once the handle is stored.
+            case .running: pendingInvocationExecutionTasks[id] = nil
+            // Finished inline, before the spawn stored the handle: leave a `.done` marker
+            // for the store step to clear, so neither side loses the entry.
+            case .reserved: pendingInvocationExecutionTasks[id] = .done
+            case .done, .none: break
+            }
+        }
     }
 
     /// `[1, {"executionFailed": {"_0": message}}]`, over `Never` -- a failure carries no
