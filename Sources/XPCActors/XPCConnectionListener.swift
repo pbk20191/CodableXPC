@@ -1,5 +1,6 @@
 #if canImport(Darwin)
 import Foundation
+import Synchronization
 import XPC
 
 // ===========================================================================================
@@ -31,8 +32,8 @@ import XPC
 public final class XPCConnectionListener: @unchecked Sendable {
 
     private let listener: xpc_connection_t
-    private let lock = NSLock()
-    private var isCancelled = false
+    /// One-shot fuse, `caslb 0 -> 1`; an `Atomic<Bool>` now that the floor is macOS 26.
+    private let isCancelled = Atomic<Bool>(false)
 
     /// Retained for the same reason as the transport's: the event handler is held by the
     /// connection, so a handler that captured `self` strongly would make the pair immortal.
@@ -95,22 +96,18 @@ public final class XPCConnectionListener: @unchecked Sendable {
     /// Stop accepting. Peers already accepted are untouched -- they have their own connections
     /// and their own lifetimes.
     public func cancel() {
-        let shouldCancel: Bool = lock.withLock {
-            guard !isCancelled else { return false }
-            isCancelled = true
-            return true
-        }
-        guard shouldCancel else { return }
+        let (tripped, _) = isCancelled.compareExchange(
+            expected: false, desired: true, ordering: .sequentiallyConsistent)
+        guard tripped else { return }
         xpc_connection_cancel(listener)
         box.accept = nil
     }
 
     final class Box: @unchecked Sendable {
-        private let lock = NSLock()
-        private var _accept: (@Sendable (XPCConnectionTransport) -> Void)?
+        private let _accept = Mutex<(@Sendable (XPCConnectionTransport) -> Void)?>(nil)
         var accept: (@Sendable (XPCConnectionTransport) -> Void)? {
-            get { lock.withLock { _accept } }
-            set { lock.withLock { _accept = newValue } }
+            get { _accept.withLock { $0 } }
+            set { _accept.withLock { $0 = newValue } }
         }
     }
 }
