@@ -257,15 +257,16 @@ public final class Session: SessionCoding, OutboundSession, InboundSession, @unc
     /// the difference between the two is only *whose* priority a waiter escalates, and
     /// ``ActivationEvent`` carries that as an optional owner.
     ///
-    /// **Ours starts posted; Apple's does not.** Both of Apple's initialisers leave the
-    /// owned event `nil`, so a session that never went through `readyToReceive(_:)` blocks
-    /// every inbound execution until `cancellationCompleted()` fulfils the unowned one --
-    /// which is fine over there, because a session that receives requests is one a
-    /// `LocalInterface.activateThen…` entry point drove, and those call `readyToReceive`.
-    /// There is no `LocalInterface` in this module and no `export` API that would call it,
-    /// so defaulting closed would make every session a session that never answers. The
-    /// default is a parameter on ``XPCActorSystem/makeSession(over:localInterfaceActivated:)``
-    /// and it moves to `InitializationOptions` when those arrive.
+    /// **Whether it starts posted is now a real choice, as Apple's is.** A session that
+    /// exports actors is driven by ``LocalInterface/activateThenWaitForCancellation()`` --
+    /// which activates this gate -- so it starts *shut* and opens once its exports are in;
+    /// a plain client exports nothing and starts *open*, because an inbound request to it can
+    /// only ever be answered "nothing is shared there". The choice is the
+    /// `localInterfaceActivated` parameter on
+    /// ``XPCActorSystem/makeSession(over:localInterfaceActivated:)`` /
+    /// ``XPCActorSystem/makeLocalSession(peer:localInterfaceActivated:)``, set from
+    /// ``Service/InitializationOptions/bidirectional`` at connect and `false` for an accepted
+    /// peer, which its handler then activates.
     private let activationEvent: ActivationEvent
 
     /// Apple's `Session.cancellationEvent` -- the second of the two promises
