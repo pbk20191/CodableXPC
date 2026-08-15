@@ -58,36 +58,29 @@ extension XPCActorSystem {
         /// [dis] Branches on `isMach`, creates the session `.inactive`, then applies the
         ///       requirement when one was given.
         ///
-        /// Apple's builds an `XPCSession`; this builds the `xpc_connection_t` underneath one.
-        /// The branch, the ordering and the `.inactive` are all theirs -- a connection created
-        /// here is suspended until ``XPCConnectionTransport/activate()``, which is what
-        /// `.inactive` means one layer up, and it is what gives the requirement somewhere to be
+        /// Apple's builds an `XPCSession`, and so does this -- the same branch, the same
+        /// ordering, the same `.inactive`. A session created here is inactive until
+        /// ``XPCRawTransport/activate()``, which is what gives the requirement somewhere to be
         /// applied before any byte moves.
         private func makeTransport(
             peerRequirement: PeerRequirement?, targetQueue: DispatchQueue?
-        ) throws(SetupError) -> XPCConnectionTransport {
-            let transport = isMach
-                ? XPCConnectionTransport.connectingToMachService(name, targetQueue: targetQueue)
-                : XPCConnectionTransport.connectingToXPCService(name, targetQueue: targetQueue)
+        ) throws(SetupError) -> XPCRawTransport {
+            let transport: XPCRawTransport
+            do {
+                transport = isMach
+                    ? try XPCRawTransport.connectingToMachService(name, targetQueue: targetQueue)
+                    : try XPCRawTransport.connectingToXPCService(name, targetQueue: targetQueue)
+            } catch {
+                throw SetupError("could not dial \(debugName): \(error)")
+            }
             guard let peerRequirement else { return transport }
-            // **Refused, not ignored.** Apple's `makeXPCSession` calls
-            // `XPCSession.setPeerRequirement(_:)` here, and there is no way to do the same to a
-            // bare connection from Swift: `xpc_connection_set_peer_requirement` is
-            // `XPC_SWIFT_NOEXPORT`, and its argument type cannot even be linked --
-            // `_OBJC_CLASS_$_OS_xpc_peer_requirement` is in no SDK stub. The full measurement is
-            // in `PeerRequirement.swift`.
-            //
-            // A connection opened while quietly dropping the caller's requirement would be the
-            // exact failure this codebase keeps refusing to ship: a gate that looks like one and
-            // is not. The **inbound** gates are unaffected -- they run on
-            // `AuditTokenAttestation`, which the overlay does export -- so what is lost is only
-            // a client's ability to have libxpc screen the service *before* the first byte.
-            throw SetupError(
-                "\(peerRequirement) cannot be enforced on the connection to \(debugName): "
-                + "libxpc's peer-requirement API is unavailable to Swift and its requirement "
-                + "type is not linkable. Connect without it and gate inbound calls instead: "
-                + "XPCActorSystem(_:peerRequirement:) and RestrictedAccessDistributedActor both "
-                + "still work, because those run on AuditTokenAttestation.")
+            // Apple's `makeXPCSession` calls `XPCSession.setPeerRequirement(_:)` here -- and
+            // over the overlay we can, which is one capability the bare-connection detour had
+            // to refuse (`xpc_connection_set_peer_requirement` is `XPC_SWIFT_NOEXPORT`, its
+            // argument type not even linkable). Applied on the inactive session, before any
+            // byte moves, exactly as theirs.
+            transport.setPeerRequirement(peerRequirement)
+            return transport
         }
 
         /// Dial this service and return the session speaking to it.

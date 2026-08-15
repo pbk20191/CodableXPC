@@ -222,11 +222,11 @@ extension audit_token_t {
     func xpcBridgedIsValid() -> Bool
 }
 
-// The fourth bridged declaration, `XPC.XPCSession.auditToken.getter`, is **gone** rather than
-// merely unused. It was the connection-level token `XPCRawTransport` read; that transport was
-// replaced by ``XPCConnectionTransport``, which has no `XPCSession` to read it from. Keeping a
-// `@_silgen_name` binding with no caller would be keeping a weakly-linked symbol reference
-// alive to prove a point -- the comment above already records that it exists and works.
+// The fourth bridged declaration, `XPC.XPCSession.auditToken.getter`, is **gone** from the
+// current overlay rather than merely unused: even ``XPCRawTransport``, which is back on
+// `XPCSession`, cannot read a session-level token, so it attests from the last message
+// instead (below). Keeping a `@_silgen_name` binding with no caller would keep a
+// weakly-linked symbol reference alive to prove a point the comment above already records.
 
 @available(macOS 26, macCatalyst 26, *)
 extension XPCDictionary {
@@ -237,13 +237,12 @@ extension XPCDictionary {
     /// the bytes in hand than to the connection.
     ///
     /// **This is now the only reading available, and it is why this declaration was worth
-    /// keeping.** It was written speculatively, beside the `XPCSession` one that
-    /// ``XPCRawTransport`` actually used, on the grounds that it made the two readings
-    /// distinguishable. When the transport dropped to `xpc_connection_t` the session-level
-    /// accessor went with the overlay and the public connection API has no replacement, so
-    /// ``XPCConnectionTransport`` attests from the last message it received. A test pins that a
-    /// dictionary which never crossed a connection has **no** valid token, which is what keeps
-    /// "cannot tell" distinct from "not entitled" on this path.
+    /// keeping.** It was written speculatively, beside the `XPCSession.auditToken` reading, on
+    /// the grounds that it made the two distinguishable. That session-level accessor is now
+    /// gone from the overlay, so ``XPCRawTransport`` -- though back on `XPCSession` -- attests
+    /// from the last message it received. A test pins that a dictionary which never crossed a
+    /// connection has **no** valid token, which is what keeps "cannot tell" distinct from "not
+    /// entitled" on this path.
     @_silgen_name("$s3XPC13XPCDictionaryV10auditTokenSo0C8_token_tavg")
     func xpcBridgedAuditToken() -> audit_token_t
 }
