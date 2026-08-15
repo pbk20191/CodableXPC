@@ -50,4 +50,31 @@ final class DirectInvocationDecoderTests: XCTestCase {
         var decoder = InvocationDecoder(direct: encoder)
         XCTAssertThrowsError(try decoder.decodeNextArgument() as String)
     }
+
+    // MARK: The direct result handler
+
+    func testDirectResultHandlerCapturesAValue() async throws {
+        let handler = DirectResultHandler()
+        try await handler.onReturn(value: 99)
+        guard case .value(let captured) = handler.capturedResult else {
+            return XCTFail("expected a captured value, got \(String(describing: handler.capturedResult))")
+        }
+        XCTAssertEqual(captured as? Int, 99)
+    }
+
+    func testDirectResultHandlerCapturesVoid() async throws {
+        let handler = DirectResultHandler()
+        try await handler.onReturnVoid()
+        guard case .void = handler.capturedResult else { return XCTFail("expected void") }
+    }
+
+    func testDirectResultHandlerCapturesAThrow() async throws {
+        struct Boom: Error {}
+        let handler = DirectResultHandler()
+        try await handler.onThrow(error: Boom())
+        guard case .failure(let error) = handler.capturedResult else {
+            return XCTFail("expected a captured failure")
+        }
+        XCTAssertTrue(error is Boom)
+    }
 }
