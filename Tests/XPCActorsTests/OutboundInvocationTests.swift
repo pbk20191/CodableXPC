@@ -355,8 +355,7 @@ final class OutboundInvocationTests: XCTestCase {
     /// claims to belong to cannot disagree, because there is only one parameter.
     func testASessionVendedByASystemAgreesWithIt() throws {
         let peer = try Peer()
-        XCTAssertTrue(peer.session.system === peer.system,
-                      "a session must belong, by identity, to the system that vended it")
+        XCTAssertEqual(peer.session.systemID, peer.system.id)
         let id = peer.session.remoteID(for: .dynamic(ID64(rawValue: 1)))
         XCTAssertNil(try peer.system.resolve(id: id, as: Echo.self),
                      "a proxy through our own session is a proxy, not a refusal")
