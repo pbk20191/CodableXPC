@@ -645,21 +645,6 @@ final class PeerGateTests: XCTestCase {
         link.clientTransport.cancel(reason: "done")
     }
 
-    /// Where the floor is applied depends on the OS, and both shapes carry the same value.
-    /// On macOS 26+ the spawn priority is Apple's exactly -- the ceiling and nothing else --
-    /// because the floor arrives as an escalation.
-    func testTheSpawnPriorityCarriesTheFloorOnlyWhereEscalationIsUnavailable() {
-        let clamped = Session.spawnPriority(requested: .background, floor: .userInitiated)
-        let ambient = Session.spawnPriority(requested: nil, floor: .utility)
-        if #available(macOS 26, iOS 26, tvOS 26, watchOS 26, *) {
-            XCTAssertEqual(clamped, .background)
-            XCTAssertNil(ambient)
-        } else {
-            XCTAssertEqual(clamped, .userInitiated)
-            XCTAssertEqual(ambient, .utility)
-        }
-    }
-
     // -------------------------------------------------------------------------------------
     // MARK: 6. The overlay, for real
     // -------------------------------------------------------------------------------------

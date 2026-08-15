@@ -809,8 +809,10 @@ public final class Session: SessionCoding, OutboundSession, InboundSession, @unc
         // being clamped. See ``executionPriority(requested:)`` and
         // ``executionFloorPriority()``.
         let floor = Self.executionFloorPriority()
-        let priority = Self.spawnPriority(
-            requested: Self.executionPriority(requested: request.basePriority), floor: floor)
+        // The floor is applied by escalation *inside* the execution (Apple's way, now that
+        // `escalatePriority` is always available at the macOS 26 floor), not folded into the
+        // spawn priority -- so the spawn priority is exactly the requested one.
+        let priority = Self.executionPriority(requested: request.basePriority)
 
         // **Registered before the task can complete, and that is what the lock buys.**
         // The execution's last act is to remove itself, which takes this same lock -- so
@@ -865,17 +867,11 @@ public final class Session: SessionCoding, OutboundSession, InboundSession, @unc
         let task = Task.immediate(priority: priority) { [weak self] in
             // Rebuilt here rather than captured -- see `callTargetIdentifier` above.
             let callTarget = RemoteCallTarget(callTargetIdentifier)
-            // The floor, applied the way Apple applies it: not as the spawn priority
-            // but as an escalation of the task that is already running, which is why it
-            // can only ever raise. See ``executionFloorPriority()``.
-            //
-            // `UnsafeCurrentTask.escalatePriority(to:)` is SE-0462 and macOS 26+, above
-            // this module's floor. Below it the same value is folded into the spawn
-            // priority instead -- see ``spawnPriority(requested:floor:)``, which is why
-            // `floor` is still read on every path.
-            if #available(macOS 26, iOS 26, tvOS 26, watchOS 26, *) {
-                withUnsafeCurrentTask { $0?.escalatePriority(to: floor) }
-            }
+            // The floor, applied the way Apple applies it: not as the spawn priority but as
+            // an escalation of the task that is already running, which is why it can only
+            // ever raise. `UnsafeCurrentTask.escalatePriority(to:)` is SE-0462, macOS 26,
+            // which is this module's floor. See ``executionFloorPriority()``.
+            withUnsafeCurrentTask { $0?.escalatePriority(to: floor) }
 
             guard let self else {
                 // The session went away between registration and the first hop. Nothing
@@ -1049,34 +1045,6 @@ public final class Session: SessionCoding, OutboundSession, InboundSession, @unc
         min(Task.currentPriority, .userInitiated)
     }
 
-    /// What to hand `Task(priority:)`, given both halves of the clamp.
-    ///
-    /// Apple's answer is "the ceiling, and nothing else" -- the floor arrives later, as an
-    /// escalation. That is reproduced verbatim where the escalation API exists. Where it
-    /// does not (`UnsafeCurrentTask.escalatePriority(to:)` is SE-0462, macOS 26+, and this
-    /// module's floor is macOS 14) the floor has to be applied at the only other moment
-    /// there is, which is here.
-    ///
-    /// The two are not identical and the difference is worth naming rather than papering
-    /// over: escalating a running task raises its priority *and* propagates that to
-    /// anything already waiting on it, while spawning higher never has anything to
-    /// propagate to. For a task that has not started yet the observable priority is the
-    /// same, which is why this is a sound fallback and not a second behaviour.
-    ///
-    /// `nil` requested means "ambient" to `Task(priority:)`. The fallback substitutes `floor`
-    /// for it, and that is **not** the same thing: `floor` is the delivering context's
-    /// priority *capped* at `.userInitiated`, where Apple passes `nil` and lets escalation
-    /// only ever raise. So on a delivering context above `.userInitiated` this fallback runs
-    /// the execution *lower* than Apple would. The direction is the safe one -- a peer cannot
-    /// gain priority from it -- and it is unreachable wherever
-    /// `UnsafeCurrentTask.escalatePriority(to:)` exists, which is every platform this package
-    /// is currently built for. Named rather than smoothed over, because "capped, unlike
-    /// Apple's" is the kind of difference that gets read as "exactly Apple's" a slice later.
-    static func spawnPriority(requested: TaskPriority?, floor: TaskPriority) -> TaskPriority? {
-        if #available(macOS 26, iOS 26, tvOS 26, watchOS 26, *) { return requested }
-        guard let requested else { return floor }
-        return max(requested, floor)
-    }
 
     /// Apple's `handleReceivedNotification(_:)`: decode, and dispatch the three cases.
     ///
