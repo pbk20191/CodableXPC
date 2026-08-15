@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 import XPC
 
 /// Two transports wired to each other in one process.
@@ -10,14 +11,20 @@ import XPC
 @available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 public final class InProcessRawTransport: RawTransportProtocol, @unchecked Sendable {
 
-    private let lock = NSLock()
     private let queue: DispatchQueue
-    private var remoteEnd: InProcessRawTransport?
-    private var handler: (@Sendable (Packet) -> Void)?
-    private var cancellationHandler: (@Sendable (String) -> Void)?
-    private var activated = false
-    private var cancellationReason: String?
-    private var _peerAttestation: (any PeerAttestation)?
+
+    /// All mutable ends of the pipe under one `Synchronization.Mutex` -- `send`, `cancel` and
+    /// `deliver` each read several of these together, so they cannot be split into separate
+    /// primitives.
+    private struct State {
+        var remoteEnd: InProcessRawTransport?
+        var handler: (@Sendable (Packet) -> Void)?
+        var cancellationHandler: (@Sendable (String) -> Void)?
+        var activated = false
+        var cancellationReason: String?
+        var peerAttestation: (any PeerAttestation)?
+    }
+    private let state = Mutex<State>(State())
 
     /// What this end can prove about the other end.
     ///
@@ -28,8 +35,8 @@ public final class InProcessRawTransport: RawTransportProtocol, @unchecked Senda
     /// attests nothing unless it is told what to attest, and every gate in ``Session`` reads
     /// that `nil` as refuse.
     public var peerAttestation: (any PeerAttestation)? {
-        get { lock.withLock { _peerAttestation } }
-        set { lock.withLock { _peerAttestation = newValue } }
+        get { state.withLock { $0.peerAttestation } }
+        set { state.withLock { $0.peerAttestation = newValue } }
     }
 
     private init(debugName: String, qos: DispatchQoS) {
@@ -49,37 +56,35 @@ public final class InProcessRawTransport: RawTransportProtocol, @unchecked Senda
     ) -> (InProcessRawTransport, InProcessRawTransport) {
         let a = InProcessRawTransport(debugName: "\(debugName).a", qos: qos)
         let b = InProcessRawTransport(debugName: "\(debugName).b", qos: qos)
-        a.lock.withLock { a.remoteEnd = b }
-        b.lock.withLock { b.remoteEnd = a }
+        a.state.withLock { $0.remoteEnd = b }
+        b.state.withLock { $0.remoteEnd = a }
         return (a, b)
     }
 
     public func setPacketHandler(_ handler: @escaping @Sendable (Packet) -> Void) {
-        lock.withLock { self.handler = handler }
+        state.withLock { $0.handler = handler }
     }
 
     public func setCancellationHandler(_ handler: @escaping @Sendable (String) -> Void) {
-        lock.withLock { self.cancellationHandler = handler }
+        state.withLock { $0.cancellationHandler = handler }
     }
 
     public func activate() throws(RawTransportError) {
-        // Explicit lock/unlock rather than `withLock`: that method is `rethrows`,
-        // which cannot carry a typed `throws(RawTransportError)` out of the closure.
-        lock.lock()
-        let reason = cancellationReason
-        if reason == nil { activated = true }
-        lock.unlock()
+        // The throw is outside the lock so the typed `throws(RawTransportError)` need not
+        // cross `Mutex.withLock`'s `rethrows` boundary.
+        let reason = state.withLock { state -> String? in
+            if state.cancellationReason == nil { state.activated = true }
+            return state.cancellationReason
+        }
         if let reason {
             throw RawTransportError.rawTransportCancelled(message: reason)
         }
     }
 
     public func send(packet: Packet) throws(RawTransportError) {
-        lock.lock()
-        let reason = cancellationReason
-        let isActivated = activated
-        let target = remoteEnd
-        lock.unlock()
+        let (reason, isActivated, target) = state.withLock {
+            ($0.cancellationReason, $0.activated, $0.remoteEnd)
+        }
 
         if let reason {
             throw RawTransportError.rawTransportCancelled(message: reason)
@@ -96,22 +101,22 @@ public final class InProcessRawTransport: RawTransportProtocol, @unchecked Senda
     }
 
     private func deliver(_ packet: Packet) {
-        let handler: (@Sendable (Packet) -> Void)? = lock.withLock {
-            cancellationReason == nil && activated ? self.handler : nil
+        let handler: (@Sendable (Packet) -> Void)? = state.withLock {
+            $0.cancellationReason == nil && $0.activated ? $0.handler : nil
         }
         handler?(packet)
     }
 
     public func cancel(reason: String) {
-        let peer: InProcessRawTransport? = lock.withLock {
-            guard cancellationReason == nil else { return nil }
-            cancellationReason = reason
-            handler = nil
+        let peer: InProcessRawTransport? = state.withLock { state in
+            guard state.cancellationReason == nil else { return nil }
+            state.cancellationReason = reason
+            state.handler = nil
             // Our own cancellation never calls our own cancellation handler: that
             // channel reports deaths that did *not* originate on this side.
-            cancellationHandler = nil
-            let peer = remoteEnd
-            remoteEnd = nil
+            state.cancellationHandler = nil
+            let peer = state.remoteEnd
+            state.remoteEnd = nil
             return peer
         }
         guard let peer else { return }
@@ -120,11 +125,11 @@ public final class InProcessRawTransport: RawTransportProtocol, @unchecked Senda
         // pick up its cancellation handler in the same critical section. Our own lock
         // is already released here: the two ends are locked strictly one at a time, so
         // a simultaneous cancel from both directions cannot deadlock.
-        let peerHandler: (@Sendable (String) -> Void)? = peer.lock.withLock {
-            peer.remoteEnd = nil
-            guard peer.cancellationReason == nil else { return nil }
-            defer { peer.cancellationHandler = nil }
-            return peer.cancellationHandler
+        let peerHandler: (@Sendable (String) -> Void)? = peer.state.withLock { peerState in
+            peerState.remoteEnd = nil
+            guard peerState.cancellationReason == nil else { return nil }
+            defer { peerState.cancellationHandler = nil }
+            return peerState.cancellationHandler
         }
         guard let peerHandler else { return }
 
