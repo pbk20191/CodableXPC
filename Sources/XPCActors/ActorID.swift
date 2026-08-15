@@ -1,5 +1,6 @@
 // Sources/XPCActors/ActorID.swift
 import Foundation
+import Synchronization
 
 /// Where an `ActorID` finds the session it needs in order to code itself.
 ///
@@ -84,24 +85,14 @@ public struct ID64: Hashable, Sendable, Codable, CustomStringConvertible {
         self.rawValue = try decoder.singleValueContainer().decode(UInt64.self)
     }
 
-    private static let counter = ManagedAtomicCounter()
-    public static func next() -> ID64 { ID64(rawValue: counter.next()) }
+    /// A monotonic id source. `Synchronization.Atomic` now that the floor is macOS 26 --
+    /// the increment is a single atomic, no lock.
+    private static let counter = Atomic<UInt64>(0)
+    public static func next() -> ID64 {
+        ID64(rawValue: counter.wrappingAdd(1, ordering: .relaxed).newValue)
+    }
 
     public var description: String { "\(rawValue)" }
-}
-
-/// A monotonic counter. `OSAllocatedUnfairLock` rather than an atomics package so the
-/// target keeps its single dependency on `CodableXPC`.
-@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
-private final class ManagedAtomicCounter: @unchecked Sendable {
-    private let lock = NSLock()
-    private var value: UInt64 = 0
-    func next() -> UInt64 {
-        lock.withLock {
-            value += 1
-            return value
-        }
-    }
 }
 
 @available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
