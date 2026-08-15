@@ -1,7 +1,7 @@
 import XCTest
 @testable import XPCActors
 
-@available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 final class ErrorsTests: XCTestCase {
 
     func testRawTransportErrorCarriesMessage() {

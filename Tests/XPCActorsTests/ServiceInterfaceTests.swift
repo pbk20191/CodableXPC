@@ -11,7 +11,7 @@ import Distributed
 /// The demo proves the whole path works once. These pin the parts of it that can regress
 /// silently: the well-known key both sides mint, and the activation gate, whose entire purpose
 /// is to be invisible when nothing races.
-@available(macOS 13, *)
+@available(macOS 26, *)
 final class ServiceInterfaceTests: XCTestCase {
 
     // MARK: Naming
@@ -153,7 +153,7 @@ final class ServiceInterfaceTests: XCTestCase {
 
 // MARK: - the actor
 
-@available(macOS 13, *)
+@available(macOS 26, *)
 distributed actor NamedGreeter {
     typealias ActorSystem = XPCActorSystem
     distributed func greet() -> String { "hello from the server actor" }
@@ -163,7 +163,7 @@ distributed actor NamedGreeter {
 
 /// The service side built the way a service process builds it -- `TransportReceiver` plus a
 /// listener -- but on an anonymous endpoint, so no bundle and no launchd are involved.
-@available(macOS 13, *)
+@available(macOS 26, *)
 private final class ServedLink: @unchecked Sendable {
 
     let serverSystem = XPCActorSystem("served")
@@ -219,7 +219,7 @@ private final class ServedLink: @unchecked Sendable {
     }
 }
 
-@available(macOS 13, *)
+@available(macOS 26, *)
 private final class Box<Value: Sendable>: @unchecked Sendable {
     private let lock = NSLock()
     private var _outcome: Result<Value, any Error>?

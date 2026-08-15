@@ -15,7 +15,7 @@ import Foundation
 /// decodes cleanly. Apple's own decoder works the same way -- `"Unable to resolve
 /// type: "` is a distinct, later failure raised by whatever tries to use the type, not
 /// by decoding the wrapper.
-@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 public struct SwiftType: Sendable {
 
     public let mangledTypeName: String
@@ -61,7 +61,7 @@ public struct SwiftType: Sendable {
     }
 }
 
-@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 extension SwiftType: Hashable {
     // Equality and hashing are defined over `mangledTypeName` alone. `type` is a
     // derived, cache-backed lookup -- not additional identity -- and two `SwiftType`s
@@ -74,7 +74,7 @@ extension SwiftType: Hashable {
     }
 }
 
-@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 extension SwiftType: Codable {
 
     // A bare String on the wire, not `{ mangledTypeName: ... }`. The struct has two

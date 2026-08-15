@@ -25,7 +25,7 @@ import XPC
 /// Sends are one-way, exactly as before. `xpc_connection_send_message` never uses the reply
 /// channel, so replies travel as ordinary inbound messages -- which is what lets the
 /// listening side originate calls.
-@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 public final class XPCConnectionTransport: RawTransportProtocol, @unchecked Sendable {
 
     private let connection: xpc_connection_t
@@ -256,7 +256,7 @@ public final class XPCConnectionTransport: RawTransportProtocol, @unchecked Send
 // MARK: - Dialling
 // ===========================================================================================
 
-@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 extension XPCConnectionTransport {
 
     /// Dial a launchd Mach service by name.

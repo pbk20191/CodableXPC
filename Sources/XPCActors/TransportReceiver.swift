@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 #if canImport(Darwin)
 import XPC
 #endif
@@ -7,7 +8,7 @@ import XPC
 // MARK: - TransportReceiver
 // ===========================================================================================
 
-@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 extension XPCActorSystem {
 
     /// The serving side: one of these turns arriving transports into sessions and runs a
@@ -21,13 +22,14 @@ extension XPCActorSystem {
     /// return an `ActivationToken`, and the only ways to obtain a token are to activate or to
     /// explicitly decline (``Session/LocalInterface/cancelWithoutActivating(because:)``). A
     /// handler that exports actors and then forgets to start answering does not compile.
-    public final class TransportReceiver: @unchecked Sendable {
-
-        private let lock = NSLock()
+    public final class TransportReceiver: Sendable {
 
         /// [fieldmd] `{XPCDistributed.Fuse}` -- one-shot. [disasm] `cancel()` does
-        /// `caslb 0 -> 1` and returns immediately if it was already tripped.
-        private var isCancelled = false
+        /// `caslb 0 -> 1` and returns immediately if it was already tripped. Apple's `Fuse`
+        /// is `{ value: Atomic<Bool> }`; this **is** that atomic, and the `caslb` is its
+        /// `compareExchange(expected: false, desired: true)`. No `NSLock` stand-in now that
+        /// the floor is macOS 26 and `Synchronization` is available.
+        private let fuse = Atomic<Bool>(false)
 
         private let actorSystem: XPCActorSystem
 
@@ -37,8 +39,10 @@ extension XPCActorSystem {
         private let peerHandler: @Sendable (consuming Session.LocalInterface) async
             -> (result: (), token: Session.LocalInterface.ActivationToken)
 
-        /// [fieldmd] `yyYbcSg`, flags 0x2 -- a `var`, and optional.
-        private var cancellationHandler: (@Sendable () -> Void)?
+        /// [fieldmd] `yyYbcSg`, flags 0x2 -- a `var`, and optional. Held under its own
+        /// mutex; only the caller that wins the fuse trip in ``cancel()`` ever
+        /// reads-and-clears it.
+        private let cancellationHandler = Mutex<(@Sendable () -> Void)?>(nil)
 
         /// [fieldmd] `{TransportReceiver.(PeerTaskTable)}`, private in Apple's too.
         ///
@@ -69,7 +73,7 @@ extension XPCActorSystem {
         /// the group, reintroducing the very thing the group was meant to replace. A group
         /// wins only for a single async entry point with terminal-only shutdown and no
         /// per-id need — which this is not. So the table owns the tasks directly.
-        private var peerHandlingTasks: [ID64: Task<Session.LocalInterface.ActivationToken, Never>] = [:]
+        private let peerHandlingTasks = Mutex<[ID64: Task<Session.LocalInterface.ActivationToken, Never>]>([:])
 
         /// [sym] 0x2ad4e99f0.
         public init(
@@ -82,7 +86,7 @@ extension XPCActorSystem {
         }
 
         /// [sym] 0x2ad4e94d8. [disasm] the mutex-guarded count of `.live` slots.
-        public var peerTaskCount: Int { lock.withLock { peerHandlingTasks.count } }
+        public var peerTaskCount: Int { peerHandlingTasks.withLock { $0.count } }
 
         /// Turn an arriving transport into a session and start its handler.
         ///
@@ -100,35 +104,43 @@ extension XPCActorSystem {
         public func attachTransport(_ transport: Transport) throws(SetupError) {
             let session = actorSystem.makeSession(over: transport, localInterfaceActivated: false)
 
-            let alreadyCancelled: Bool = lock.withLock {
-                guard !isCancelled else { return true }
-                let task = Task<Session.LocalInterface.ActivationToken, Never> { [peerHandler] in
-                    await peerHandler(session.local).token
-                }
-                peerHandlingTasks[session.id] = task
-                // Apple's `readyToReceive(_:)`: the handler's task becomes the activation
-                // event's owner, so an inbound execution parked on the gate lifts the priority
-                // of the task that is going to open it, rather than waiting behind it at its
-                // own. `OwnedAwaitableEvent.wait()` escalates `owningTask` and never awaits it
-                // -- escalate without join, which is exactly what `escalatePriority(to:)` does
-                // and an `await` would not.
-                //
-                // **Only from macOS 26**, which is where `Task.escalatePriority(to:)` was
-                // introduced; this file's floor is macOS 14. Below it there is no way to raise
-                // a task's priority without joining it, so the owner is left unset rather than
-                // installed as a closure that silently ignores its argument -- an absent owner
-                // reads as absent, a no-op owner reads as working. The cost on older systems is
-                // a priority inversion while the gate is shut, which is latency, not
-                // correctness.
-                if #available(macOS 26, iOS 26, tvOS 26, watchOS 26, *) {
-                    session.setActivationOwner { priority in
-                        task.escalatePriority(to: priority)
-                    }
-                }
-                return false
-            }
-            if alreadyCancelled {
+            // Refuse a peer arriving after cancel. Re-checked once more at registration
+            // below, since the immediate handler is spawned outside any lock.
+            guard !fuse.load(ordering: .acquiring) else {
                 session.cancel(because: "The receiver was cancelled before this peer attached.")
+                throw SetupError("TransportReceiver is cancelled; refusing the peer.")
+            }
+
+            // **Apple's `Task.immediate`, the real one.** It runs the handler synchronously to
+            // its first suspension right here, so the exports land and the local interface
+            // activates before `attachTransport` returns -- the ordering the shut-interface
+            // gate depends on. Spawned **outside any lock**: the immediate prologue is user
+            // code (exports, activation) and must never run under a lock it -- or a
+            // synchronously-completing handler -- could re-enter.
+            let task = Task.immediate { [peerHandler] in
+                await peerHandler(session.local).token
+            }
+
+            // Apple's `readyToReceive(_:)`: the handler's task becomes the activation event's
+            // owner, so an inbound execution parked on the gate escalates the task about to
+            // open it (escalate without join, exactly what `Task.escalatePriority(to:)` does
+            // and an `await` would not). `escalatePriority` is macOS 26, which is this
+            // module's floor now, so the owner is always installed.
+            session.setActivationOwner { priority in
+                task.escalatePriority(to: priority)
+            }
+
+            // Register, re-checking the fuse: a `cancel()` that landed while the handler was
+            // starting must not leave this task unreachable from `unwindPeers`. If it did,
+            // cancel the just-spawned task and refuse the peer.
+            let registered = peerHandlingTasks.withLock { table -> Bool in
+                guard !fuse.load(ordering: .acquiring) else { return false }
+                table[session.id] = task
+                return true
+            }
+            guard registered else {
+                task.cancel()
+                session.cancel(because: "The receiver was cancelled while this peer attached.")
                 throw SetupError("TransportReceiver is cancelled; refusing the peer.")
             }
             // **Nothing is activated here, and Apple does not activate either** -- the five
@@ -142,7 +154,7 @@ extension XPCActorSystem {
         /// [sym] 0x2ad4e90f4. [disasm] stores the closure, releasing whatever was there. The
         /// parameter is not optional.
         public func setCancellationHandler(_ handler: @escaping @Sendable () -> Void) {
-            lock.withLock { cancellationHandler = handler }
+            cancellationHandler.withLock { $0 = handler }
         }
 
         /// Stop accepting, and tell whoever is listening to stop too.
@@ -156,19 +168,22 @@ extension XPCActorSystem {
         /// running and accepting peers into a receiver that refuses them. Failing quietly there
         /// is worse than failing here.
         public func cancel() {
-            let handler: (@Sendable () -> Void)? = lock.withLock {
-                guard !isCancelled else { return nil }
-                isCancelled = true
-                guard let handler = cancellationHandler else {
+            // Trip the fuse -- `caslb 0 -> 1`. Only the caller that wins the exchange
+            // proceeds; a second `cancel()` finds it already tripped and returns.
+            let (tripped, _) = fuse.compareExchange(
+                expected: false, desired: true, ordering: .sequentiallyConsistent)
+            guard tripped else { return }
+            let handler = cancellationHandler.withLock { stored -> (@Sendable () -> Void) in
+                guard let handler = stored else {
                     preconditionFailure(
                         "TransportReceiver.cancel() with no cancellation handler set. Call "
                         + "setCancellationHandler(_:) before cancelling -- otherwise there is "
                         + "nothing to stop the listener that feeds this receiver.")
                 }
-                cancellationHandler = nil
+                stored = nil
                 return handler
             }
-            handler?()
+            handler()
         }
 
         /// Cancel every peer handler and wait for all of them to finish.
@@ -181,9 +196,12 @@ extension XPCActorSystem {
         /// finishing handler needs in order to deregister is a deadlock, and the handlers do
         /// deregister.
         public func unwindPeers() async {
-            let tasks: [Task<Session.LocalInterface.ActivationToken, Never>] = lock.withLock {
-                let live = Array(peerHandlingTasks.values)
-                peerHandlingTasks.removeAll()
+            // Collect under the lock and await outside it -- `Mutex.withLock` is
+            // non-`async` and so *enforces* that at compile time: a finishing handler that
+            // needs the lock to deregister would deadlock if we awaited while holding it.
+            let tasks = peerHandlingTasks.withLock { table -> [Task<Session.LocalInterface.ActivationToken, Never>] in
+                let live = Array(table.values)
+                table.removeAll()
                 return live
             }
             for task in tasks {
@@ -193,7 +211,7 @@ extension XPCActorSystem {
         }
 
         deinit {
-            lock.withLock { peerHandlingTasks.values.forEach { $0.cancel() } }
+            peerHandlingTasks.withLock { $0.values.forEach { $0.cancel() } }
         }
     }
 }
@@ -204,7 +222,7 @@ extension XPCActorSystem {
 // MARK: - Serving over libxpc
 // ===========================================================================================
 
-@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 extension XPCActorSystem.TransportReceiver {
 
     /// Accept one inbound peer connection and start its handler.
@@ -229,7 +247,7 @@ extension XPCActorSystem.TransportReceiver {
     }
 }
 
-@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 extension XPCActorSystem {
 
     /// Everything a service process needs to stay up: the listener, the receiver, and the way

@@ -24,6 +24,7 @@ import Distributed
 
 /// Somewhere a callee can leave a mark that a test body can read. Shared by reference into
 /// an actor, so it survives the actor's isolation without the test having to enter it.
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 final class InboundLog: @unchecked Sendable {
     private let lock = NSLock()
     private var entries: [String] = []
@@ -32,6 +33,7 @@ final class InboundLog: @unchecked Sendable {
     func has(_ text: String) -> Bool { all.contains(text) }
 }
 
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 enum CalleeError: Error, CustomStringConvertible {
     case refused(String)
     var description: String {
@@ -39,7 +41,7 @@ enum CalleeError: Error, CustomStringConvertible {
     }
 }
 
-@available(macOS 14, *)
+@available(macOS 26, *)
 distributed actor Callback {
     typealias ActorSystem = XPCActorSystem
     let name: String
@@ -50,7 +52,7 @@ distributed actor Callback {
     distributed func greet() -> String { "hello from \(name)" }
 }
 
-@available(macOS 14, *)
+@available(macOS 26, *)
 distributed actor Calculator {
     typealias ActorSystem = XPCActorSystem
     let log: InboundLog
@@ -90,7 +92,7 @@ distributed actor Calculator {
 /// `InvocationEncoderTests.swift`. Calls through `$Greeter` are the only ones that carry a
 /// `protocolStub`, and therefore the only ones whose accessor the Swift runtime resolves
 /// through `decodeGenericSubstitutions`.
-@available(macOS 15, *)
+@available(macOS 26, *)
 distributed actor Politeness: Greeter {
     typealias ActorSystem = XPCActorSystem
     init(actorSystem: ActorSystem) { self.actorSystem = actorSystem }
@@ -105,6 +107,7 @@ distributed actor Politeness: Greeter {
 ///
 /// Not `RemoteInvocationRequest`: a hostile request is precisely one our own encoder would
 /// never produce, and going through it would only prove we agree with ourselves.
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 private struct HandBuiltRequest: Encodable {
 
     enum Argument: Encodable {
@@ -163,6 +166,7 @@ private struct HandBuiltRequest: Encodable {
 
 /// `[1, {"<case>": {"_0": "<message>"}}]`, read as a peer would read it rather than
 /// through `RemoteInvocationResponse`.
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 private struct PeerFailureResponse: Decodable {
     let tag: UInt8
     let caseName: String
@@ -191,6 +195,7 @@ private struct PeerFailureResponse: Decodable {
 }
 
 /// `[0, <Int>]`, read the same way.
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 private struct PeerIntResponse: Decodable {
     let tag: UInt8
     let value: Int
@@ -203,6 +208,7 @@ private struct PeerIntResponse: Decodable {
 
 /// Just enough of a request to read its `remoteCallIdentifier` and `protocolStub` back off
 /// the wire. There is no API that returns either, so they are harvested rather than spelled.
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 private struct PeerRequestIdentifier: Decodable {
     let remoteCallIdentifier: String
     let protocolStub: String?
@@ -222,7 +228,7 @@ private struct PeerRequestIdentifier: Decodable {
 
 /// Two systems, two sessions, one pipe. Both ends are real: neither side is a stand-in for
 /// the other, and a call travels through `Packet`, the overlay coder and back.
-@available(macOS 14, *)
+@available(macOS 26, *)
 private final class Link: @unchecked Sendable {
     let clientSystem = XPCActorSystem("client")
     let serverSystem = XPCActorSystem("server")
@@ -278,7 +284,7 @@ private final class Link: @unchecked Sendable {
 ///
 /// There is no API that returns it, and spelling one by hand would pin our guess rather
 /// than the compiler's answer -- so it is read off the wire from a real call.
-@available(macOS 14, *)
+@available(macOS 26, *)
 private final class Harvester: @unchecked Sendable {
     let system = XPCActorSystem("harvest")
     let transport: Transport
@@ -304,7 +310,7 @@ private final class Harvester: @unchecked Sendable {
                                using: system)
     }
 
-    @available(macOS 15, *)
+    @available(macOS 26, *)
     func stubProxy() throws -> $Greeter<XPCActorSystem> {
         try $Greeter<XPCActorSystem>.resolve(
             id: session.remoteID(for: .exportedRawValue("harvest")), using: system)
@@ -312,6 +318,7 @@ private final class Harvester: @unchecked Sendable {
 }
 
 /// Somewhere a `Task` can leave its outcome that a test body can read without awaiting it.
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 private final class Box<Value: Sendable>: @unchecked Sendable {
     private let lock = NSLock()
     private var storage: Result<Value, any Error>?
@@ -323,7 +330,7 @@ private final class Box<Value: Sendable>: @unchecked Sendable {
 // MARK: - The tests
 // ===========================================================================================
 
-@available(macOS 14, *)
+@available(macOS 26, *)
 final class InboundInvocationTests: XCTestCase {
 
     /// Run `body` and poll its box rather than awaiting it. See the file comment.
@@ -356,7 +363,7 @@ final class InboundInvocationTests: XCTestCase {
 
     /// The `remoteCallIdentifier` and `protocolStub` a call through the `Greeter`
     /// distributed protocol puts on the wire, harvested the same way.
-    @available(macOS 15, *)
+    @available(macOS 26, *)
     private func protocolCallShape() async throws -> (identifier: String, stub: String) {
         let harvester = try Harvester()
         let stub = try harvester.stubProxy()
@@ -989,6 +996,7 @@ final class InboundInvocationTests: XCTestCase {
 }
 
 /// The raw `[tag, payload]` pair of a response, kept undecoded past the tag.
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 private struct RawResponsePair: Decodable {
     var container: any UnkeyedDecodingContainer
     init(from decoder: any Decoder) throws {

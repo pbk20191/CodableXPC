@@ -5,7 +5,7 @@ import XPC
 ///
 /// `xpc_copy_description` is not usable for this: its output includes pointer
 /// values and its dictionary ordering is unspecified.
-@available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 func normalizedDescription(_ object: xpc_object_t, topLevel: Bool = true) -> String {
     switch xpc_get_type(object) {
     case XPC_TYPE_DICTIONARY:

@@ -20,7 +20,7 @@ import CodableXPC
 
 /// Enough of a session to let an `ActorID` code itself. `ActorIDTests` has its own,
 /// `private` to that file.
-@available(macOS 14, *)
+@available(macOS 26, *)
 final class InvocationBodiesTests: XCTestCase {
 
     private func encoded<T: Encodable>(

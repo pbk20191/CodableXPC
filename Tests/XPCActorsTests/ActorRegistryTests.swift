@@ -1,9 +1,10 @@
 import XCTest
 @testable import XPCActors
 
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 private final class Dummy {}
 
-@available(macOS 14, *)
+@available(macOS 26, *)
 final class ActorRegistryTests: XCTestCase {
 
     private func makeLocal() -> RawActorID.Local {

@@ -26,7 +26,7 @@ import XPC
 /// only layer that knows who the peer is. That is Apple's arrangement too:
 /// `RawTransportProtocol.auditToken` → `Session.RemoteInterface.auditToken` →
 /// `audit_token_t.satisfies(requirement:)`.
-@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 public struct PeerRequirement: Sendable, CustomStringConvertible {
 
     /// What this requirement is, in words. Stable, and the only thing a non-token
@@ -96,7 +96,7 @@ public struct PeerRequirement: Sendable, CustomStringConvertible {
 /// the point: 'unknown' is distinct from 'no'."* A transport with no attestation at all
 /// returns `nil` from this, and every gate in ``Session`` folds `nil` into **refuse** — but
 /// it folds it there, deliberately, rather than losing the distinction here.
-@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 public protocol PeerAttestation: Sendable {
 
     /// `true` / `false` / `nil` — satisfied, not satisfied, cannot tell.
@@ -271,7 +271,7 @@ extension XPCDictionary {
 ///   witness table `swift_conformsToProtocol2` returns, with no `await` — so Apple's is
 ///   nonisolated whether or not their source says the word. An isolated one could not be
 ///   read from the gate at all.
-@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 public protocol RestrictedAccessDistributedActor: DistributedActor
 where ActorSystem == XPCActorSystem {
 

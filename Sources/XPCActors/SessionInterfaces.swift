@@ -20,7 +20,7 @@ import Distributed
 /// [refl] Both are `struct { let session: Session }` -- one field, so a retain.
 /// [sym] `LocalInterface.init(session:)` 0x2ad507a70 (`__shared`, i.e. `borrowing`);
 ///       `RemoteInterface.init(session:)` 0x2ad507a68.
-@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 extension Session {
 
     /// [sym] `Session.local.getter` -- "a one-word struct, so this is just a retain".
@@ -78,7 +78,7 @@ extension Session {
         /// `_DistributedActorStub` is macOS 15+, narrower than this file's macOS-14 floor, so
         /// the stub-keyed overloads carry their own availability rather than raising everyone
         /// else's -- the same split `XPCRawTransport.connecting(to:)` makes for `XPCEndpoint`.
-        @available(macOS 15, iOS 18, tvOS 18, watchOS 11, *)
+        @available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
         public func export<A: DistributedActor, B: Distributed._DistributedActorStub>(
             _ actor: A, asDefaultActorFor stub: B.Type
         ) where A.ActorSystem == XPCActorSystem, B.ActorSystem == XPCActorSystem {
@@ -237,7 +237,7 @@ extension Session {
         /// `_DistributedActorStub` is macOS 15+, narrower than this file's macOS-14 floor, so
         /// the stub-keyed overloads carry their own availability rather than raising everyone
         /// else's -- the same split `XPCRawTransport.connecting(to:)` makes for `XPCEndpoint`.
-        @available(macOS 15, iOS 18, tvOS 18, watchOS 11, *)
+        @available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
         public func `import`<A: Distributed._DistributedActorStub>(defaultActorFor stub: A.Type) -> A
         where A.ActorSystem == XPCActorSystem {
             guard let type = SwiftType(stub) else {

@@ -13,7 +13,7 @@ import XPC
 /// which is the clearest single measurement of what dropping to `xpc_connection_t` bought:
 /// `xpc_connection_create(NULL, q)` and `xpc_endpoint_create` are `__MAC_10_7`, and neither is
 /// restricted to macOS.
-@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 final class XPCRawTransportTests: XCTestCase {
 
     struct Ping: Codable, Equatable { let value: Int }

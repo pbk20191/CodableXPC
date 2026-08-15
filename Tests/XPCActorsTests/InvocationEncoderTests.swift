@@ -22,6 +22,7 @@ import CodableXPC
 /// `internal`, not `private`. A `private` type's mangled name carries a process-address
 /// discriminator and does not resolve -- which is precisely what a distributed signature
 /// may not contain, and what `testAnUnresolvableReturnTypeThrows` pins.
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 struct Payload: Codable, Equatable { let n: Int }
 
 /// A distributed protocol, which is the only way a `_DistributedActorStub` conformer
@@ -34,7 +35,7 @@ struct Payload: Codable, Equatable { let n: Int }
 /// The actor system parameter only has to name *some* system for the stub type to be
 /// concrete; `LocalTestingDistributedActorSystem` is the stdlib's own and nothing in
 /// these tests ever instantiates it.
-@available(macOS 15, iOS 18, tvOS 18, watchOS 11, *)
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 @Resolvable
 protocol Greeter: DistributedActor where ActorSystem: DistributedActorSystem<any Codable> {
     distributed func greet(name: String) -> String
@@ -42,13 +43,13 @@ protocol Greeter: DistributedActor where ActorSystem: DistributedActorSystem<any
 
 /// A second, distinct stub type -- `protocolStub` holds at most one, and the second one
 /// has to be rejected rather than overwrite the first.
-@available(macOS 15, iOS 18, tvOS 18, watchOS 11, *)
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 @Resolvable
 protocol Counter: DistributedActor where ActorSystem: DistributedActorSystem<any Codable> {
     distributed func count() -> Int
 }
 
-@available(macOS 14, *)
+@available(macOS 26, *)
 final class InvocationEncoderTests: XCTestCase {
 
     private func encoded<T: Encodable>(_ value: T) throws -> String {

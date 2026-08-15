@@ -21,6 +21,7 @@ import Distributed
 
 /// `[0, <value>]` -- a success response, written without consulting
 /// ``RemoteInvocationResponse``.
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 private struct PeerSuccess<Value: Encodable>: Encodable {
     let value: Value
     func encode(to encoder: any Encoder) throws {
@@ -32,6 +33,7 @@ private struct PeerSuccess<Value: Encodable>: Encodable {
 
 /// `[0, {}]` -- the void reply. The empty dictionary is what a field-less `Ack` encodes
 /// to, spelled here as an actually-empty dictionary so nothing about `Ack` is assumed.
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 private struct PeerVoidSuccess: Encodable {
     func encode(to encoder: any Encoder) throws {
         var container = encoder.unkeyedContainer()
@@ -41,6 +43,7 @@ private struct PeerVoidSuccess: Encodable {
 }
 
 /// `[1, {"<case>": {"_0": "<message>"}}]` -- a failure response.
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 private struct PeerFailure: Encodable {
     enum Kind: String { case executionFailed, resultPropagationFailed }
     let kind: Kind
@@ -81,6 +84,7 @@ private struct PeerFailure: Encodable {
 /// types we encoded them from: `id` is a bare `UInt64`, `basePriority` a bare `UInt8`,
 /// every type reference a bare `String`. The arguments container is left unconsumed so
 /// each test decodes what it expects to be there.
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 private struct PeerRequest: Decodable {
     let id: UInt64
     let basePriority: UInt8?
@@ -117,6 +121,7 @@ private struct PeerRequest: Decodable {
 
 /// `RemoteNotification.invocationCancelled(id:)`, read as a peer would: one top-level key
 /// naming the case, and the field spelled **`id`** -- never `requestSeq`.
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 private struct PeerCancellation: Decodable {
     /// A bare `UInt64`, because `ID64` is single-value on the wire.
     let cancelledID: UInt64
@@ -132,6 +137,7 @@ private struct PeerCancellation: Decodable {
 /// `targetedSharedActor`, read as the raw unkeyed pair -- `[WireCode, payload]` -- rather
 /// than through our own `SharedActorKey: Decodable`. `WireCode` is `RawRepresentable` over
 /// `UInt8` with `exported` 0, `exportedRawValue` 1, `dynamic` 2.
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 private struct PeerRequestKey: Decodable {
     let wireCode: UInt8
     let name: String
@@ -148,7 +154,7 @@ private struct PeerRequestKey: Decodable {
 // MARK: - The actor under test
 // ===========================================================================================
 
-@available(macOS 14, *)
+@available(macOS 26, *)
 distributed actor Echo {
     typealias ActorSystem = XPCActorSystem
     init(actorSystem: ActorSystem) { self.actorSystem = actorSystem }
@@ -164,7 +170,7 @@ distributed actor Echo {
 ///
 /// The far end has no `Transport` of its own: packets are captured raw and answers are
 /// sent raw, so nothing in a test's expectations is produced by the code under test.
-@available(macOS 14, *)
+@available(macOS 26, *)
 private final class Peer: @unchecked Sendable {
 
     let system: XPCActorSystem
@@ -214,6 +220,7 @@ private final class Peer: @unchecked Sendable {
 }
 
 /// Somewhere for a `Task` to leave its outcome that a test body can read.
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 private final class ResultBox<Value: Sendable>: @unchecked Sendable {
     private let lock = NSLock()
     private var storage: Result<Value, any Error>?
@@ -221,6 +228,7 @@ private final class ResultBox<Value: Sendable>: @unchecked Sendable {
     func set(_ value: Result<Value, any Error>) { lock.withLock { storage = value } }
 }
 
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 private struct CallerError: Error {}
 
 /// A `SessionCoding` that can name actors but cannot send anything, and that claims a
@@ -231,7 +239,7 @@ private struct CallerError: Error {}
 /// this package can therefore return an id it merely guessed -- so `resolve` will hand
 /// back a proxy through this. `remoteCall` is then the layer that has to notice there is
 /// nowhere to send.
-@available(macOS 14, *)
+@available(macOS 26, *)
 private final class ImpostorSession: SessionCoding, @unchecked Sendable {
     let systemID: ID64
     init(claiming system: XPCActorSystem) { systemID = system.id }
@@ -245,13 +253,14 @@ private final class ImpostorSession: SessionCoding, @unchecked Sendable {
 /// type mangles to a name embedding a process address, which `SwiftType.init?(_:)`
 /// rejects precisely because no peer could resolve it -- so `recordReturnType` would
 /// throw and the call would never be sent.
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 struct Point: Codable, Equatable, Sendable { let x: Int; let y: String }
 
 // ===========================================================================================
 // MARK: - The tests
 // ===========================================================================================
 
-@available(macOS 14, *)
+@available(macOS 26, *)
 final class OutboundInvocationTests: XCTestCase {
 
     /// Drive one `remoteCall` on a background task, so the test body can inspect and

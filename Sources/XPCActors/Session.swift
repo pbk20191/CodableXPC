@@ -18,7 +18,7 @@ import Foundation
 /// Declared here rather than beside `SessionCoding` in `ActorID.swift` on purpose:
 /// `sendInvocation` mentions `RemoteCallTarget` and `InvocationEncoder`, and
 /// `ActorID.swift` is deliberately buildable with no `Distributed` import at all.
-@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 public protocol OutboundSession: SessionCoding {
 
     /// Send one invocation to `id` and wait for its response.
@@ -55,7 +55,7 @@ public protocol OutboundSession: SessionCoding {
 /// an `ActorRegistry<Void>` -- and a generic parameter that can only ever be `Void` buys
 /// nothing but a type argument at every use site. (`ActorRegistry` keeps its own
 /// parameter; narrowing that is a separate change to a separate type.)
-@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 public final class Session: SessionCoding, OutboundSession, InboundSession, @unchecked Sendable {
 
     /// From the process-global counter, like Apple's `Session.id` -- the same generator
@@ -1161,7 +1161,7 @@ public final class Session: SessionCoding, OutboundSession, InboundSession, @unc
 // MARK: - The system vends sessions
 // ===========================================================================================
 
-@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 extension XPCActorSystem {
 
     /// Open a session over `transport`.

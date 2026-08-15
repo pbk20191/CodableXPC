@@ -9,7 +9,7 @@ import XPCOverlayCoder
 /// (`0x2ad4e1488`) calls `XPCDictionary.encode(value, forKey: "payload", withUserInfo:)`,
 /// which routes through `XPCReceivedMessage.encodeMessage` -- the XPC *overlay*'s
 /// Codable coder, whose output is an envelope carrying one `xpc_data` byte stream.
-@available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 final class PayloadTests: XCTestCase {
 
     struct Body: Codable, Equatable {

@@ -1,6 +1,6 @@
 @testable import XPCActors
 
-@available(macOS 14, *)
+@available(macOS 26, *)
 extension XPCActorSystem {
 
     /// A real ``Session`` over a transport with nobody on the other end.
@@ -32,7 +32,7 @@ extension XPCActorSystem {
 /// `@unchecked Sendable` because `SessionCoding` requires `Sendable` and this has mutable
 /// state. Tests drive it from one thread; a stub that locked would be pretending to a
 /// property nothing here depends on.
-@available(macOS 14, *)
+@available(macOS 26, *)
 final class StubSession: SessionCoding, @unchecked Sendable {
 
     /// Every actor handed to ``shareDynamically(_:)``, in order.

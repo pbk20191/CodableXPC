@@ -7,7 +7,7 @@ import XPC
 /// but the payload is a real overlay-encoded body, so serialization bugs still
 /// surface on this path. That is what makes it a legitimate test substrate rather
 /// than a mock.
-@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 public final class InProcessRawTransport: RawTransportProtocol, @unchecked Sendable {
 
     private let lock = NSLock()

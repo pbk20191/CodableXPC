@@ -14,7 +14,7 @@ import Distributed
 /// that lives in this process, which is a different and much worse thing than a lookup
 /// failure. `nil` means exactly one thing: "this id names a peer's actor reached through
 /// a session of mine, make me a proxy."
-@available(macOS 14, *)
+@available(macOS 26, *)
 final class XPCActorSystemTests: XCTestCase {
 
     /// A distributed actor with nothing in it. Everything under test is the system's
@@ -355,7 +355,7 @@ final class XPCActorSystemTests: XCTestCase {
 }
 
 /// A second actor type, so the failing cast in `resolve` has something to fail against.
-@available(macOS 14, *)
+@available(macOS 26, *)
 distributed actor OtherProbe {
     typealias ActorSystem = XPCActorSystem
     init(actorSystem: ActorSystem) { self.actorSystem = actorSystem }
