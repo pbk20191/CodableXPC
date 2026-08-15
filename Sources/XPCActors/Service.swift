@@ -87,15 +87,14 @@ extension XPCActorSystem {
         ///
         /// [sym] `Service.connect(from:with:)` @ 0x2ad4d7020.
         ///
-        /// **Apple's same-process optimization is deliberately absent.** Their body first
-        /// consults `ServiceRegistry.shared.lookUpAndConnect(to:from:options:)` and only falls
-        /// through to XPC when that returns nil -- the two branches are named by their own log
-        /// lines, `'Using same-process optimization for service %s'` and `'preserveSelfIPC set,
-        /// forcing XPC for service %s'`. That path needs `Session.Kind.local`, a peer session,
-        /// and a direct-invocation path that never encodes anything, none of which exist here
-        /// (see the note on `Session.transport`). Connecting always goes over XPC, which is
-        /// what `preserveSelfIPC = true` makes Apple do anyway -- so this is their forced
-        /// branch, not a third behaviour.
+        /// **Apple's same-process optimization, and this now has it.** The body first consults
+        /// `ServiceRegistry.shared.lookUpAndConnect(to:from:options:)`: a service served in
+        /// this same process is reached over a `.local` session's direct-invocation path,
+        /// which encodes nothing, and only a miss (or `preserveSelfIPC`) falls through to XPC
+        /// -- the two branches Apple names in its own log lines, `'Using same-process
+        /// optimization for service %s'` and `'preserveSelfIPC set, forcing XPC for service
+        /// %s'`. The `.local` session, its `LocalSessionState` peer, and the direct-invocation
+        /// path are all here now; see ``Session/Kind`` and ``ServiceRegistry``.
         func connect(
             from actorSystem: XPCActorSystem, with arguments: ServiceConnectArguments
         ) throws(SetupError) -> Session {

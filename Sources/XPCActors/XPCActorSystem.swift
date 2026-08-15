@@ -67,8 +67,9 @@ public final class XPCActorSystem: Sendable {
     /// Apple has four initialisers rather than one with defaults — the image contains no
     /// `default argument N of XPCSystem.init…` symbol, and the absence is meaningful
     /// because `Session.init`'s *does* exist. One with a default is enough here; the four
-    /// exist over there because `preserveSelfIPC` is the other axis and there is no
-    /// in-process path in this module to preserve.
+    /// exist over there because `preserveSelfIPC` is the other axis -- and that axis is now
+    /// real here too (``Service/InitializationOptions/preserveSelfIPC`` forces XPC past the
+    /// same-process path), it just rides an option rather than a fourth initialiser.
     public init(_ debugName: String, peerRequirement: PeerRequirement? = nil) {
         self.debugName = debugName
         self.id = ID64.next()
@@ -350,10 +351,12 @@ typealias InboundThunk = (
 /// back out of a `RemoteInvocationRequest` before calling the target.
 ///
 /// Apple's is `XPCSystem.InvocationDecoder`, a `{ mode: encoded | direct }` wrapper around
-/// `EncodedInvocationDecoder` and `DirectInvocationDecoder`. There is no in-process path
-/// here, so there is no wrapper and no mode: this *is* the encoded decoder.
+/// `EncodedInvocationDecoder` and `DirectInvocationDecoder`, and this is that wrapper now that
+/// the same-process path is here (see ``Mode``): the encoded mode reads an
+/// ``InboundInvocation`` off the wire, the direct mode carries the caller's own recorded
+/// values and decodes nothing.
 ///
-/// It holds an ``InboundInvocation``, which has already done the hard part -- the header
+/// In the **encoded** mode it holds an ``InboundInvocation``, which has already done the hard part -- the header
 /// fields are decoded eagerly and the arguments container is retained unconsumed, because
 /// an argument's type is not known until `executeDistributedTarget` asks for it by static
 /// type. **That container is the decoder's entire state**, which is why no index is
