@@ -353,12 +353,14 @@ public final class Session: SessionCoding, OutboundSession, InboundSession, @unc
     /// comes from a monotonic process-global counter -- so a key can never come to mean
     /// a different actor than the one it was minted for.
     ///
-    /// **Apple's `isBidirectional` guard is deliberately absent**, not overlooked:
-    /// `Session.(addSharedActor)` asserts it (`"API violation: Session must be
-    /// bidirectional to share actor references"`), but the flag is written at init from
-    /// `InitializationOptions.bidirectional`, and neither the options nor the
-    /// initialisers that set them exist yet. A flag with one settable value is a
-    /// guard that tests nothing; it goes in with the initialisers.
+    /// **Apple's `isBidirectional` guard is still absent, now for a narrower reason.**
+    /// `Session.(addSharedActor)` asserts it (`"API violation: Session must be bidirectional
+    /// to share actor references"`). ``Service/InitializationOptions/bidirectional`` exists
+    /// now, but it is spent on the *activation-gate* default (a bidirectional side starts
+    /// shut) and no distinct `isBidirectional` flag is stored on the session -- so there is
+    /// still nothing here to assert on. Giving it its own axis, rather than deriving it from
+    /// `localInterfaceActivated`, is what the guard waits on; several tests export on a
+    /// session created open, which that derivation would wrongly trap.
     public func shareDynamically(_ local: RawActorID.Local) -> SharedActorKey? {
         // Outside our lock, deliberately: `lookup` takes the registry's own lock, and
         // taking two locks in one critical section is how lock orders get invented by
