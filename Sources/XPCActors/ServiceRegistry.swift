@@ -80,9 +80,16 @@ final class ServiceRegistry: Sendable {
         options: XPCActorSystem.InitializationOptions
     ) -> Session? {
         if options.contains(.preserveSelfIPC) { return nil }
-        guard registration(for: service) != nil else { return nil }
-        // In-process hit -- the `.local` session is built here in phase (c). Until then the
-        // caller falls through to the XPC path, which is what `preserveSelfIPC` forces anyway.
-        return nil
+        guard let registration = registration(for: service) else { return nil }
+        // In-process hit: build the pair. The server end is a transport-less `.local`
+        // session that starts shut; its receiver's handler exports the service's actors and
+        // opens its gate. The client end is a `.local` session holding the server as its
+        // peer, so its calls run directly against the server's table, never encoding a byte.
+        let serverSession = registration.actorSystem.makeLocalSession(
+            peer: nil, localInterfaceActivated: false)
+        registration.receiver.acceptLocal(serverSession)
+        return actorSystem.makeLocalSession(
+            peer: serverSession,
+            localInterfaceActivated: !options.contains(.bidirectional))
     }
 }
