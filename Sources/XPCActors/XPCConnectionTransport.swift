@@ -76,7 +76,6 @@ public final class XPCConnectionTransport: RawTransportProtocol, @unchecked Send
     /// inventing one.
     public var peerAttestation: (any PeerAttestation)? {
         #if os(macOS) || targetEnvironment(macCatalyst)
-        guard #available(macOS 26, macCatalyst 26, *) else { return nil }
         guard let message = lock.withLock({ lastReceivedMessage }) else { return nil }
         // The token comes from a *message* rather than from the connection, because the
         // connection API has no public audit-token accessor -- `XPCSession.auditToken` had one
