@@ -76,6 +76,23 @@ final class SameProcessOptimizationTests: XCTestCase {
         XCTAssertTrue(reaped, "the completed server handler was not reaped from the table")
     }
 
+    /// The `isBidirectional` axis is wired from the connect option, and it is distinct from
+    /// the activation-gate default. A plain client is not bidirectional (exporting on it would
+    /// trap); a `.bidirectional` one is.
+    func testTheBidirectionalAxisFollowsTheConnectOption() throws {
+        let serverSystem = XPCActorSystem("server")
+        let service = XPCActorSystem.Service.machService("com.example.sameprocess.bidi")
+        defer { ServiceRegistry.shared.unregister(service) }
+        serve(service, on: serverSystem)
+
+        let plain = try service.connect(from: XPCActorSystem("c1"), with: .init(options: []))
+        XCTAssertFalse(plain.isBidirectional, "a plain client must not be bidirectional")
+
+        let bidi = try service.connect(
+            from: XPCActorSystem("c2"), with: .init(options: [.bidirectional]))
+        XCTAssertTrue(bidi.isBidirectional, "a .bidirectional client must be bidirectional")
+    }
+
     func testADirectThrowComesBack() async throws {
         let serverSystem = XPCActorSystem("server")
         let service = XPCActorSystem.Service.machService("com.example.sameprocess.throw")

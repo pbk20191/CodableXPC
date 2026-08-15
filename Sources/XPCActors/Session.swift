@@ -281,10 +281,19 @@ public final class Session: SessionCoding, OutboundSession, InboundSession, @unc
     /// at the bottom of this file. (`private` would not reach it -- Swift extends
     /// `private` to extensions of *the same type* in the same file, and the vending
     /// method is an extension of the system.)
+    /// Apple's `Session.isBidirectional`, written at init from
+    /// ``Service/InitializationOptions/bidirectional``. A session that exports actors must be
+    /// bidirectional; a plain client is not, and exporting on it is the API violation
+    /// ``shareDynamically(_:)`` / ``addSharedActor(_:at:)`` now trap on. Server sessions --
+    /// the ones a peer handler exports through -- are bidirectional by default; only a client
+    /// dialled without the option is not.
+    let isBidirectional: Bool
+
     fileprivate init(system: XPCActorSystem, transport: Transport,
-                     localInterfaceActivated: Bool) {
+                     localInterfaceActivated: Bool, isBidirectional: Bool) {
         self.system = system
         self.kind = .xpc(transport)
+        self.isBidirectional = isBidirectional
         self.activationEvent = ActivationEvent(posted: localInterfaceActivated)
         // Weakly, as Apple's initialiser does it (`swift_unknownObjectWeakAssign` into
         // `transport+0x10`). We hold the transport; it must not hold us back.
@@ -310,9 +319,10 @@ public final class Session: SessionCoding, OutboundSession, InboundSession, @unc
     /// direct calls against such a peer (the client end, `peer` set). See ``send`` and the
     /// pairing in ``ServiceRegistry``.
     fileprivate init(system: XPCActorSystem, local: LocalSessionState,
-                     localInterfaceActivated: Bool) {
+                     localInterfaceActivated: Bool, isBidirectional: Bool) {
         self.system = system
         self.kind = .local(local)
+        self.isBidirectional = isBidirectional
         self.activationEvent = ActivationEvent(posted: localInterfaceActivated)
     }
 
@@ -353,15 +363,16 @@ public final class Session: SessionCoding, OutboundSession, InboundSession, @unc
     /// comes from a monotonic process-global counter -- so a key can never come to mean
     /// a different actor than the one it was minted for.
     ///
-    /// **Apple's `isBidirectional` guard is still absent, now for a narrower reason.**
-    /// `Session.(addSharedActor)` asserts it (`"API violation: Session must be bidirectional
-    /// to share actor references"`). ``Service/InitializationOptions/bidirectional`` exists
-    /// now, but it is spent on the *activation-gate* default (a bidirectional side starts
-    /// shut) and no distinct `isBidirectional` flag is stored on the session -- so there is
-    /// still nothing here to assert on. Giving it its own axis, rather than deriving it from
-    /// `localInterfaceActivated`, is what the guard waits on; several tests export on a
-    /// session created open, which that derivation would wrongly trap.
+    /// **Apple's `isBidirectional` guard, now in.** `Session.(addSharedActor)` asserts it
+    /// (`"API violation: Session must be bidirectional to share actor references"`), and so
+    /// does this. ``isBidirectional`` is its own axis, distinct from `localInterfaceActivated`
+    /// -- a server session, and a client dialled with
+    /// ``Service/InitializationOptions/bidirectional``, are bidirectional and may export; a
+    /// plain client is not, so exporting on it traps rather than pinning an actor a peer can
+    /// never reach.
     public func shareDynamically(_ local: RawActorID.Local) -> SharedActorKey? {
+        precondition(isBidirectional,
+                     "API violation: Session must be bidirectional to share actor references")
         // Outside our lock, deliberately: `lookup` takes the registry's own lock, and
         // taking two locks in one critical section is how lock orders get invented by
         // accident. Nothing between here and the insert can invalidate the answer that
@@ -410,6 +421,8 @@ public final class Session: SessionCoding, OutboundSession, InboundSession, @unc
     }
 
     func addSharedActor(_ local: RawActorID.Local, at key: SharedActorKey) -> ShareOutcome {
+        precondition(isBidirectional,
+                     "API violation: Session must be bidirectional to share actor references")
         guard let entry = registry.lookup(local) else { return .notRegistered }
         return sharedActors.withLock { state in
             guard !state.isCancelled else { return .sessionCancelled }
@@ -1372,16 +1385,20 @@ extension XPCActorSystem {
     ///   `LocalInterface` here to drive it, so defaulting closed would make every session a
     ///   session that never answers. See ``Session/activateLocalInterface()``.
     func makeSession(over transport: Transport,
-                     localInterfaceActivated: Bool = true) -> Session {
+                     localInterfaceActivated: Bool = true,
+                     isBidirectional: Bool = true) -> Session {
         Session(system: self, transport: transport,
-                localInterfaceActivated: localInterfaceActivated)
+                localInterfaceActivated: localInterfaceActivated,
+                isBidirectional: isBidirectional)
     }
 
     /// Vend a `.local` session -- no transport. The server end passes `peer: nil` and
     /// exports actors a same-process client resolves directly; the client end passes the
     /// server session as `peer` and originates direct calls against it. See ``ServiceRegistry``.
-    func makeLocalSession(peer: Session?, localInterfaceActivated: Bool) -> Session {
+    func makeLocalSession(peer: Session?, localInterfaceActivated: Bool,
+                          isBidirectional: Bool = true) -> Session {
         Session(system: self, local: LocalSessionState(peer: peer),
-                localInterfaceActivated: localInterfaceActivated)
+                localInterfaceActivated: localInterfaceActivated,
+                isBidirectional: isBidirectional)
     }
 }
