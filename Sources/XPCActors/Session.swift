@@ -859,6 +859,20 @@ public final class Session: SessionCoding, OutboundSession, InboundSession, @unc
                 expected: false, desired: true, ordering: .sequentiallyConsistent).exchanged
             else { return }
             cancellationCompleted()
+            // Tear down the paired end too, the way a transport death fails both ends of a
+            // wire pair -- so the server end's handler task stops parking rather than living
+            // until the receiver unwinds. `peer` is set on the client end and `nil` on the
+            // server end, so this propagates once, from client to server.
+            local.peer?.cancel(because: "the paired \(reason)")
+        }
+    }
+
+    /// A dropped `.local` client session tears down the server end it paired with, so that
+    /// end's handler task is reaped rather than parking forever. An `xpc` session's lifecycle
+    /// is its transport's, so there is nothing to do for it here.
+    deinit {
+        if case .local(let local) = kind, let peer = local.peer {
+            peer.cancel(because: "the local session's client end was released")
         }
     }
 
