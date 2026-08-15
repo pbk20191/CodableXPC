@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 import XPC
 
 /// Which end of the pipe this is.
@@ -65,13 +66,19 @@ public final class Transport: @unchecked Sendable {
     private let rawTransport: RawTransportProtocol
     private let requests = RequestTable()
 
-    private let lock = NSLock()
-    private var _nextSeq: UInt64 = 1
-    private var cancelled = false
+    /// Disjoint from the handlers below -- nothing reads a seq and a handler in one critical
+    /// section -- so the monotonic id source is a plain `Atomic<UInt64>`.
+    private let nextSeq = Atomic<UInt64>(1)
+    /// The one-shot teardown fuse; `beginCancelling` is its `compareExchange`.
+    private let cancelledFuse = Atomic<Bool>(false)
 
-    private var _inboundRequestHandler: RequestHandler?
-    private var _inboundNotificationHandler: NotificationHandler?
-    private weak var _inboundSession: (any InboundSession)?
+    /// The inbound handlers and the weakly-held session, under one `Synchronization.Mutex`.
+    private struct Handlers {
+        weak var inboundSession: (any InboundSession)?
+        var inboundRequestHandler: RequestHandler?
+        var inboundNotificationHandler: NotificationHandler?
+    }
+    private let handlers = Mutex<Handlers>(Handlers())
 
     /// The session speaking over this transport, held **weakly**.
     ///
@@ -83,7 +90,7 @@ public final class Transport: @unchecked Sendable {
     ///
     /// Read-only from outside, because Apple's field is `private` and has exactly one
     /// writer. See ``install(inboundSession:)``.
-    public var inboundSession: (any InboundSession)? { lock.withLock { _inboundSession } }
+    public var inboundSession: (any InboundSession)? { handlers.withLock { $0.inboundSession } }
 
     /// Seat the session that speaks over this transport. The one writer, called from
     /// `Session`'s initializer.
@@ -99,26 +106,26 @@ public final class Transport: @unchecked Sendable {
     /// re-using a transport whose session has gone is allowed. So is re-installing the
     /// same session, which makes the call idempotent.
     func install(inboundSession session: any InboundSession) {
-        lock.withLock {
-            if let existing = _inboundSession, existing !== session {
+        handlers.withLock { handlers in
+            if let existing = handlers.inboundSession, existing !== session {
                 preconditionFailure("""
                     this transport already has a live session (\(existing)); a second one \
                     would silently orphan the first, which would then never learn that the \
                     transport had died
                     """)
             }
-            _inboundSession = session
+            handlers.inboundSession = session
         }
     }
 
     public var inboundRequestHandler: RequestHandler? {
-        get { lock.withLock { _inboundRequestHandler } }
-        set { lock.withLock { _inboundRequestHandler = newValue } }
+        get { handlers.withLock { $0.inboundRequestHandler } }
+        set { handlers.withLock { $0.inboundRequestHandler = newValue } }
     }
 
     public var inboundNotificationHandler: NotificationHandler? {
-        get { lock.withLock { _inboundNotificationHandler } }
-        set { lock.withLock { _inboundNotificationHandler = newValue } }
+        get { handlers.withLock { $0.inboundNotificationHandler } }
+        set { handlers.withLock { $0.inboundNotificationHandler = newValue } }
     }
 
     /// What the pipe can prove about the process on the other end, or `nil`.
@@ -130,7 +137,7 @@ public final class Transport: @unchecked Sendable {
 
     /// Internal for tests: teardown has run, from either our own `cancel` or the
     /// raw transport's death channel.
-    var isCancelled: Bool { lock.withLock { cancelled } }
+    var isCancelled: Bool { cancelledFuse.load(ordering: .acquiring) }
 
     /// Internal for tests: requests registered and not yet resolved.
     var pendingRequestCount: Int { get async { await requests.pendingCount } }
@@ -161,11 +168,8 @@ public final class Transport: @unchecked Sendable {
     /// Claim the one-shot teardown. Returns `false` if teardown already ran, so our
     /// own `cancel` and a remote death cannot double-fire.
     private func beginCancelling() -> Bool {
-        lock.withLock {
-            guard !cancelled else { return false }
-            cancelled = true
-            return true
-        }
+        cancelledFuse.compareExchange(
+            expected: false, desired: true, ordering: .sequentiallyConsistent).exchanged
     }
 
     /// Both teardown paths -- our own `cancel` and the peer's death -- funnel here, and
@@ -214,10 +218,7 @@ public final class Transport: @unchecked Sendable {
     /// and never sending it is harmless: no state is allocated until `sendRequest`
     /// registers a waiter.
     public func allocateSeq() -> UInt64 {
-        lock.withLock {
-            defer { _nextSeq += 1 }
-            return _nextSeq
-        }
+        nextSeq.wrappingAdd(1, ordering: .relaxed).oldValue
     }
 
     /// Send a request under a `seq` obtained from `allocateSeq()` and await its
