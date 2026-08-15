@@ -1,6 +1,7 @@
 // Sources/XPCActors/Session.swift
 import Distributed
 import Foundation
+import Synchronization
 
 /// The half of a session an outbound call needs: somewhere to send an invocation.
 ///
@@ -128,33 +129,45 @@ public final class Session: SessionCoding, OutboundSession, InboundSession, @unc
     /// nothing here -- every mint already takes the lock -- and makes "the key is unique
     /// *and* the table records it" a single critical section rather than two.
     ///
-    /// `NSLock` rather than `Synchronization.Mutex` to keep the deployment floor where
-    /// the rest of the module puts it, and to match `ActorRegistry`.
-    private let lock = NSLock()
+    /// The session's mutable shared-actor state, under one `Synchronization.Mutex` now that
+    /// the floor is macOS 26 (Apple synchronises the same state on the transport's serial
+    /// queue). `isCancelled` lives here rather than in a separate atomic because a share
+    /// must observe "not cancelled" **and** register in the same critical section -- see
+    /// ``shareDynamically(_:)``.
+    private struct SharedActorState {
+        /// key -> actor. The direction the decode path reads, so it is a direct lookup.
+        var byKey: [SharedActorKey: SharedActor] = [:]
 
-    /// key -> actor. The direction the decode path reads, so it is a direct lookup.
-    private var byKey: [SharedActorKey: SharedActor] = [:]
+        /// actor -> key. Apple has no such map -- which is exactly why Apple cannot dedupe.
+        /// See ``shareDynamically(_:)``.
+        var keyForLocal: [RawActorID.Local: SharedActorKey] = [:]
 
-    /// actor -> key. Apple has no such map -- which is exactly why Apple cannot dedupe.
-    /// See ``shareDynamically(_:)``.
-    private var keyForLocal: [RawActorID.Local: SharedActorKey] = [:]
+        /// **Apple's `Session.idGenerator` (+0x20), and it mints two different things.**
+        ///
+        /// The `dynamic` shared-actor keys come from it -- `shareActor` and
+        /// `handleActorShared` are byte-identical 96-byte clones that load `Session+0x20`,
+        /// `adds #1`, and `b.hs` to a `brk` on overflow -- and so does
+        /// `RemoteInvocationRequest.id`, which the spec resolves as "an inlined
+        /// `ID64.Generator.next()`, a `cas` loop on `Session+0x20`". One counter, not two.
+        ///
+        /// That is observable rather than cosmetic: a session that has shared one actor
+        /// sends its first request under id 2, and the two number spaces interleave. Both
+        /// values are only ever interpreted by their minter's peer, so nothing depends on
+        /// which of the two took a given number -- but a peer that logged them would see the
+        /// gaps, and reproducing them costs one shared counter instead of two.
+        ///
+        /// Ids run from 1 and an overflow traps, which `+= 1` on a `UInt64` gives for free.
+        var lastID: UInt64 = 0
 
-    /// **Apple's `Session.idGenerator` (+0x20), and it mints two different things.**
-    ///
-    /// The `dynamic` shared-actor keys come from it -- `shareActor` and
-    /// `handleActorShared` are byte-identical 96-byte clones that load `Session+0x20`,
-    /// `adds #1`, and `b.hs` to a `brk` on overflow -- and so does
-    /// `RemoteInvocationRequest.id`, which the spec resolves as "an inlined
-    /// `ID64.Generator.next()`, a `cas` loop on `Session+0x20`". One counter, not two.
-    ///
-    /// That is observable rather than cosmetic: a session that has shared one actor
-    /// sends its first request under id 2, and the two number spaces interleave. Both
-    /// values are only ever interpreted by their minter's peer, so nothing depends on
-    /// which of the two took a given number -- but a peer that logged them would see the
-    /// gaps, and reproducing them costs one shared counter instead of two.
-    ///
-    /// Ids run from 1 and an overflow traps, which `+= 1` on a `UInt64` gives for free.
-    private var lastID: UInt64 = 0
+        /// Ours rather than Apple's: it stops a share that races the clear from
+        /// repopulating a table nobody will ever read again, and makes "a cancelled session
+        /// exports nothing" true rather than momentarily true. See ``cancellationCompleted()``.
+        var isCancelled = false
+
+        /// The next number from the session's generator; from 1, trapping on overflow.
+        mutating func nextID() -> ID64 { lastID += 1; return ID64(rawValue: lastID) }
+    }
+    private let sharedActors = Mutex<SharedActorState>(SharedActorState())
 
     /// **Keyed by the request body's `ID64`, never by the envelope's `headerID`.** Apple's
     /// `Session.pendingInvocationExecutionTasks` (+0xa0), and the id
@@ -174,7 +187,7 @@ public final class Session: SessionCoding, OutboundSession, InboundSession, @unc
     ///
     /// Apple's four accessors trap on a `.local` session. There is no `.local` session here
     /// -- see ``transport`` -- so there is nothing to trap on.
-    private var pendingInvocationExecutionTasks: [ID64: ExecutionSlot] = [:]
+    private let pendingInvocationExecutionTasks = Mutex<[ID64: ExecutionSlot]>([:])
 
     /// The three states an inbound execution's table entry moves through, so a
     /// `Task.immediate` execution can be spawned **outside** ``lock`` -- its last act,
@@ -192,8 +205,6 @@ public final class Session: SessionCoding, OutboundSession, InboundSession, @unc
         /// The task finished (or was reaped) inline, before its handle was stored.
         case done
     }
-
-    private var isCancelled = false
 
     /// **Apple's local-interface activation gate**, and the thing an inbound execution
     /// waits on before it is allowed to resolve a target.
@@ -254,18 +265,12 @@ public final class Session: SessionCoding, OutboundSession, InboundSession, @unc
     }
 
     /// How many actors this session currently exports.
-    var sharedActorCount: Int { lock.withLock { byKey.count } }
+    var sharedActorCount: Int { sharedActors.withLock { $0.byKey.count } }
 
     /// Internal for tests: the request ids of the executions this side is running for the
     /// peer. The set a `RemoteNotification.invocationCancelled(id:)` names into.
     var pendingInvocationIDs: Set<ID64> {
-        lock.withLock { Set(pendingInvocationExecutionTasks.keys) }
-    }
-
-    /// The next number from the session's generator. Callers hold ``lock``.
-    private func nextID() -> ID64 {
-        lastID += 1
-        return ID64(rawValue: lastID)
+        pendingInvocationExecutionTasks.withLock { Set($0.keys) }
     }
 
     // MARK: - SessionCoding
@@ -308,13 +313,13 @@ public final class Session: SessionCoding, OutboundSession, InboundSession, @unc
         // accident. Nothing between here and the insert can invalidate the answer that
         // matters -- we are about to hold the instance strongly ourselves.
         guard let entry = registry.lookup(local) else { return nil }
-        return lock.withLock { () -> SharedActorKey? in
-            guard !isCancelled else { return nil }
-            if let existing = keyForLocal[local] { return existing }
-            let key = SharedActorKey.dynamic(nextID())
-            byKey[key] = SharedActor(local: local, instance: entry.instance,
-                                     thunk: entry.thunk)
-            keyForLocal[local] = key
+        return sharedActors.withLock { state -> SharedActorKey? in
+            guard !state.isCancelled else { return nil }
+            if let existing = state.keyForLocal[local] { return existing }
+            let key = SharedActorKey.dynamic(state.nextID())
+            state.byKey[key] = SharedActor(local: local, instance: entry.instance,
+                                           thunk: entry.thunk)
+            state.keyForLocal[local] = key
             return key
         }
     }
@@ -352,10 +357,10 @@ public final class Session: SessionCoding, OutboundSession, InboundSession, @unc
 
     func addSharedActor(_ local: RawActorID.Local, at key: SharedActorKey) -> ShareOutcome {
         guard let entry = registry.lookup(local) else { return .notRegistered }
-        return lock.withLock {
-            guard !isCancelled else { return .sessionCancelled }
-            byKey[key] = SharedActor(local: local, instance: entry.instance,
-                                     thunk: entry.thunk)
+        return sharedActors.withLock { state in
+            guard !state.isCancelled else { return .sessionCancelled }
+            state.byKey[key] = SharedActor(local: local, instance: entry.instance,
+                                           thunk: entry.thunk)
             return .shared
         }
     }
@@ -437,7 +442,7 @@ public final class Session: SessionCoding, OutboundSession, InboundSession, @unc
     /// way of. Kept rather than folded in because splitting it is what lets the execution
     /// path take one critical section instead of two.
     func resolveSharedActor(at key: SharedActorKey) -> AnyObject? {
-        lock.withLock { byKey[key]?.instance }
+        sharedActors.withLock { $0.byKey[key]?.instance }
     }
 
     /// The lookup the inbound execution path makes: the instance **and** the invocation
@@ -445,7 +450,7 @@ public final class Session: SessionCoding, OutboundSession, InboundSession, @unc
     /// table.
     private func resolveSharedTarget(at key: SharedActorKey)
     -> (instance: AnyObject, thunk: InboundThunk)? {
-        lock.withLock { byKey[key].map { ($0.instance, $0.thunk) } }
+        sharedActors.withLock { state in state.byKey[key].map { ($0.instance, $0.thunk) } }
     }
 
     // MARK: - Outbound
@@ -486,7 +491,7 @@ public final class Session: SessionCoding, OutboundSession, InboundSession, @unc
         }
 
         let request = invocation.makeRequest(
-            id: lock.withLock { nextID() },
+            id: sharedActors.withLock { $0.nextID() },
             targetedSharedActor: remote.key,
             remoteCallTarget: target)
 
@@ -846,9 +851,9 @@ public final class Session: SessionCoding, OutboundSession, InboundSession, @unc
         // runs synchronously here, so we reserve now, spawn outside the lock, then store the
         // handle -- and the ``ExecutionSlot`` machine reconciles a body that finished inline
         // before its handle landed.
-        let accepted = lock.withLock { () -> Bool in
-            guard pendingInvocationExecutionTasks[id] == nil else { return false }
-            pendingInvocationExecutionTasks[id] = .reserved
+        let accepted = pendingInvocationExecutionTasks.withLock { table -> Bool in
+            guard table[id] == nil else { return false }
+            table[id] = .reserved
             return true
         }
         guard accepted else {
@@ -966,10 +971,10 @@ public final class Session: SessionCoding, OutboundSession, InboundSession, @unc
         // Store the handle unless the body already finished inline. `.reserved` -> the body
         // suspended, so store the handle for cancellation to reach; `.done` -> it finished
         // inline before we got here, so drop the transient entry.
-        lock.withLock {
-            switch pendingInvocationExecutionTasks[id] {
-            case .reserved: pendingInvocationExecutionTasks[id] = .running(task)
-            case .done: pendingInvocationExecutionTasks[id] = nil
+        pendingInvocationExecutionTasks.withLock { table in
+            switch table[id] {
+            case .reserved: table[id] = .running(task)
+            case .done: table[id] = nil
             case .running, .none: break
             }
         }
@@ -1074,8 +1079,8 @@ public final class Session: SessionCoding, OutboundSession, InboundSession, @unc
     /// unknown id is silently ignored -- a peer may cancel a call this side has already
     /// answered, which is a race rather than an error.
     private func cancelPendingInvocationExecutionTask(withID id: ID64) {
-        let task: Task<Void, Never>? = lock.withLock {
-            if case .running(let task) = pendingInvocationExecutionTasks[id] { return task }
+        let task: Task<Void, Never>? = pendingInvocationExecutionTasks.withLock { table in
+            if case .running(let task) = table[id] { return task }
             return nil
         }
         task?.cancel()
@@ -1086,8 +1091,8 @@ public final class Session: SessionCoding, OutboundSession, InboundSession, @unc
     /// The tasks are cancelled *outside* the lock: each one's completion takes the same
     /// lock to remove itself, and `Task.cancel()` can run a cancellation handler inline.
     private func cancelAllPendingInvocationExecutionTasks() {
-        let tasks: [Task<Void, Never>] = lock.withLock {
-            pendingInvocationExecutionTasks.values.compactMap {
+        let tasks: [Task<Void, Never>] = pendingInvocationExecutionTasks.withLock { table in
+            table.values.compactMap {
                 if case .running(let task) = $0 { return task }
                 return nil
             }
@@ -1098,13 +1103,13 @@ public final class Session: SessionCoding, OutboundSession, InboundSession, @unc
     /// The execution is over, however it ended. Ours; Apple's removal happens inside
     /// `replyToPendingInvocation(withID:replyBlock:)`.
     private func finishPendingInvocationExecutionTask(withID id: ID64) {
-        lock.withLock {
-            switch pendingInvocationExecutionTasks[id] {
+        pendingInvocationExecutionTasks.withLock { table in
+            switch table[id] {
             // Normal removal once the handle is stored.
-            case .running: pendingInvocationExecutionTasks[id] = nil
+            case .running: table[id] = nil
             // Finished inline, before the spawn stored the handle: leave a `.done` marker
             // for the store step to clear, so neither side loses the entry.
-            case .reserved: pendingInvocationExecutionTasks[id] = .done
+            case .reserved: table[id] = .done
             case .done, .none: break
             }
         }
@@ -1163,10 +1168,10 @@ public final class Session: SessionCoding, OutboundSession, InboundSession, @unc
     /// the clear from repopulating a table nobody will ever read again, and it makes
     /// "a cancelled session exports nothing" true rather than momentarily true.
     func cancellationCompleted() {
-        lock.withLock {
-            isCancelled = true
-            byKey.removeAll()
-            keyForLocal.removeAll()
+        sharedActors.withLock { state in
+            state.isCancelled = true
+            state.byKey.removeAll()
+            state.keyForLocal.removeAll()
         }
         // **Apple's, and not tidiness.** Their `cancellationCompleted()` fulfils the
         // `cancellationEvent` promise *and* the `unownedLocalInterfaceActivationEvent` one
