@@ -23,7 +23,7 @@ import Foundation
 /// No `Combine.Future` here: this is one latch and a list of parked continuations, which is
 /// what the future is being used as. `Fuse` — Apple's `{ value: Atomic<Bool> }` one-shot —
 /// is the `posted` flag under the same lock.
-@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 final class ActivationEvent: @unchecked Sendable {
 
     private let lock = NSLock()

@@ -16,7 +16,7 @@ import XPCOverlayCoder
 /// The strongest check available here is the last one in each pair: `AppleCoderBridge`
 /// runs Apple's own decoder in-process against the bytes we produced. It is as close to
 /// a real peer as this repository can get.
-@available(macOS 14, *)
+@available(macOS 26, *)
 final class PacketBodyTests: XCTestCase {
 
     private static let request = RemoteInvocationRequest(

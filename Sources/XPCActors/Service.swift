@@ -6,7 +6,7 @@ import XPC
 // MARK: - Service
 // ===========================================================================================
 
-@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 extension XPCActorSystem {
 
     /// A launchd-registered service, addressed by name.

@@ -5,7 +5,7 @@ import CodableXPC
 @testable import XPCActors
 
 /// Stands in for a `Session`, so identity can be tested with no transport.
-@available(macOS 14, *)
+@available(macOS 26, *)
 final class ActorIDTests: XCTestCase {
 
     private func userInfo(_ session: StubSession) -> [CodingUserInfoKey: Any] {

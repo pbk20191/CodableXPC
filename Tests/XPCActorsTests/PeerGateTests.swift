@@ -34,15 +34,16 @@ import Distributed
 ///
 /// An unknown requirement answers `nil` -- "cannot tell" -- which is what a real attestation
 /// does with a requirement it cannot express.
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 struct TableAttestation: PeerAttestation, Sendable {
     let answers: [String: Bool]
     init(_ answers: [String: Bool]) { self.answers = answers }
     func satisfies(_ requirement: PeerRequirement) -> Bool? { answers[requirement.description] }
 }
 
-@available(macOS 14, *)
+@available(macOS 26, *)
 let systemRequirement = PeerRequirement("test.system.requirement")
-@available(macOS 14, *)
+@available(macOS 26, *)
 let vaultRequirement = PeerRequirement("test.vault.requirement")
 
 /// An actor that vets its own callers, over and above whatever the system requires.
@@ -51,7 +52,7 @@ let vaultRequirement = PeerRequirement("test.vault.requirement")
 /// `nonisolated` *stored* property on a distributed actor -- storage on a distributed actor
 /// might not be here at all. Apple's requirement is read synchronously out of the witness
 /// table on the inbound path, with no `await`, so nonisolated is not a choice either way.
-@available(macOS 14, *)
+@available(macOS 26, *)
 distributed actor Vault: RestrictedAccessDistributedActor {
     typealias ActorSystem = XPCActorSystem
 
@@ -76,7 +77,7 @@ distributed actor Vault: RestrictedAccessDistributedActor {
 
 /// Two systems, two sessions, one pipe -- with the server end's peer requirement, its
 /// attestation and its activation state all under the test's control.
-@available(macOS 14, *)
+@available(macOS 26, *)
 private final class GatedLink: @unchecked Sendable {
     let clientSystem: XPCActorSystem
     let serverSystem: XPCActorSystem
@@ -125,6 +126,7 @@ private final class GatedLink: @unchecked Sendable {
 }
 
 /// Somewhere a `Task` can leave its outcome that a test body can read without awaiting it.
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 private final class Outcome<Value: Sendable>: @unchecked Sendable {
     private let lock = NSLock()
     private var storage: Result<Value, any Error>?
@@ -136,7 +138,7 @@ private final class Outcome<Value: Sendable>: @unchecked Sendable {
 // MARK: - The tests
 // ===========================================================================================
 
-@available(macOS 14, *)
+@available(macOS 26, *)
 final class PeerGateTests: XCTestCase {
 
     /// Start `body` detached, filling `box`. Nothing awaits the returned task.

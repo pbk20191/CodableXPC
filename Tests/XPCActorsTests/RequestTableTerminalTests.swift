@@ -16,7 +16,7 @@ import XCTest
 /// *before* failing the table, so the later `send()` throws and `waitForReply`'s
 /// catch path resumes the caller. The bug was real, and its only guard was an
 /// ordering in a different type with nothing pinning it. Both are pinned here.
-@available(macOS 14, *)
+@available(macOS 26, *)
 final class RequestTableTerminalTests: XCTestCase {
 
     /// Every call here is one that *hung* before the fix, so a regression must fail
@@ -107,12 +107,14 @@ final class RequestTableTerminalTests: XCTestCase {
     }
 }
 
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 private final class Box: @unchecked Sendable {
     var value = false
 }
 
 /// Carries the body's result out of the unstructured task. Safe because `waitUntil`
 /// establishes the ordering: nothing reads `value` except after observing it non-nil.
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 private final class ResultBox<T>: @unchecked Sendable {
     var value: T?
 }

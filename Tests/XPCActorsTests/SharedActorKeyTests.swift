@@ -3,7 +3,7 @@ import XPC
 import CodableXPC
 @testable import XPCActors
 
-@available(macOS 14, *)
+@available(macOS 26, *)
 final class SharedActorKeyTests: XCTestCase {
 
     private func encoded(_ key: SharedActorKey) throws -> String {

@@ -4,9 +4,10 @@ import XCTest
 /// Deliberately `internal`, not `private`. A `private` or `fileprivate` type mangles
 /// with a `$<process address>yXZ` discriminator that `_typeByName` cannot resolve, so it
 /// has no round trip to test -- and no peer could resolve it either.
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 struct Sample: Codable, Equatable { let n: Int }
 
-@available(macOS 14, *)
+@available(macOS 26, *)
 final class TypeNameTests: XCTestCase {
 
     func testAConcreteTypeRoundTrips() throws {

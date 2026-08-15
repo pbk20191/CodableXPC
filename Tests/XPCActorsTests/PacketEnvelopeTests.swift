@@ -9,7 +9,7 @@ import XPC
 /// the shapes out of `Packet.(Header).write(to:)` (`0x2ad4e134c`) and
 /// `Packet.(Header).init(from:)` (`0x2ad4e71c0`) in the shipping macOS 27 framework.
 /// They are not transcriptions of this package's own output.
-@available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 final class PacketEnvelopeTests: XCTestCase {
 
     /// A stand-in for the overlay-encoded body.

@@ -24,7 +24,7 @@ import XPCOverlayCoder
 ///
 /// This is the decode direction only. That Apple's *encoder* produces these same
 /// bytes is pinned separately, in `XPCOverlayCoderTests.AppleEncoderParityTests`.
-@available(macOS 14, *)
+@available(macOS 26, *)
 private struct EagerRequest: Decodable, Equatable {
     let id: UInt64
     let target: String
@@ -71,7 +71,7 @@ private struct EagerRequest: Decodable, Equatable {
     }
 }
 
-@available(macOS 14, *)
+@available(macOS 26, *)
 final class AppleDecodesInvocationArgumentsTests: XCTestCase {
 
     private static let request = RemoteInvocationRequest(

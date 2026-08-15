@@ -27,7 +27,7 @@ import XPC
 ///   `xpc_main`, which never returns and owns the main thread. ``runXPCServiceMain(accepting:)``
 ///   is that path, and it is a separate function because a call that never returns should not
 ///   look like one that does.
-@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 public final class XPCConnectionListener: @unchecked Sendable {
 
     private let listener: xpc_connection_t
@@ -129,7 +129,7 @@ public final class XPCConnectionListener: @unchecked Sendable {
 /// The peer handler runs on libxpc's own queue. Anything asynchronous it wants to do -- and a
 /// distributed-actor peer handler is entirely asynchronous -- has to be started as a `Task`,
 /// which is what ``XPCActorSystem/TransportReceiver/attachTransport(_:)`` already does.
-@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 public func runXPCServiceMain(
     accepting accept: @escaping @Sendable (XPCConnectionTransport) -> Void
 ) -> Never {
@@ -141,7 +141,7 @@ public func runXPCServiceMain(
     }
 }
 
-@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 nonisolated(unsafe) private var xpcServiceMainAccept:
     (@Sendable (XPCConnectionTransport) -> Void)?
 #endif

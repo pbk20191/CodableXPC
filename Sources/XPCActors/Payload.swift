@@ -2,7 +2,7 @@ import Foundation
 import XPC
 import XPCOverlayCoder
 
-@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 extension Packet {
 
     /// `Packet.Payload` -- an xpc dictionary with exactly one entry, `"payload"`,

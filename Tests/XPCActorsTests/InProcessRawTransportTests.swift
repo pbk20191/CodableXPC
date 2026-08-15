@@ -7,12 +7,12 @@ import XPC
 ///
 /// A free function, not a method: it is called from `@Sendable` packet handlers, which
 /// must not capture the `XCTestCase`.
-@available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 private func marker(of packet: Packet) -> UInt64? {
     try? packet.payload.decode(as: UInt64.self)
 }
 
-@available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 final class InProcessRawTransportTests: XCTestCase {
 
     private func notification(_ marker: UInt64) throws -> Packet {

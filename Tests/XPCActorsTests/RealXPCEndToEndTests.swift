@@ -19,7 +19,7 @@ import XPCOverlayCoder
 /// `libxpc` before our code sees it again. Same process, real transport — which is the
 /// most this repository can reach, since a real *peer* refuses us at the entitlement
 /// wall before it looks at our bytes (see the wire-format spec).
-@available(macOS 15, *)
+@available(macOS 26, *)
 final class RealXPCEndToEndTests: XCTestCase {
 
     func testACallCrossesRealXPCAndComesBack() async throws {
@@ -125,6 +125,7 @@ final class RealXPCEndToEndTests: XCTestCase {
 }
 
 /// Local, because the one in `InboundInvocationTests` is `private` to that file.
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 private final class Box<Value: Sendable>: @unchecked Sendable {
     private let lock = NSLock()
     private var _outcome: Result<Value, any Error>?
@@ -134,7 +135,7 @@ private final class Box<Value: Sendable>: @unchecked Sendable {
 
 // MARK: - the actor
 
-@available(macOS 15, *)
+@available(macOS 26, *)
 distributed actor WireGreeter {
     typealias ActorSystem = XPCActorSystem
 
@@ -146,7 +147,7 @@ distributed actor WireGreeter {
 
 // MARK: - a link over a real anonymous XPC connection
 
-@available(macOS 15, *)
+@available(macOS 26, *)
 private final class RealLink: @unchecked Sendable {
 
     let clientSystem = XPCActorSystem("client")
@@ -225,7 +226,7 @@ private final class RealLink: @unchecked Sendable {
     }
 }
 
-@available(macOS 15, *)
+@available(macOS 26, *)
 private final class Arrived: @unchecked Sendable {
     private let lock = NSLock()
     private var _message: xpc_object_t?

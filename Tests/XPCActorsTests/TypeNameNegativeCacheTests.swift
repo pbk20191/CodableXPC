@@ -20,7 +20,7 @@ import XCTest
 /// second and third peer-reachable defects found in this package were of exactly this
 /// shape: a field a peer controls, whose unbounded or out-of-range values nobody had
 /// enumerated.
-@available(macOS 14, *)
+@available(macOS 26, *)
 final class TypeNameNegativeCacheTests: XCTestCase {
 
     /// Distinct unresolvable names must not accumulate.
@@ -80,4 +80,5 @@ final class TypeNameNegativeCacheTests: XCTestCase {
 
 /// Internal, not `private`: a `private` type's mangled name carries a process-address
 /// discriminator and does not resolve at all.
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 struct LateResolver: Codable {}

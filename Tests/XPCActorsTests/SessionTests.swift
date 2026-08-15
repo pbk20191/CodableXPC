@@ -18,7 +18,7 @@ import CodableXPC
 /// that consulted its own table first would resolve the *peer's* actor as its own, at
 /// bytes of the peer's choosing. Apple does not support it either, and traps where we
 /// throw. Read the absence of that test as the rule, not as an oversight.
-@available(macOS 14, *)
+@available(macOS 26, *)
 final class SessionTests: XCTestCase {
 
     /// Stands in for a distributed actor. The registry stores `AnyObject`, so

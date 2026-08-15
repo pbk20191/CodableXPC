@@ -5,9 +5,10 @@ import CodableXPC
 
 /// `internal`, not `private`: a `private` type's mangled name embeds a process address
 /// and does not resolve, which is exactly what `SwiftType(_:)` now refuses.
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 struct SwiftTypeSample: Codable {}
 
-@available(macOS 14, *)
+@available(macOS 26, *)
 final class SwiftTypeTests: XCTestCase {
 
 

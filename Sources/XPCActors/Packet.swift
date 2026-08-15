@@ -24,7 +24,7 @@ import XPC
 /// builds and no receiver could have told. Interop buys peer compatibility and pays for
 /// it with that detector; nothing replaces it, and the only remaining guard is the
 /// golden fixtures in this package's tests.
-@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 public enum EnvelopeKey {
     public static let headerCategory = "headerCategory"
     public static let headerID = "headerID"
@@ -40,7 +40,7 @@ public enum EnvelopeKey {
 /// The associated value is an ``ID64`` because that is what Apple's enum carries. It is
 /// a bare `UInt64` wherever it is coded, and the header is not coded at all -- it is
 /// written as native xpc entries -- so the choice is about modelling, not bytes.
-@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 public enum PacketHeader: Hashable, Sendable {
     case request(ID64)
     case response(ID64)
@@ -84,7 +84,7 @@ public enum PacketHeader: Hashable, Sendable {
 /// `payload.dictionary` into the result and tail-calls `Header.write(to:)` on that copy,
 /// which is why the payload's own single `"payload"` entry *is* the envelope's third
 /// entry rather than sitting beneath one.
-@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 public struct Packet: @unchecked Sendable {
     public let header: PacketHeader
     public let payload: Payload

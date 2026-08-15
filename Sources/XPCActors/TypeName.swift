@@ -5,7 +5,7 @@ import Foundation
 /// `_typeByName` performs a runtime lookup on every call, so the reverse direction
 /// is cached; the forward direction is cached with it so the two stay one component.
 /// Apple added the same cache to `XPCSystem` between the two builds we can observe.
-@available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 public enum TypeName {
 
     private static let lock = NSLock()
