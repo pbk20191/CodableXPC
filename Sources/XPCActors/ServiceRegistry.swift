@@ -90,6 +90,7 @@ final class ServiceRegistry: Sendable {
         registration.receiver.acceptLocal(serverSession)
         return actorSystem.makeLocalSession(
             peer: serverSession,
-            localInterfaceActivated: !options.contains(.bidirectional))
+            localInterfaceActivated: !options.contains(.bidirectional),
+            isBidirectional: options.contains(.bidirectional))
     }
 }

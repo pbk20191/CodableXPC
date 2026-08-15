@@ -118,7 +118,8 @@ extension XPCActorSystem {
                 // open, and the peer would wait forever -- there is no timeout in this
                 // protocol. Open, it answers "nothing is shared at that key", which is both
                 // true and terminal.
-                localInterfaceActivated: !arguments.options.contains(.bidirectional))
+                localInterfaceActivated: !arguments.options.contains(.bidirectional),
+                isBidirectional: arguments.options.contains(.bidirectional))
             do {
                 try raw.activate()
             } catch {
