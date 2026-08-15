@@ -99,6 +99,12 @@ extension XPCActorSystem {
         func connect(
             from actorSystem: XPCActorSystem, with arguments: ServiceConnectArguments
         ) throws(SetupError) -> Session {
+            // Apple's body first consults the process-wide registry: a service served in
+            // this same process is reached directly unless `preserveSelfIPC` forces XPC.
+            if let local = ServiceRegistry.shared.lookUpAndConnect(
+                to: self, from: actorSystem, options: arguments.options) {
+                return local
+            }
             let raw = try makeTransport(peerRequirement: arguments.peerRequirement,
                                         targetQueue: nil)
             let transport = Transport(debugName: debugName, role: .initiator, rawTransport: raw)
@@ -166,6 +172,11 @@ extension XPCActorSystem {
         /// Apple's `Session.(addSharedActor)` asserts on it -- `"API violation: Session must be
         /// bidirectional to share actor references"`.
         public static let bidirectional = InitializationOptions(rawValue: 1 << 0)
+
+        /// Force the XPC path even when the service is served in this same process, rather
+        /// than taking ``ServiceRegistry``'s same-process optimization. Apple's
+        /// `preserveSelfIPC`; it logs `"preserveSelfIPC set, forcing XPC for service %s"`.
+        public static let preserveSelfIPC = InitializationOptions(rawValue: 1 << 1)
     }
 
     // =======================================================================================
