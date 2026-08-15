@@ -369,10 +369,39 @@ public struct InvocationDecoder: DistributedTargetInvocationDecoder {
 
     public typealias SerializationRequirement = any Codable
 
-    private var invocation: InboundInvocation
+    /// Apple's `{ mode: encoded | direct }`. The **encoded** mode reads an
+    /// ``InboundInvocation`` off the wire; the **direct** mode -- the same-process path that
+    /// ``ServiceRegistry`` takes -- carries the caller's own recorded values and never
+    /// decodes a byte. Same header fields, same positional argument consumption, two sources.
+    enum Mode {
+        case encoded(InboundInvocation)
+        case direct(Direct)
+    }
 
-    public init(_ invocation: InboundInvocation) {
-        self.invocation = invocation
+    /// The direct mode's state: the caller's ``InvocationEncoder`` values, consumed
+    /// positionally by a cursor exactly as the encoded container's own cursor is.
+    struct Direct {
+        var arguments: [any Codable]
+        var cursor = 0
+        var protocolStub: SwiftType?
+        var genericSubsitutions: [SwiftType]
+        var returnType: SwiftType?
+        var errorType: SwiftType?
+    }
+
+    private var mode: Mode
+
+    public init(_ invocation: InboundInvocation) { mode = .encoded(invocation) }
+
+    /// Build the direct decoder straight from the caller's recorded invocation -- the values
+    /// are already in hand (see ``InvocationEncoder``'s "nothing is encoded here").
+    init(direct encoder: InvocationEncoder) {
+        mode = .direct(Direct(
+            arguments: encoder.arguments,
+            protocolStub: encoder.protocolStub,
+            genericSubsitutions: encoder.genericSubsitutions,
+            returnType: encoder.returnType,
+            errorType: encoder.errorType))
     }
 
     /// **`protocolStub` is a generic substitution**, and it is merged in *ahead of*
@@ -389,10 +418,19 @@ public struct InvocationDecoder: DistributedTargetInvocationDecoder {
     /// unresolvable name is certainly not a stub. That is not in tension with
     /// ``SwiftType``'s "resolution failure is a later failure": this *is* the later
     /// failure, raised by the code that tried to use the type rather than by the decode.
+    ///
+    /// The direct mode carries the same two fields (stub, substitutions) and resolves them
+    /// the same way -- these are types this process already holds, so nothing crosses.
     public mutating func decodeGenericSubstitutions() throws -> [Any.Type] {
         var wire: [SwiftType] = []
-        if let stub = invocation.protocolStub { wire.append(stub) }
-        wire.append(contentsOf: invocation.genericSubsitutions)
+        switch mode {
+        case .encoded(let invocation):
+            if let stub = invocation.protocolStub { wire.append(stub) }
+            wire.append(contentsOf: invocation.genericSubsitutions)
+        case .direct(let direct):
+            if let stub = direct.protocolStub { wire.append(stub) }
+            wire.append(contentsOf: direct.genericSubsitutions)
+        }
         return try wire.map { named in
             guard let type = named.type, Self.isDistributedActorStub(type) else {
                 // Apple's literal, 38 bytes at the throw site in `0x2ad500220`. The name
@@ -404,17 +442,35 @@ public struct InvocationDecoder: DistributedTargetInvocationDecoder {
         }
     }
 
-    /// Pull the next argument. Positional: the container's own cursor is the whole state.
+    /// Pull the next argument. Positional: a cursor is the whole state, on either source.
     ///
     /// An absent `arguments` key is Apple's `nil` container and Apple's message, not a
-    /// decode failure a request away -- see ``InboundInvocation/argumentsContainer``.
+    /// decode failure a request away -- see ``InboundInvocation/argumentsContainer``. The
+    /// direct mode never decodes: it hands back the caller's own value, cast to the type the
+    /// runtime asks for, and a mismatch is a bug in this process rather than bad wire data.
     public mutating func decodeNextArgument<Argument: Codable>() throws -> Argument {
-        guard invocation.argumentsContainer != nil else {
-            throw DistributedActorCodingError(message: "Found no arguments from decoder.")
+        switch mode {
+        case .encoded(var invocation):
+            guard invocation.argumentsContainer != nil else {
+                throw DistributedActorCodingError(message: "Found no arguments from decoder.")
+            }
+            // Written back, always: `decode` advances the container's cursor, and a copy
+            // that is not stored is a decoder that returns argument 0 forever.
+            defer { mode = .encoded(invocation) }
+            return try invocation.argumentsContainer!.decode(Argument.self)
+        case .direct(var direct):
+            guard direct.cursor < direct.arguments.count else {
+                throw DistributedActorCodingError(message: "Found no arguments from decoder.")
+            }
+            let value = direct.arguments[direct.cursor]
+            direct.cursor += 1
+            mode = .direct(direct)
+            guard let typed = value as? Argument else {
+                throw DistributedActorCodingError(
+                    message: "direct argument is \(type(of: value)), not \(Argument.self)")
+            }
+            return typed
         }
-        // Written back, always: `decode` advances the container's cursor, and a copy that
-        // is not stored is a decoder that returns argument 0 forever.
-        return try invocation.argumentsContainer!.decode(Argument.self)
     }
 
     /// The resolved `errorType`, or `nil`.
@@ -423,9 +479,19 @@ public struct InvocationDecoder: DistributedTargetInvocationDecoder {
     /// cannot throw" -- but it is the only one this requirement can carry, and the field
     /// whose *presence* actually signals throwing is read by ``Session`` directly, off the
     /// invocation, before the decoder is handed to the runtime.
-    public mutating func decodeErrorType() throws -> Any.Type? { invocation.errorType?.type }
+    public mutating func decodeErrorType() throws -> Any.Type? {
+        switch mode {
+        case .encoded(let invocation): invocation.errorType?.type
+        case .direct(let direct): direct.errorType?.type
+        }
+    }
 
-    public mutating func decodeReturnType() throws -> Any.Type? { invocation.returnType?.type }
+    public mutating func decodeReturnType() throws -> Any.Type? {
+        switch mode {
+        case .encoded(let invocation): invocation.returnType?.type
+        case .direct(let direct): direct.returnType?.type
+        }
+    }
 
     /// The same conformance test the encoder makes, and for the same reason: a name test
     /// would pass for anything a user called `$Something`. Runtime-gated because
