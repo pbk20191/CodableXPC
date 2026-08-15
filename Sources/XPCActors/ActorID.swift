@@ -15,40 +15,6 @@ public protocol SessionCoding: AnyObject, Sendable {
 
     /// The id our side uses for an actor the peer named.
     func remoteID(for key: SharedActorKey) -> ActorID
-
-    /// Which actor system this session belongs to.
-    ///
-    /// This is Apple's `OutboundSessionProtocol.actorSystem` -- one of only *two*
-    /// requirements that protocol has, the other being `sendInvocation` -- so adding it
-    /// here moves `SessionCoding` towards Apple's shape rather than away from it. It is
-    /// the slot `RawActorID.Remote.belongsTo(actorSystem:)` calls through, and its one
-    /// job is `XPCActorSystem.resolve(id:as:)`'s third branch: a `.remote` id reached
-    /// through a session belonging to some *other* system must not resolve here.
-    ///
-    /// **An `ID64` rather than the system itself**, where Apple compares object
-    /// pointers. Three reasons, in order of weight:
-    ///
-    /// - The comparison is as strong **for every conformer in this package**. `ID64`
-    ///   comes from a monotonic process-global counter that is never recycled, and the
-    ///   comparison is always within one process -- a `.remote`'s session is an object
-    ///   in *this* process -- so equal ids and identical systems coincide.
-    ///
-    ///   It is **not** as strong in general, and an earlier revision of this comment
-    ///   claimed it was. `ID64.init(rawValue:)` and `XPCActorSystem.id` are both public,
-    ///   so a `SessionCoding` conformer outside this package could return a system id it
-    ///   guessed, without ever holding the system. Apple's `===` needs the object. This
-    ///   costs nothing today -- a `.remote`'s session is an in-process object a peer
-    ///   never chooses, so this is not a boundary against a peer -- but it is a weaker
-    ///   relation and should be described as one.
-    /// - `Session` is generic over its thunk while the system is concrete, so a stored
-    ///   `XPCActorSystem` on a `Session<Int>` would be a type-level lie: the session's
-    ///   registry need not be that system's registry. The generic collapses when a
-    ///   session is handed a system instead of a registry, and at that point this
-    ///   becomes `system.id` and stays honest.
-    /// - It keeps the identity layer free of the system: this file is deliberately
-    ///   buildable and testable with no `Distributed`, no transport and no system at
-    ///   all, which is why `SessionCoding` exists in the first place.
-    var systemID: ID64 { get }
 }
 
 @available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)

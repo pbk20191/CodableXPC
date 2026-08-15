@@ -48,7 +48,6 @@ final class StubSession: SessionCoding, @unchecked Sendable {
     /// `ID64.next()` is never recycled, so a proxy reached through it is refused by
     /// every real system -- which is the honest answer and is what
     /// `XPCActorSystemTests.testARemoteIDFromAForeignSessionConformerThrows` pins.
-    let systemID = ID64.next()
 
     func shareDynamically(_ local: RawActorID.Local) -> SharedActorKey? {
         guard !refuseToShare else { return nil }

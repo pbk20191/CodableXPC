@@ -12,9 +12,10 @@ import Synchronization
 /// *outbound* one that `RawActorID.Remote.session` is typed against, which is why
 /// `remoteCall` can find a sender through nothing but a proxy's id.
 ///
-/// It refines ``SessionCoding`` rather than restating it: `SessionCoding.systemID` is
-/// Apple's `actorSystem` requirement at the width our identity layer can state (see the
-/// comment there), so `OutboundSession` adds the one thing left.
+/// It refines ``SessionCoding`` rather than restating it: `SessionCoding` names only the
+/// identity operations (so that layer stays free of `Distributed` and the system), and
+/// `OutboundSession` adds Apple's `actorSystem` requirement -- the one thing a sender needs
+/// beyond identity.
 ///
 /// Declared here rather than beside `SessionCoding` in `ActorID.swift` on purpose:
 /// `sendInvocation` mentions `RemoteCallTarget` and `InvocationEncoder`, and
@@ -126,12 +127,12 @@ public final class Session: SessionCoding, OutboundSession, InboundSession, @unc
         return transport
     }
 
-    /// Which actor system this session belongs to. See ``SessionCoding/systemID``.
+    /// Which actor system this session belongs to -- held by identity, which is how
+    /// ``XPCActorSystem/resolve(id:as:)`` matches Apple's `===`.
     ///
     /// Now derived rather than stored: the previous slice stored an `ID64` beside a
     /// registry and noted that it "becomes `system.id` and stays honest" once a session
     /// is handed a system. It is that now, so the two can no longer disagree.
-    public var systemID: ID64 { system.id }
 
     /// Where a local id is turned into the instance behind it -- the system's table, not
     /// one of our own. Apple's `addSharedActor` likewise calls
