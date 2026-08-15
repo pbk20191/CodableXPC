@@ -261,11 +261,13 @@ extension XPCActorSystem {
 
         public let receiver: TransportReceiver
         private let listener: XPCListener
+        private let service: Service
         private let stopped = ActivationEvent(posted: false)
 
-        fileprivate init(receiver: TransportReceiver, listener: XPCListener) {
+        fileprivate init(receiver: TransportReceiver, listener: XPCListener, service: Service) {
             self.receiver = receiver
             self.listener = listener
+            self.service = service
         }
 
         /// Park until something cancels this listener. A service process's `main` ends here.
@@ -280,6 +282,7 @@ extension XPCActorSystem {
 
         /// Stop listening and unwind every peer.
         public func cancel() async {
+            ServiceRegistry.shared.unregister(service)
             receiver.cancel()
             await receiver.unwindPeers()
             stopped.post()
@@ -323,7 +326,12 @@ extension XPCActorSystem {
             throw SetupError("could not create an XPCListener for \(service.debugName): \(error)")
         }
         receiver.setCancellationHandler { [listener] in listener.cancel() }
-        return ServiceListener(receiver: receiver, listener: listener)
+        // Apple's `ServiceRegistry.register(...)`: enter this service into the process-wide
+        // table so a same-process client can be routed to `receiver` directly. Unregistered
+        // by ``ServiceListener/cancel()``.
+        ServiceRegistry.shared.register(
+            service, receiver: receiver, actorSystem: self, targetQueue: targetQueue)
+        return ServiceListener(receiver: receiver, listener: listener, service: service)
     }
 }
 
