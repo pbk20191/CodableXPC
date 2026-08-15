@@ -185,13 +185,7 @@ extension XPCActorSystem: DistributedActorSystem {
             }
             return instance
         case .remote(let remote):
-            // Apple compares the owning system by **identity** (`===`), not by id -- a
-            // `.remote` reached through a session belonging to another `XPCActorSystem` must
-            // not resolve here. `resolve` knows the concrete `Session`, so it matches Apple
-            // exactly; and identity closes the hole an id comparison left open (an outside
-            // `SessionCoding` conformer could return an id it guessed, never holding the
-            // system -- with `===` the downcast, not a guessable number, is the gate).
-            guard let session = remote.session as? Session, session.system === self else {
+            guard remote.session.systemID == self.id else {
                 throw SetupError("Remote actor does not belong to the actor system.")
             }
             return nil
