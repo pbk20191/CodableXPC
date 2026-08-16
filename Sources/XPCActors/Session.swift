@@ -669,20 +669,15 @@ public final class Session: SessionCoding, OutboundSession, InboundSession, @unc
                 "\(target.identifier) failed on the callee: \(error)")
         }
         switch handler.capturedResult {
-        case .value(let value):
+        case .success(let value):
+            // A void target arrives here as `.success(Ack())`; `Res` is bound to `Ack` for a
+            // `remoteCallVoid`, so the same cast covers both a real value and the void
+            // stand-in. Apple's `DirectResultHandler.capturedResult` folds void the same way.
             guard let typed = value as? Res else {
                 throw RemoteInvocationCancellationError.resultPropagationFailed(
                     "\(target.identifier) returned \(type(of: value)), not \(Res.self)")
             }
             return typed
-        case .void:
-            // A void target: the wire path returns an `Ack`, and `Res` is bound to `Ack` for
-            // a `remoteCallVoid`. Hand back the same stand-in.
-            guard let ack = Ack() as? Res else {
-                throw RemoteInvocationCancellationError.resultPropagationFailed(
-                    "\(target.identifier) returned void where \(Res.self) was expected")
-            }
-            return ack
         case .failure(let error):
             throw RemoteInvocationCancellationError.executionFailed("\(error)")
         case nil:

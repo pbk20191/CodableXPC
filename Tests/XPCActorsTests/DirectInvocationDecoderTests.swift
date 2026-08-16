@@ -56,7 +56,7 @@ final class DirectInvocationDecoderTests: XCTestCase {
     func testDirectResultHandlerCapturesAValue() async throws {
         let handler = ResultHandler.direct()
         try await handler.onReturn(value: 99)
-        guard case .value(let captured) = handler.capturedResult else {
+        guard case .success(let captured) = handler.capturedResult else {
             return XCTFail("expected a captured value, got \(String(describing: handler.capturedResult))")
         }
         XCTAssertEqual(captured as? Int, 99)
@@ -65,7 +65,10 @@ final class DirectInvocationDecoderTests: XCTestCase {
     func testDirectResultHandlerCapturesVoid() async throws {
         let handler = ResultHandler.direct()
         try await handler.onReturnVoid()
-        guard case .void = handler.capturedResult else { return XCTFail("expected void") }
+        // A void return folds into `.success(Ack())`, Apple's `DirectResultHandler` shape.
+        guard case .success(let captured) = handler.capturedResult, captured is Ack else {
+            return XCTFail("expected a captured void (Ack), got \(String(describing: handler.capturedResult))")
+        }
     }
 
     func testDirectResultHandlerCapturesAThrow() async throws {
