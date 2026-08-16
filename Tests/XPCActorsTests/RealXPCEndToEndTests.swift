@@ -157,6 +157,40 @@ final class RealXPCEndToEndTests: XCTestCase {
         task.cancel()
         XCTAssertEqual(try box.outcome?.get(), "hello endpoint")
     }
+
+    /// The *server* factory: `makeEphemeralServiceWithListeningTask` stands up the anonymous
+    /// listener and serves peers through `Receiver.listen(executingForEachPeer:)`. A client
+    /// dials the returned service's endpoint and a call crosses real XPC -- exercising the
+    /// deferred-handler bridge (the client may dial before the serving task installs the handler)
+    /// end to end.
+    func testACallCrossesAServedEphemeralService() async throws {
+        let serverSystem = XPCActorSystem("eph-serve-server")
+        let handle = serverSystem.makeEphemeralServiceWithListeningTask("test.ephemeral") { receiver in
+            Task {
+                await receiver.listen { local in
+                    local.export(WireGreeter(actorSystem: serverSystem), asServerActorFor: "greeter")
+                    return await local.activateThenWaitForCancellation()
+                }
+            }
+        }
+        defer { handle.listeningTask.cancel() }
+
+        let client = XPCActorSystem("eph-serve-client")
+        let remote = try await client.makeRemoteInterface(
+            to: handle.service, assumingPeerSatisfies: nil)
+        let proxy: WireGreeter = remote.import(clientActorFor: "greeter")
+
+        let box = Box<String>()
+        let task = Task {
+            do { box.set(.success(try await proxy.greet(name: "served"))) }
+            catch { box.set(.failure(error)) }
+        }
+        guard await waitUntil({ box.outcome != nil }) else {
+            return XCTFail("the call never came back from the served ephemeral service")
+        }
+        task.cancel()
+        XCTAssertEqual(try box.outcome?.get(), "hello served")
+    }
 }
 
 /// Local, because the one in `InboundInvocationTests` is `private` to that file.
