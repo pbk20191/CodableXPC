@@ -656,7 +656,12 @@ public final class Session: SessionCoding, OutboundSession, InboundSession, @unc
             throw RemoteInvocationCancellationError.executionFailed(
                 "Failed actor's peer requirement check")
         }
-        let decoder = InvocationDecoder(direct: invocation)
+        // Apple's shape: the sender's encoder makes the `DirectInvocationDecoder`
+        // (`makeDirectInvocationDecoder(senderSession:receiverSession:)`), which the wrapper
+        // then holds. `self` is the sender, `peer` the receiver.
+        let decoder = InvocationDecoder(
+            direct: invocation.makeDirectInvocationDecoder(
+                senderSession: self, receiverSession: peer))
         // The direct handler is ungated: Apple's `DirectResultHandler.init()` takes no
         // `canThrow`, and same-process capture has no peer-written request to defend against.
         let handler = ResultHandler.direct()
