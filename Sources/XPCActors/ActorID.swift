@@ -54,7 +54,15 @@ public protocol SessionCoding: AnyObject, Sendable {
 @available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 extension CodingUserInfoKey {
     /// The `SessionCoding` an `ActorID` codes itself against.
-    public static let xpcActorSession = CodingUserInfoKey(rawValue: "XPCActors.session")!
+    ///
+    /// The raw value is Apple's own -- `"com.apple.xpc.distributed/Session"`, read out of the
+    /// `XPCDistributed` binary's `__cstring` (in the session/userInfo cluster, next to the
+    /// `"Bug in XPCDistributed: Session required in user info dictionary"` trap that reads it
+    /// back). It never crosses the wire -- it only names the slot the session travels in through
+    /// the coder's `userInfo`, exactly as Apple threads it -- so matching the string is
+    /// name-fidelity, not interop.
+    public static let xpcActorSession =
+        CodingUserInfoKey(rawValue: "com.apple.xpc.distributed/Session")!
 }
 
 /// A process-local identifier.
