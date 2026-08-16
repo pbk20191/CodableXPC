@@ -528,16 +528,21 @@ public struct InvocationDecoder: DistributedTargetInvocationDecoder, Decodable {
     /// Build the direct decoder straight from the caller's recorded invocation -- the values
     /// are already in hand (see ``InvocationEncoder``'s "nothing is encoded here").
     ///
-    /// **Delta from Apple, deliberate and unexercised.** Apple's
+    /// **Delta from Apple, deliberate and characterized.** Apple's
     /// `InvocationEncoder.makeDirectInvocationDecoder(senderSession:receiverSession:)` threads
     /// both local sessions, to *rebind* any actor reference in the arguments from the sender's
     /// session to the receiver's -- reproducing, in-process, the resolve a wire crossing would
-    /// do. This reconstruction instead carries the encoder's recorded values by reference: in a
-    /// same process that is a valid object either way, and for a local actor it is strictly
-    /// cheaper (no proxy indirection). The rebinding only becomes observable if a *distributed
-    /// actor* is passed as an argument on the direct path, which no path in this module yet
-    /// does; matching Apple's rebinding would require reading its (async-fragmented, and so
-    /// unresolved) remap logic out of the binary rather than inferring it.
+    /// do. This reconstruction instead carries the encoder's recorded values by reference.
+    ///
+    /// The two are **observably equivalent**, and this one is cheaper. A distributed actor
+    /// passed as a direct-path argument arrives as the real in-process object, so the receiver
+    /// calls back on it and gets its answer with no transport and nothing encoded; Apple's
+    /// rebinding would route that same call back through the paired local session to the same
+    /// object, one indirection more. `SameProcessOptimizationTests`'
+    /// `testADistributedActorPassedOnTheDirectPathIsCallableInProcess` pins the equivalence.
+    /// Matching Apple's rebinding byte-for-byte would require reading its (async-fragmented, and
+    /// so unresolved) remap logic out of the binary rather than inferring it, and would not
+    /// change the result.
     init(direct encoder: InvocationEncoder) {
         mode = .direct(DirectInvocationDecoder(
             arguments: encoder.arguments,

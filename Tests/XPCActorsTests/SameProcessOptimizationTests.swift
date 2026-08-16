@@ -93,6 +93,28 @@ final class SameProcessOptimizationTests: XCTestCase {
         XCTAssertTrue(bidi.isBidirectional, "a .bidirectional client must be bidirectional")
     }
 
+    /// **Delta 2, characterized.** A distributed actor passed as an argument on the direct
+    /// path is carried *by reference* rather than rebound into the receiver's session the way
+    /// Apple's `makeDirectInvocationDecoder(senderSession:receiverSession:)` does. This proves
+    /// the observable result is the same: the server receives the client's callback, calls back
+    /// on it, and -- because it is the real in-process object -- gets its answer, with no
+    /// transport and nothing encoded. (Apple's rebinding would route the call back through the
+    /// paired local session to the same object; by reference skips the indirection.)
+    func testADistributedActorPassedOnTheDirectPathIsCallableInProcess() async throws {
+        let serverSystem = XPCActorSystem("server")
+        let service = XPCActorSystem.Service.machService("com.example.sameprocess.actorarg")
+        defer { ServiceRegistry.shared.unregister(service) }
+        serve(service, on: serverSystem)
+
+        let clientSystem = XPCActorSystem("client")
+        let session = try service.connect(from: clientSystem, with: .init(options: []))
+        let proxy: DirectGreeter = session.remote.import(clientActorFor: "greeter")
+
+        let callback = DirectCallback(actorSystem: clientSystem)
+        let answer = try await proxy.callBackThrough(callback)
+        XCTAssertEqual(answer, "pong")
+    }
+
     func testADirectThrowComesBack() async throws {
         let serverSystem = XPCActorSystem("server")
         let service = XPCActorSystem.Service.machService("com.example.sameprocess.throw")
@@ -116,6 +138,19 @@ distributed actor DirectGreeter {
     distributed func greet(name: String) -> String { "hello, \(name)" }
     distributed func add(_ a: Int, _ b: Int) -> Int { a + b }
     distributed func failing() throws -> Int { throw DirectGreeterError.boom }
+
+    /// Takes a *distributed actor* as an argument and calls back on it -- the case that
+    /// exercises Apple's `makeDirectInvocationDecoder(senderSession:receiverSession:)` actor
+    /// rebinding, and the one this reconstruction carries by reference instead.
+    distributed func callBackThrough(_ callback: DirectCallback) async throws -> String {
+        try await callback.pong()
+    }
+}
+
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
+distributed actor DirectCallback {
+    typealias ActorSystem = XPCActorSystem
+    distributed func pong() -> String { "pong" }
 }
 
 enum DirectGreeterError: Error { case boom }
