@@ -72,6 +72,10 @@ public final class Transport: @unchecked Sendable {
     /// The one-shot teardown fuse; `beginCancelling` is its `compareExchange`.
     private let cancelledFuse = Atomic<Bool>(false)
 
+    /// The outbound backpressure manager, or `nil` when the policy is disabled (the default).
+    /// Apple's `Transport` holds a `BackpressureManager<ID64>`; set via ``setBackpressurePolicy(_:)``.
+    private let backpressure = Mutex<BackpressureManager<UInt64>?>(nil)
+
     /// The inbound handlers and the weakly-held session, under one `Synchronization.Mutex`.
     private struct Handlers {
         weak var inboundSession: (any InboundSession)?
@@ -227,12 +231,31 @@ public final class Transport: @unchecked Sendable {
     /// Reusing a `seq` that is still in flight fails the *new* caller rather than
     /// displacing the old one; see `RequestTable.waitForReply`.
     public func sendRequest(seq: UInt64, _ payload: Packet.Payload) async -> RequestTable.Outcome {
+        // Backpressure, when a policy is set: acquire a send slot before the request goes out
+        // and release it once its reply is in, so a fast caller cannot outrun a slow peer past
+        // the configured limit. Disabled (no manager) is the default and costs one lock read.
+        let manager = backpressure.withLock { $0 }
+        let token = await manager?.acquireSlot(for: seq, priority: Task.currentPriority)
+        defer {
+            if let token, let manager {
+                Task { await manager.releaseSlot(token: token) }
+            }
+        }
         let packet = Packet(header: .request(ID64(rawValue: seq)), payload: payload)
         // Bound to an explicitly typed local rather than passed as a literal: on Swift 6.4
         // a throwing closure literal cannot be converted to a `throws(RawTransportError)`
         // parameter. Do not inline this.
         let send: () throws(RawTransportError) -> Void = { try self.rawTransport.send(packet: packet) }
         return await requests.waitForReply(seq: seq, sending: send)
+    }
+
+    /// Apple's `Transport.setBackpressurePolicy(_:)`: bound the number of in-flight requests to
+    /// the policy's limit, or remove the bound when the policy is disabled.
+    public func setBackpressurePolicy(_ policy: XPCActorSystem.BackpressurePolicy) {
+        let manager = policy.enabled
+            ? BackpressureManager<UInt64>(N: policy.maxConcurrentRequests, enabled: true)
+            : nil
+        backpressure.withLock { $0 = manager }
     }
 
     public func sendNotification(_ payload: Packet.Payload) throws(RawTransportError) {
