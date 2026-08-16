@@ -119,11 +119,11 @@ public enum AppleCoderBridge {
     /// leaves `isAvailable` permanently `false` — the whole bridge disabled with
     /// no diagnostic, and every test that depends on it reporting a skip.
     ///
-    /// The handle is not closed on success, because the function pointer lives in
-    /// that image. Closing it is harmless in practice — this module's own
-    /// `import XPC` holds the image open regardless, which is also why the
-    /// `dlopen` cannot fail here — but using a pointer into an image you have
-    /// released is not something to rely on being harmless.
+    /// The handle is closed on success too, and it is safe to: `dlclose` only drops
+    /// *this* `dlopen`'s reference, and this module's own `import XPC` holds
+    /// `libswiftXPC` loaded regardless (which is also why the `dlopen` cannot fail
+    /// here). The image therefore stays mapped and the function pointer into it stays
+    /// valid; balancing the `dlopen` just keeps the handle from leaking.
     private static let receivedMessageInit: MakeReceivedMessage? = {
         // "$s3XPC18XPCReceivedMessageV10dictionaryAcA13XPCDictionaryV_tcfC"
         // = XPC.	.init(dictionary: XPC.XPCDictionary) -> …
@@ -134,6 +134,7 @@ public enum AppleCoderBridge {
             dlclose(image)
             return nil
         }
+        dlclose(image)
         return unsafeBitCast(symbol, to: MakeReceivedMessage.self)
     }()
 }
