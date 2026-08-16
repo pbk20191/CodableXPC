@@ -122,6 +122,41 @@ final class RealXPCEndToEndTests: XCTestCase {
         }
         withExtendedLifetime(greeter) {}
     }
+
+    /// An ``XPCActorSystem/EphemeralService`` dials a peer through the live ``XPCEndpoint`` an
+    /// anonymous `XPCListener` vended -- no launchd name anywhere -- and a call crosses real XPC
+    /// and comes back. This drives `makeRemoteInterface(to: EphemeralService)`, so it exercises
+    /// `EphemeralService.connect` (endpoint dial + activation) end to end.
+    func testACallCrossesAnEphemeralServiceEndpoint() async throws {
+        let serverSystem = XPCActorSystem("eph-server")
+        let receiver = XPCActorSystem.TransportReceiver(actorSystem: serverSystem) { local in
+            local.export(WireGreeter(actorSystem: local.session.system),
+                         asServerActorFor: "greeter")
+            return await local.activateThenWaitForCancellation()
+        }
+        let listener = XPCListener { request in
+            let (decision, raw) = XPCRawTransport.accepting(request)
+            receiver.accept(raw, debugName: "ephemeral")
+            return decision
+        }
+        defer { listener.cancel() }
+
+        let ephemeral = XPCActorSystem.EphemeralService(endpoint: listener.endpoint)
+        let client = XPCActorSystem("eph-client")
+        let remote = try await client.makeRemoteInterface(to: ephemeral, assumingPeerSatisfies: nil)
+        let proxy: WireGreeter = remote.import(clientActorFor: "greeter")
+
+        let box = Box<String>()
+        let task = Task {
+            do { box.set(.success(try await proxy.greet(name: "endpoint"))) }
+            catch { box.set(.failure(error)) }
+        }
+        guard await waitUntil({ box.outcome != nil }) else {
+            return XCTFail("the call never came back over the ephemeral endpoint")
+        }
+        task.cancel()
+        XCTAssertEqual(try box.outcome?.get(), "hello endpoint")
+    }
 }
 
 /// Local, because the one in `InboundInvocationTests` is `private` to that file.
