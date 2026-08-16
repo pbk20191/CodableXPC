@@ -235,6 +235,27 @@ extension XPCActorSystem {
         return session.remote
     }
 
+    /// Hand back the remote interface of an already-established `session`. Apple's
+    /// `makeRemoteInterface(over: Session)`. `async throws` to match Apple's signature; there
+    /// is nothing to await or fail once the session exists -- ``Session/remote`` is one word.
+    public func makeRemoteInterface(over session: Session) async throws(SetupError)
+    -> Session.RemoteInterface {
+        session.remote
+    }
+
+    /// Build a plain (remote-only) session over `transport`, activate it, and hand back its
+    /// remote interface. Apple's `makeRemoteInterface(over: Transport)` -- the counterpart of
+    /// ``makeRemoteInterface(to:)`` for a transport already in hand rather than a service being
+    /// dialled. Not bidirectional (this side imports, never exports) and the gate starts open,
+    /// the same plain-client shape ``Service/connect(from:with:)`` builds.
+    public func makeRemoteInterface(over transport: Transport) async throws(SetupError)
+    -> Session.RemoteInterface {
+        let session = makeSession(
+            over: transport, localInterfaceActivated: true, isBidirectional: false)
+        try await transport.activate()
+        return session.remote
+    }
+
     /// Dial `service`, run `perform` against its ``Session/RemoteInterface``, and close the
     /// connection when `perform` returns. Apple's
     /// `withRemoteInterface<A, B: ConnectableService>(to:assumingPeerSatisfies:perform:)`.
