@@ -299,11 +299,25 @@ public final class Session: SessionCoding, OutboundSession, InboundSession, @unc
     /// dialled without the option is not.
     let isBidirectional: Bool
 
+    /// A connection-level peer requirement, from a listener's `forPeersSatisfying:`. When set,
+    /// a request from a peer that does not satisfy it is refused before the target runs -- the
+    /// coarse counterpart of ``RestrictedAccessDistributedActor``'s per-actor requirement.
+    ///
+    /// **A designed enforcement, not Apple's.** Apple's `forPeersSatisfying` is a libxpc-level
+    /// requirement (`XPCPeerRequirement`) applied at the listener, so a non-satisfying peer is
+    /// refused before any byte. This side's ``PeerAttestation`` is message-level -- there is no
+    /// token before the first request -- so the check is made per request instead, on the first
+    /// (and every) call. `nil` on a `.local` session: a same-process peer is not attested and
+    /// needs no gate.
+    let connectionRequirement: PeerRequirement?
+
     fileprivate init(system: XPCActorSystem, transport: Transport,
-                     localInterfaceActivated: Bool, isBidirectional: Bool) {
+                     localInterfaceActivated: Bool, isBidirectional: Bool,
+                     connectionRequirement: PeerRequirement? = nil) {
         self.system = system
         self.kind = .xpc(transport)
         self.isBidirectional = isBidirectional
+        self.connectionRequirement = connectionRequirement
         self.activationEvent = ActivationEvent(posted: localInterfaceActivated)
         // Weakly, as Apple's initialiser does it (`swift_unknownObjectWeakAssign` into
         // `transport+0x10`). We hold the transport; it must not hold us back.
@@ -333,6 +347,7 @@ public final class Session: SessionCoding, OutboundSession, InboundSession, @unc
         self.system = system
         self.kind = .local(local)
         self.isBidirectional = isBidirectional
+        self.connectionRequirement = nil
         self.activationEvent = ActivationEvent(posted: localInterfaceActivated)
     }
 
@@ -873,6 +888,15 @@ public final class Session: SessionCoding, OutboundSession, InboundSession, @unc
         return peerAttestation?.satisfies(restricted.peerRequirement) == true
     }
 
+    /// The connection-level gate: satisfied when no ``connectionRequirement`` is set, otherwise
+    /// when the peer attests to satisfying it. An unattested peer (`peerAttestation == nil`)
+    /// fails a set requirement -- the same fail-closed stance ``peerSatisfiesRequirement(of:)``
+    /// takes, and for the same reason: "we cannot tell" must not read as "allowed".
+    private func peerSatisfiesConnectionRequirement() -> Bool {
+        guard let connectionRequirement else { return true }
+        return peerAttestation?.satisfies(connectionRequirement) == true
+    }
+
     /// Apple's `Session.cancel(because:)`, at the width this module has: tearing the
     /// transport down is what runs `handleTransportCancellation()`, which cancels the
     /// in-flight executions and empties the exported-actor table.
@@ -1090,6 +1114,16 @@ public final class Session: SessionCoding, OutboundSession, InboundSession, @unc
             // only other listener for this id is a `RequestTable` entry that is gone.
             // The pending-table entry still has to be drained.
             guard !Task.isCancelled else {
+                self.finishPendingInvocationExecutionTask(withID: id)
+                return
+            }
+
+            // Gate zero: the connection-level `forPeersSatisfying` requirement -- refuse the
+            // peer entirely, ahead of resolving any actor. Designed enforcement (see
+            // ``connectionRequirement``): checked per request because this side's attestation is
+            // message-level, so there is nothing to gate on before the first call arrives.
+            guard self.peerSatisfiesConnectionRequirement() else {
+                reply(Self.failure("Failed peer requirement check"))
                 self.finishPendingInvocationExecutionTask(withID: id)
                 return
             }
@@ -1398,10 +1432,12 @@ extension XPCActorSystem {
     ///   session that never answers. See ``Session/activateLocalInterface()``.
     func makeSession(over transport: Transport,
                      localInterfaceActivated: Bool = true,
-                     isBidirectional: Bool = true) -> Session {
+                     isBidirectional: Bool = true,
+                     connectionRequirement: PeerRequirement? = nil) -> Session {
         Session(system: self, transport: transport,
                 localInterfaceActivated: localInterfaceActivated,
-                isBidirectional: isBidirectional)
+                isBidirectional: isBidirectional,
+                connectionRequirement: connectionRequirement)
     }
 
     /// Vend a `.local` session -- no transport. The server end passes `peer: nil` and

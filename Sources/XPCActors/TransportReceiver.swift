@@ -39,6 +39,11 @@ extension XPCActorSystem {
         private let peerHandler: @Sendable (consuming Session.LocalInterface) async
             -> (result: (), token: Session.LocalInterface.ActivationToken)
 
+        /// A connection-level peer requirement from a listener's `forPeersSatisfying:`, carried
+        /// onto every session this receiver seats (see ``Session/connectionRequirement``). `nil`
+        /// for a listener that accepts all peers.
+        private let connectionRequirement: PeerRequirement?
+
         /// [fieldmd] `yyYbcSg`, flags 0x2 -- a `var`, and optional. Held under its own
         /// mutex; only the caller that wins the fuse trip in ``cancel()`` ever
         /// reads-and-clears it.
@@ -78,10 +83,12 @@ extension XPCActorSystem {
         /// [sym] 0x2ad4e99f0.
         public init(
             actorSystem: XPCActorSystem,
+            forPeersSatisfying connectionRequirement: PeerRequirement? = nil,
             peerHandler: @escaping @Sendable (consuming Session.LocalInterface) async
                 -> (result: (), token: Session.LocalInterface.ActivationToken)
         ) {
             self.actorSystem = actorSystem
+            self.connectionRequirement = connectionRequirement
             self.peerHandler = peerHandler
         }
 
@@ -102,7 +109,9 @@ extension XPCActorSystem {
         /// ``Session/waitForLocalInterfaceActivation()`` instead of resolving against an empty
         /// table. The gate is load-bearing here, not decorative.
         public func attachTransport(_ transport: Transport) throws(SetupError) {
-            let session = actorSystem.makeSession(over: transport, localInterfaceActivated: false)
+            let session = actorSystem.makeSession(
+                over: transport, localInterfaceActivated: false,
+                connectionRequirement: connectionRequirement)
 
             // Refuse a peer arriving after cancel. Re-checked once more at registration
             // below, since the immediate handler is spawned outside any lock.
