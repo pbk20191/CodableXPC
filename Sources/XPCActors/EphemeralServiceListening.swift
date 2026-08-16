@@ -61,8 +61,9 @@ private final class EphemeralServing: @unchecked Sendable {
 /// Suspends until the calling task is cancelled, then resumes once. What keeps
 /// `Receiver.listen` alive (and so the receiver, listener, and every served peer) for as long
 /// as the serving task runs -- Apple's `listen` is `async` and returns only when it stops.
+/// Shared with ``XPCActorSystem/InProcessService``'s `listen`, which parks the same way.
 @available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
-private final class CancellationPark: @unchecked Sendable {
+final class CancellationPark: @unchecked Sendable {
 
     private let lock = NSLock()
     private var continuation: CheckedContinuation<Void, Never>?
