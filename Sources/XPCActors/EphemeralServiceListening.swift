@@ -144,11 +144,11 @@ extension XPCActorSystem.EphemeralService {
         /// endpoint first), then parks until the serving task is cancelled -- at which point it
         /// cancels the listener and returns the ``ListeningToken`` receipt.
         ///
-        /// **`forPeersSatisfying` is accepted to match Apple's signature; accept-side
-        /// enforcement is not wired here.** Apple applies an `XPCPeerRequirement` to refuse
-        /// peers at the listener; the accepted sessions here are already live, so per-peer
-        /// requirement checking would belong on ``XPCActorSystem/Session`` (which has
-        /// `peerSatisfiesRequirement`) rather than at accept -- a known simplification.
+        /// **`forPeersSatisfying` is enforced**, as a connection-level gate carried onto each
+        /// served session (see ``XPCActorSystem/Session/connectionRequirement``). Apple applies
+        /// an `XPCPeerRequirement` at the libxpc listener, refusing a non-satisfying peer before
+        /// any byte; this side's attestation is message-level, so the check is made per request
+        /// instead -- a designed enforcement of the same intent, not the libxpc mechanism.
         @discardableResult
         public func listen(
             forPeersSatisfying requirement: PeerRequirement? = nil,
@@ -157,7 +157,8 @@ extension XPCActorSystem.EphemeralService {
                 -> (result: (), token: Session.LocalInterface.ActivationToken)
         ) async -> ListeningToken {
             let transportReceiver = XPCActorSystem.TransportReceiver(
-                actorSystem: actorSystem, peerHandler: peerHandler)
+                actorSystem: actorSystem, forPeersSatisfying: requirement,
+                peerHandler: peerHandler)
             serving.install(transportReceiver)
             await serving.park.wait()
             listener.cancel()
