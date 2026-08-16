@@ -347,59 +347,162 @@ typealias InboundThunk = (
 // MARK: - The other two associated types
 // ===========================================================================================
 
-/// The inbound half of an invocation: the Swift runtime drives this to pull the arguments
-/// back out of a `RemoteInvocationRequest` before calling the target.
+/// The same conformance test the encoder makes, and for the same reason: a name test would
+/// pass for anything a user called `$Something`. Runtime-gated because `_DistributedActorStub`
+/// is macOS 15+, above this module's floor; below it no conformer can exist and `false` is
+/// correct. Shared by both inner decoders.
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
+private func isDistributedActorStub(_ type: Any.Type) -> Bool {
+    guard #available(macOS 15, iOS 18, tvOS 18, watchOS 11, *) else { return false }
+    return type is any _DistributedActorStub.Type
+}
+
+/// Resolve the wire's generic substitutions, shared by both inner decoders.
 ///
-/// Apple's is `XPCSystem.InvocationDecoder`, a `{ mode: encoded | direct }` wrapper around
-/// `EncodedInvocationDecoder` and `DirectInvocationDecoder`, and this is that wrapper now that
-/// the same-process path is here (see ``Mode``): the encoded mode reads an
-/// ``InboundInvocation`` off the wire, the direct mode carries the caller's own recorded
-/// values and decodes nothing.
+/// **`protocolStub` is a generic substitution**, merged in *ahead of* `substitutions`. Two
+/// wire keys, one `[Any.Type]`, stub first -- Apple's
+/// `EncodedInvocationDecoder.decodeGenericSubstitutions` appends in exactly that order and the
+/// order is observable by the runtime.
 ///
-/// In the **encoded** mode it holds an ``InboundInvocation``, which has already done the hard part -- the header
-/// fields are decoded eagerly and the arguments container is retained unconsumed, because
-/// an argument's type is not known until `executeDistributedTarget` asks for it by static
-/// type. **That container is the decoder's entire state**, which is why no index is
-/// tracked here and none is tracked in Apple's either.
+/// **Anything that is not a `Distributed._DistributedActorStub` is rejected.** That is the
+/// receive-side counterpart of ``InvocationEncoder/recordGenericSubstitution(_:)`` refusing to
+/// record one: `genericSubsitutions` cannot carry a real substitution on this wire in either
+/// direction. Apple's message, verbatim. A name that does not resolve is rejected here too, by
+/// the same guard -- an unresolvable name is certainly not a stub, and this *is* the later
+/// failure ``SwiftType`` defers to, raised by the code that tried to use the type.
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
+private func resolveGenericSubstitutions(
+    protocolStub: SwiftType?, _ substitutions: [SwiftType]) throws -> [Any.Type] {
+    var wire: [SwiftType] = []
+    if let protocolStub { wire.append(protocolStub) }
+    wire.append(contentsOf: substitutions)
+    return try wire.map { named in
+        guard let type = named.type, isDistributedActorStub(type) else {
+            // Apple's literal, 38 bytes at the throw site in `0x2ad500220`. The name is
+            // appended because theirs leaves the caller with nothing to look at.
+            throw DistributedActorCodingError(
+                message: "Failed to decode generic substitution. \(named.mangledTypeName)")
+        }
+        return type
+    }
+}
+
+/// Apple's `XPCSystem.EncodedInvocationDecoder`: the encoded half. Holds an
+/// ``InboundInvocation``, which has already done the hard part -- the header fields are decoded
+/// eagerly and the arguments container is retained unconsumed, because an argument's type is
+/// not known until `executeDistributedTarget` asks for it by static type. **That container is
+/// the decoder's entire state**, which is why no index is tracked here and none is in Apple's.
 ///
-/// **The session travels with the container, not beside it.** An argument holding an
-/// `ActorID` needs `CodingUserInfoKey.xpcActorSession` to decode, and it has it: the
-/// container was vended by the decoder that read the request, so it carries that decoder's
-/// `userInfo`. There is deliberately no second `userInfo` on this type -- one would be a
-/// copy that could disagree with the one actually in force.
+/// **The session travels with the container, not beside it.** An argument holding an `ActorID`
+/// needs `CodingUserInfoKey.xpcActorSession` to decode, and it has it: the container was vended
+/// by the decoder that read the request, so it carries that decoder's `userInfo`. There is
+/// deliberately no second `userInfo` on this type -- one would be a copy that could disagree
+/// with the one actually in force.
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
+struct EncodedInvocationDecoder: DistributedTargetInvocationDecoder {
+
+    public typealias SerializationRequirement = any Codable
+
+    var invocation: InboundInvocation
+
+    init(_ invocation: InboundInvocation) { self.invocation = invocation }
+
+    mutating func decodeGenericSubstitutions() throws -> [Any.Type] {
+        try resolveGenericSubstitutions(
+            protocolStub: invocation.protocolStub, invocation.genericSubsitutions)
+    }
+
+    /// An absent `arguments` key is Apple's `nil` container and Apple's message, not a decode
+    /// failure a request away -- see ``InboundInvocation/argumentsContainer``. `decode`
+    /// advances the container's cursor in place; `self` is `mutating` so the advance is kept
+    /// (a copy that is not stored is a decoder that returns argument 0 forever).
+    mutating func decodeNextArgument<Argument: Codable>() throws -> Argument {
+        guard invocation.argumentsContainer != nil else {
+            throw DistributedActorCodingError(message: "Found no arguments from decoder.")
+        }
+        return try invocation.argumentsContainer!.decode(Argument.self)
+    }
+
+    /// The resolved `errorType`, or `nil` for a name that does not resolve -- which is not the
+    /// same as "the target cannot throw". The field whose *presence* signals throwing is read
+    /// by ``Session`` directly, off the invocation, before the decoder is handed to the runtime.
+    mutating func decodeErrorType() throws -> Any.Type? { invocation.errorType?.type }
+
+    mutating func decodeReturnType() throws -> Any.Type? { invocation.returnType?.type }
+}
+
+/// Apple's `XPCSystem.DirectInvocationDecoder`: the same-process half that ``ServiceRegistry``
+/// takes. It carries the caller's own recorded ``InvocationEncoder`` values, consumed
+/// positionally by a cursor exactly as the encoded container's own cursor is, and decodes
+/// nothing -- these are types and values this process already holds, so nothing crosses.
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
+struct DirectInvocationDecoder: DistributedTargetInvocationDecoder {
+
+    public typealias SerializationRequirement = any Codable
+
+    var arguments: [any Codable]
+    var cursor = 0
+    var protocolStub: SwiftType?
+    var genericSubsitutions: [SwiftType]
+    var returnType: SwiftType?
+    var errorType: SwiftType?
+
+    mutating func decodeGenericSubstitutions() throws -> [Any.Type] {
+        try resolveGenericSubstitutions(protocolStub: protocolStub, genericSubsitutions)
+    }
+
+    /// Hands back the caller's own value, cast to the type the runtime asks for; a mismatch is
+    /// a bug in this process rather than bad wire data. Exhaustion reports exactly as the
+    /// encoded container's does.
+    mutating func decodeNextArgument<Argument: Codable>() throws -> Argument {
+        guard cursor < arguments.count else {
+            throw DistributedActorCodingError(message: "Found no arguments from decoder.")
+        }
+        let value = arguments[cursor]
+        cursor += 1
+        guard let typed = value as? Argument else {
+            throw DistributedActorCodingError(
+                message: "direct argument is \(type(of: value)), not \(Argument.self)")
+        }
+        return typed
+    }
+
+    mutating func decodeErrorType() throws -> Any.Type? { errorType?.type }
+
+    mutating func decodeReturnType() throws -> Any.Type? { returnType?.type }
+}
+
+/// The inbound half of an invocation: the Swift runtime drives this to pull the arguments back
+/// out of a `RemoteInvocationRequest` before calling the target.
+///
+/// Apple's `XPCSystem.InvocationDecoder` is a `{ mode: encoded | direct }` **wrapper** over
+/// ``EncodedInvocationDecoder`` and ``DirectInvocationDecoder``, each a
+/// `DistributedTargetInvocationDecoder` in its own right; this is that wrapper. The runtime
+/// drives the wrapper (it is the system's `InvocationDecoder` associated type), and every call
+/// forwards to whichever inner decoder the mode holds -- same header fields, same positional
+/// argument consumption, two sources.
 @available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 public struct InvocationDecoder: DistributedTargetInvocationDecoder {
 
     public typealias SerializationRequirement = any Codable
 
-    /// Apple's `{ mode: encoded | direct }`. The **encoded** mode reads an
-    /// ``InboundInvocation`` off the wire; the **direct** mode -- the same-process path that
-    /// ``ServiceRegistry`` takes -- carries the caller's own recorded values and never
-    /// decodes a byte. Same header fields, same positional argument consumption, two sources.
     enum Mode {
-        case encoded(InboundInvocation)
-        case direct(Direct)
+        case encoded(EncodedInvocationDecoder)
+        case direct(DirectInvocationDecoder)
     }
-
-    /// The direct mode's state: the caller's ``InvocationEncoder`` values, consumed
-    /// positionally by a cursor exactly as the encoded container's own cursor is.
-    struct Direct {
-        var arguments: [any Codable]
-        var cursor = 0
-        var protocolStub: SwiftType?
-        var genericSubsitutions: [SwiftType]
-        var returnType: SwiftType?
-        var errorType: SwiftType?
-    }
-
     private var mode: Mode
 
-    public init(_ invocation: InboundInvocation) { mode = .encoded(invocation) }
+    public init(_ invocation: InboundInvocation) {
+        mode = .encoded(EncodedInvocationDecoder(invocation))
+    }
 
     /// Build the direct decoder straight from the caller's recorded invocation -- the values
-    /// are already in hand (see ``InvocationEncoder``'s "nothing is encoded here").
+    /// are already in hand (see ``InvocationEncoder``'s "nothing is encoded here"). Apple's
+    /// `InvocationEncoder.makeDirectInvocationDecoder(senderSession:receiverSession:)` resolves
+    /// the types eagerly against the sessions; this reconstruction carries the encoder's
+    /// ``SwiftType`` values and resolves them on demand, the same as the encoded path.
     init(direct encoder: InvocationEncoder) {
-        mode = .direct(Direct(
+        mode = .direct(DirectInvocationDecoder(
             arguments: encoder.arguments,
             protocolStub: encoder.protocolStub,
             genericSubsitutions: encoder.genericSubsitutions,
@@ -407,102 +510,32 @@ public struct InvocationDecoder: DistributedTargetInvocationDecoder {
             errorType: encoder.errorType))
     }
 
-    /// **`protocolStub` is a generic substitution**, and it is merged in *ahead of*
-    /// `genericSubsitutions`. Two wire keys, one `[Any.Type]`, stub first -- Apple's
-    /// `EncodedInvocationDecoder.decodeGenericSubstitutions` appends in exactly that order
-    /// and the order is observable by the runtime.
-    ///
-    /// **Anything that is not a `Distributed._DistributedActorStub` is rejected.** That is
-    /// the receive-side counterpart of ``InvocationEncoder/recordGenericSubstitution(_:)``
-    /// refusing to record one: `genericSubsitutions` cannot carry a real substitution on
-    /// this wire in either direction. Apple's message, verbatim.
-    ///
-    /// A name that does not resolve is rejected here too, and by the same guard -- an
-    /// unresolvable name is certainly not a stub. That is not in tension with
-    /// ``SwiftType``'s "resolution failure is a later failure": this *is* the later
-    /// failure, raised by the code that tried to use the type rather than by the decode.
-    ///
-    /// The direct mode carries the same two fields (stub, substitutions) and resolves them
-    /// the same way -- these are types this process already holds, so nothing crosses.
     public mutating func decodeGenericSubstitutions() throws -> [Any.Type] {
-        var wire: [SwiftType] = []
         switch mode {
-        case .encoded(let invocation):
-            if let stub = invocation.protocolStub { wire.append(stub) }
-            wire.append(contentsOf: invocation.genericSubsitutions)
-        case .direct(let direct):
-            if let stub = direct.protocolStub { wire.append(stub) }
-            wire.append(contentsOf: direct.genericSubsitutions)
-        }
-        return try wire.map { named in
-            guard let type = named.type, Self.isDistributedActorStub(type) else {
-                // Apple's literal, 38 bytes at the throw site in `0x2ad500220`. The name
-                // is appended because theirs leaves the caller with nothing to look at.
-                throw DistributedActorCodingError(
-                    message: "Failed to decode generic substitution. \(named.mangledTypeName)")
-            }
-            return type
+        case .encoded(var d): defer { mode = .encoded(d) }; return try d.decodeGenericSubstitutions()
+        case .direct(var d): defer { mode = .direct(d) }; return try d.decodeGenericSubstitutions()
         }
     }
 
-    /// Pull the next argument. Positional: a cursor is the whole state, on either source.
-    ///
-    /// An absent `arguments` key is Apple's `nil` container and Apple's message, not a
-    /// decode failure a request away -- see ``InboundInvocation/argumentsContainer``. The
-    /// direct mode never decodes: it hands back the caller's own value, cast to the type the
-    /// runtime asks for, and a mismatch is a bug in this process rather than bad wire data.
     public mutating func decodeNextArgument<Argument: Codable>() throws -> Argument {
         switch mode {
-        case .encoded(var invocation):
-            guard invocation.argumentsContainer != nil else {
-                throw DistributedActorCodingError(message: "Found no arguments from decoder.")
-            }
-            // Written back, always: `decode` advances the container's cursor, and a copy
-            // that is not stored is a decoder that returns argument 0 forever.
-            defer { mode = .encoded(invocation) }
-            return try invocation.argumentsContainer!.decode(Argument.self)
-        case .direct(var direct):
-            guard direct.cursor < direct.arguments.count else {
-                throw DistributedActorCodingError(message: "Found no arguments from decoder.")
-            }
-            let value = direct.arguments[direct.cursor]
-            direct.cursor += 1
-            mode = .direct(direct)
-            guard let typed = value as? Argument else {
-                throw DistributedActorCodingError(
-                    message: "direct argument is \(type(of: value)), not \(Argument.self)")
-            }
-            return typed
+        case .encoded(var d): defer { mode = .encoded(d) }; return try d.decodeNextArgument()
+        case .direct(var d): defer { mode = .direct(d) }; return try d.decodeNextArgument()
         }
     }
 
-    /// The resolved `errorType`, or `nil`.
-    ///
-    /// `nil` for a name that does not resolve, which is not the same message as "the target
-    /// cannot throw" -- but it is the only one this requirement can carry, and the field
-    /// whose *presence* actually signals throwing is read by ``Session`` directly, off the
-    /// invocation, before the decoder is handed to the runtime.
     public mutating func decodeErrorType() throws -> Any.Type? {
         switch mode {
-        case .encoded(let invocation): invocation.errorType?.type
-        case .direct(let direct): direct.errorType?.type
+        case .encoded(var d): defer { mode = .encoded(d) }; return try d.decodeErrorType()
+        case .direct(var d): defer { mode = .direct(d) }; return try d.decodeErrorType()
         }
     }
 
     public mutating func decodeReturnType() throws -> Any.Type? {
         switch mode {
-        case .encoded(let invocation): invocation.returnType?.type
-        case .direct(let direct): direct.returnType?.type
+        case .encoded(var d): defer { mode = .encoded(d) }; return try d.decodeReturnType()
+        case .direct(var d): defer { mode = .direct(d) }; return try d.decodeReturnType()
         }
-    }
-
-    /// The same conformance test the encoder makes, and for the same reason: a name test
-    /// would pass for anything a user called `$Something`. Runtime-gated because
-    /// `_DistributedActorStub` is macOS 15+, above this type's floor; below it no
-    /// conformer can exist and `false` is correct.
-    private static func isDistributedActorStub(_ type: Any.Type) -> Bool {
-        guard #available(macOS 15, iOS 18, tvOS 18, watchOS 11, *) else { return false }
-        return type is any _DistributedActorStub.Type
     }
 }
 
