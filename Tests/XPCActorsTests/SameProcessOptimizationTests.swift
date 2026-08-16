@@ -115,6 +115,38 @@ final class SameProcessOptimizationTests: XCTestCase {
         XCTAssertEqual(answer, "pong")
     }
 
+    /// The scoped `withRemoteInterface` runs `perform` against the dialled interface and
+    /// returns its value. The non-throwing overload.
+    func testWithRemoteInterfaceRunsPerformAndReturns() async throws {
+        let serverSystem = XPCActorSystem("server")
+        let service = XPCActorSystem.Service.machService("com.example.sameprocess.withremote")
+        defer { ServiceRegistry.shared.unregister(service) }
+        serve(service, on: serverSystem)
+
+        let client = XPCActorSystem("client")
+        let matched = try await client.withRemoteInterface(to: service) { remote in
+            let proxy: DirectGreeter = remote.import(clientActorFor: "greeter")
+            return (try? await proxy.greet(name: "scoped")) == "hello, scoped"
+        }
+        XCTAssertTrue(matched, "perform did not see the greeting through the scoped interface")
+    }
+
+    /// The throwing overload keeps the two error channels apart: `perform`'s success or
+    /// failure comes back in the `Result`, while a *setup* failure would throw `SetupError`.
+    func testWithRemoteInterfaceThrowingReturnsResult() async throws {
+        let serverSystem = XPCActorSystem("server")
+        let service = XPCActorSystem.Service.machService("com.example.sameprocess.withremote.throwing")
+        defer { ServiceRegistry.shared.unregister(service) }
+        serve(service, on: serverSystem)
+
+        let client = XPCActorSystem("client")
+        let result = try await client.withRemoteInterface(to: service) { remote in
+            let proxy: DirectGreeter = remote.import(clientActorFor: "greeter")
+            return try await proxy.greet(name: "scoped")
+        }
+        XCTAssertEqual(try result.get(), "hello, scoped")
+    }
+
     func testADirectThrowComesBack() async throws {
         let serverSystem = XPCActorSystem("server")
         let service = XPCActorSystem.Service.machService("com.example.sameprocess.throw")
