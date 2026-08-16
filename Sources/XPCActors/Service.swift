@@ -366,6 +366,28 @@ extension XPCActorSystem {
             return .failure(error)
         }
     }
+
+    /// Dial `service` bidirectionally, run `perform` against the owned
+    /// ``Session/LocalInterface`` -- which exports, activates, and does its work, returning
+    /// `(result, token)` -- and close the connection when it returns. Apple's
+    /// `withBidirectionalInterface<A, B: ConnectableService>(to:assumingPeerSatisfies:perform:)`.
+    ///
+    /// The scoped counterpart of ``makeBidirectionalInterface(to:assumingPeerSatisfies:assumeLocalInterfaceActivatedIn:)``:
+    /// there the activation runs in a `Task` that outlives the call; here it runs *inside*
+    /// `perform`, and the session is dropped -- the connection closed -- once `perform` returns
+    /// its `(result, token)`. The `token` is the activation receipt (discarded here; the
+    /// value the caller asked for is `result`).
+    public func withBidirectionalInterface<A: Sendable, S: ConnectableService>(
+        to service: S,
+        assumingPeerSatisfies requirement: PeerRequirement? = nil,
+        perform: @isolated(any) (Session.LocalInterface) async
+            -> (result: A, token: Session.LocalInterface.ActivationToken)
+    ) async throws(SetupError) -> A {
+        let session = try await service.connect(
+            from: self,
+            with: ServiceConnectArguments(peerRequirement: requirement, options: [.bidirectional]))
+        return await perform(session.local).result
+    }
 }
 
 // ===========================================================================================

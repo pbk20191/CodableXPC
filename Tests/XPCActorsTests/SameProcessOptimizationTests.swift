@@ -147,6 +147,22 @@ final class SameProcessOptimizationTests: XCTestCase {
         XCTAssertEqual(try result.get(), "hello, scoped")
     }
 
+    /// The scoped bidirectional variant runs `perform` against the owned local interface --
+    /// which exports, activates, and does its work -- and returns its result.
+    func testWithBidirectionalInterfaceRunsPerformAndReturns() async throws {
+        let serverSystem = XPCActorSystem("server")
+        let service = XPCActorSystem.Service.machService("com.example.sameprocess.withbidi")
+        defer { ServiceRegistry.shared.unregister(service) }
+        serve(service, on: serverSystem)
+
+        let client = XPCActorSystem("client")
+        let answer = try await client.withBidirectionalInterface(to: service) { local in
+            local.export(DirectCallback(actorSystem: client), asServerActorFor: "cb")
+            return await local.activateThenWithRemoteInterface { _ in 42 }
+        }
+        XCTAssertEqual(answer, 42, "withBidirectionalInterface did not return perform's result")
+    }
+
     func testADirectThrowComesBack() async throws {
         let serverSystem = XPCActorSystem("server")
         let service = XPCActorSystem.Service.machService("com.example.sameprocess.throw")
