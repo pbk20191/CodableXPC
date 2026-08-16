@@ -525,31 +525,11 @@ public struct InvocationDecoder: DistributedTargetInvocationDecoder, Decodable {
         mode = .encoded(try EncodedInvocationDecoder(from: decoder))
     }
 
-    /// Build the direct decoder straight from the caller's recorded invocation -- the values
-    /// are already in hand (see ``InvocationEncoder``'s "nothing is encoded here").
-    ///
-    /// **Delta from Apple, deliberate and characterized.** Apple's
-    /// `InvocationEncoder.makeDirectInvocationDecoder(senderSession:receiverSession:)` threads
-    /// both local sessions, to *rebind* any actor reference in the arguments from the sender's
-    /// session to the receiver's -- reproducing, in-process, the resolve a wire crossing would
-    /// do. This reconstruction instead carries the encoder's recorded values by reference.
-    ///
-    /// The two are **observably equivalent**, and this one is cheaper. A distributed actor
-    /// passed as a direct-path argument arrives as the real in-process object, so the receiver
-    /// calls back on it and gets its answer with no transport and nothing encoded; Apple's
-    /// rebinding would route that same call back through the paired local session to the same
-    /// object, one indirection more. `SameProcessOptimizationTests`'
-    /// `testADistributedActorPassedOnTheDirectPathIsCallableInProcess` pins the equivalence.
-    /// Matching Apple's rebinding byte-for-byte would require reading its (async-fragmented, and
-    /// so unresolved) remap logic out of the binary rather than inferring it, and would not
-    /// change the result.
-    init(direct encoder: InvocationEncoder) {
-        mode = .direct(DirectInvocationDecoder(
-            arguments: encoder.arguments,
-            protocolStub: encoder.protocolStub,
-            genericSubsitutions: encoder.genericSubsitutions,
-            returnType: encoder.returnType,
-            errorType: encoder.errorType))
+    /// Apple's `InvocationDecoder.init(direct: DirectInvocationDecoder)`: wrap a direct decoder
+    /// the sender's ``InvocationEncoder/makeDirectInvocationDecoder(senderSession:receiverSession:)``
+    /// built from its recorded values. The same-process path ``ServiceRegistry`` takes.
+    init(direct: DirectInvocationDecoder) {
+        mode = .direct(direct)
     }
 
     public mutating func decodeGenericSubstitutions() throws -> [Any.Type] {

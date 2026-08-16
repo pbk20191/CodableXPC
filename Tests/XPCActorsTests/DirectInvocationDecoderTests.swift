@@ -16,12 +16,25 @@ final class DirectInvocationDecoderTests: XCTestCase {
         return encoder
     }
 
+    /// The wrapper around a ``DirectInvocationDecoder`` built from the encoder's recorded
+    /// values -- the same construction `InvocationEncoder.makeDirectInvocationDecoder` performs,
+    /// without the two `Session`s that method takes only to match Apple's signature (see its
+    /// doc). Isolates the decoder's argument handoff from session plumbing.
+    private func directDecoder(_ encoder: InvocationEncoder) -> InvocationDecoder {
+        InvocationDecoder(direct: DirectInvocationDecoder(
+            arguments: encoder.arguments,
+            protocolStub: encoder.protocolStub,
+            genericSubsitutions: encoder.genericSubsitutions,
+            returnType: encoder.returnType,
+            errorType: encoder.errorType))
+    }
+
     func testDirectDecoderHandsBackRecordedArgumentsInOrder() throws {
         let encoder = try encoderRecording {
             try $0.recordArgument(RemoteCallArgument(label: nil, name: "a", value: 41))
             try $0.recordArgument(RemoteCallArgument(label: nil, name: "b", value: "hi"))
         }
-        var decoder = InvocationDecoder(direct: encoder)
+        var decoder = directDecoder(encoder)
         XCTAssertEqual(try decoder.decodeNextArgument() as Int, 41)
         XCTAssertEqual(try decoder.decodeNextArgument() as String, "hi")
     }
@@ -30,7 +43,7 @@ final class DirectInvocationDecoderTests: XCTestCase {
         let encoder = try encoderRecording {
             try $0.recordArgument(RemoteCallArgument(label: nil, name: "a", value: 1))
         }
-        var decoder = InvocationDecoder(direct: encoder)
+        var decoder = directDecoder(encoder)
         _ = try decoder.decodeNextArgument() as Int
         XCTAssertThrowsError(try decoder.decodeNextArgument() as Int) { error in
             XCTAssertTrue("\(error)".contains("Found no arguments"), "\(error)")
@@ -47,7 +60,7 @@ final class DirectInvocationDecoderTests: XCTestCase {
         let encoder = try encoderRecording {
             try $0.recordArgument(RemoteCallArgument(label: nil, name: "a", value: 7))
         }
-        var decoder = InvocationDecoder(direct: encoder)
+        var decoder = directDecoder(encoder)
         XCTAssertThrowsError(try decoder.decodeNextArgument() as String)
     }
 

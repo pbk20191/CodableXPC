@@ -175,4 +175,29 @@ public struct InvocationEncoder: DistributedTargetInvocationEncoder {
             remoteCallIdentifier: remoteCallTarget.identifier,
             contents: makeInvocationBody())
     }
+
+    /// Apple's `makeDirectInvocationDecoder(senderSession:receiverSession:)`: the same-process
+    /// counterpart of ``makeInvocationBody()``. Instead of an encoded body it produces a
+    /// ``DirectInvocationDecoder`` carrying the recorded values directly, for the peer's
+    /// `executeDistributedTarget` to drive without a byte crossing. ``Session`` wraps the result
+    /// in an ``InvocationDecoder`` (Apple's `InvocationDecoder.init(direct:)`).
+    ///
+    /// **The sessions are Apple's actor-rebinding inputs, and this reconstruction does not use
+    /// them.** Apple threads both local sessions to rebind an actor reference in the arguments
+    /// from the sender's session into the receiver's; carrying the values by reference is
+    /// observably equivalent in-process (and cheaper), as `SameProcessOptimizationTests`'
+    /// `testADistributedActorPassedOnTheDirectPathIsCallableInProcess` pins. The parameters are
+    /// kept to match Apple's signature. **Apple's is also `throws`** -- its rebinding can fail;
+    /// the by-reference path cannot, so this one does not, which keeps it callable from
+    /// ``Session``'s typed-`throws` direct send without a conversion that would never fire.
+    func makeDirectInvocationDecoder(
+        senderSession: Session, receiverSession: Session
+    ) -> DirectInvocationDecoder {
+        DirectInvocationDecoder(
+            arguments: arguments,
+            protocolStub: protocolStub,
+            genericSubsitutions: genericSubsitutions,
+            returnType: returnType,
+            errorType: errorType)
+    }
 }
