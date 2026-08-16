@@ -111,13 +111,15 @@ let package = Package(
         // and never loads it. That dylib is now the *only* thing setting this
         // target's floor: the transport speaks to `xpc_connection_t` rather than to
         // the Swift overlay's macOS 14/15 `XPCSession`/`XPCListener`/`XPCEndpoint`.
-        // `XPCOverlayCoder` is not an optional extra here: a packet body is whatever
-        // `XPCDictionary.encode(_:forKey:withUserInfo:)` produces, which is an overlay
-        // byte stream rather than a native xpc tree. `CodableXPC` remains for the
-        // native-xpc values that never cross this wire.
+        // **Standalone.** A packet body is whatever `XPCDictionary.encode(_:forKey:withUserInfo:)`
+        // produces -- an overlay byte stream, not a native xpc tree -- and `XPCActors` now calls
+        // *Apple's own* coder for it (`AppleCoder.swift` binds the exported-but-unheadered
+        // `libswiftXPC` symbols with `@_silgen_name`), so it no longer depends on the
+        // `XPCOverlayCoder` reconstruction. That reconstruction remains its own target, verified
+        // against Apple's coder in tests.
         .target(
             name: "XPCActors",
-            dependencies: ["CodableXPC", "XPCOverlayCoder"]),
+            dependencies: []),
         // Carrying Codable values over NSXPC, which can only move NSSecureCoding
         // objects. Foundation only -- no dependency on CodableXPC, and no platform
         // floor above the package's own, so a 10.13 consumer can use it.
@@ -166,10 +168,10 @@ let package = Package(
         // directly, and a transitive import is not a dependency anyone declared.
         .testTarget(
             name: "XPCActorsTests",
-            dependencies: ["XPCActors", "XPCOverlayCoder"]),
+            dependencies: ["XPCActors", "XPCOverlayCoder", "CodableXPC"]),
         .testTarget(
             name: "XPCOverlayCoderTests",
-            dependencies: ["XPCOverlayCoder"]),
+            dependencies: ["XPCOverlayCoder", "CodableXPC"]),
         // Declares a public @XPCService protocol and nothing else. Its only job is
         // to be a *different module* from the tests that consume it.
         .target(

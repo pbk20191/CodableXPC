@@ -1,6 +1,5 @@
 import Foundation
 import XPC
-import XPCOverlayCoder
 
 @available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 extension Packet {
@@ -10,10 +9,13 @@ extension Packet {
     ///
     /// Apple's `Payload.init<A>(encoding:userInfo:)` (`0x2ad4e1488`) creates an empty
     /// `XPCDictionary` and calls `XPCDictionary.encode(value, forKey: "payload",
-    /// withUserInfo:)`. That call is not a native-xpc encoder: in `libswiftXPC` it
-    /// routes through `XPCReceivedMessage.encodeMessage(_:userInfo:)`, the XPC
-    /// **overlay**'s Codable coder, whose output is a five-key envelope carrying one
-    /// `xpc_data` byte stream under `_CodableBody`.
+    /// withUserInfo:)` -- and this now calls **exactly that**, Apple's own overlay coder in
+    /// `libswiftXPC.dylib`, bound directly (see ``XPC/XPCDictionary/appleEncode(_:forKey:withUserInfo:)``
+    /// in `AppleCoder.swift`). That call is not a native-xpc encoder: inside `libswiftXPC` it
+    /// routes through `XPCReceivedMessage.encodeMessage(_:userInfo:)`, the XPC **overlay**'s
+    /// Codable coder, whose output is a five-key envelope carrying one `xpc_data` byte stream
+    /// under `_CodableBody`. Calling it directly is what lets ``XPCActors`` carry its own wire
+    /// coding with no dependency on the `XPCOverlayCoder` reconstruction.
     ///
     /// So every key name in the wire spec -- `genericSubsitutions`,
     /// `targetedSharedActor`, the `WireCode` discriminator, `_0` -- lives inside that
@@ -69,19 +71,22 @@ extension Packet {
             encoding value: T,
             userInfo: [CodingUserInfoKey: Any]
         ) throws {
-            var encoder = XPCOverlayEncoder()
-            encoder.userInfo = userInfo
-            self.init(body: try encoder.message(value))
+            // Apple's own body, called directly: an empty dictionary, then
+            // `encode(value, forKey: "payload", withUserInfo:)` -- which encodes the value into
+            // the dictionary under `payload`, leaving exactly `{ "payload": <envelope> }`.
+            let dictionary = xpc_dictionary_create(nil, nil, 0)
+            try XPCDictionary(dictionary).appleEncode(
+                value, forKey: EnvelopeKey.payload, withUserInfo: userInfo)
+            self.object = dictionary
         }
 
         public func decode<T: Decodable>(
             as type: T.Type = T.self,
             userInfo: [CodingUserInfoKey: Any] = [:]
         ) throws -> T {
-            guard let body else { throw PacketCodingError.payloadHasNoBody }
-            var decoder = XPCOverlayDecoder()
-            decoder.userInfo = userInfo
-            return try decoder.decode(type, from: body)
+            guard body != nil else { throw PacketCodingError.payloadHasNoBody }
+            return try XPCDictionary(object).appleDecode(
+                as: type, forKey: EnvelopeKey.payload, withUserInfo: userInfo)
         }
     }
 }
