@@ -256,6 +256,80 @@ extension XPCActorSystem {
         return session.remote
     }
 
+    // MARK: Bidirectional
+
+    /// Establish a **bidirectional** interface over an already-built `session`: this side both
+    /// imports the peer's actors *and* exports its own. Apple's
+    /// `makeBidirectionalInterface(over: Session, assumeLocalInterfaceActivatedIn:)`.
+    ///
+    /// `assumeLocalInterfaceActivatedIn` is handed a ``Session/LocalInterface/UncheckedHandoff``
+    /// and returns the `Task` that will `complete()` it, export on the local interface, and
+    /// activate -- the `Task<ActivationToken, Never>` whose return type is the receipt that it
+    /// did. The task runs independently (it is unstructured, so dropping the handle does not
+    /// cancel it, which is how the exported side keeps serving); this call only waits until the
+    /// local interface has actually activated before handing back the peer-facing half, so a
+    /// caller cannot use the remote interface before its own exports are answerable.
+    public func makeBidirectionalInterface(
+        over session: Session,
+        assumeLocalInterfaceActivatedIn body:
+            (Session.LocalInterface.UncheckedHandoff)
+            -> Task<Session.LocalInterface.ActivationToken, Never>
+    ) async throws(SetupError) -> Session.RemoteInterface {
+        _ = body(Session.LocalInterface.UncheckedHandoff(session))
+        await session.waitForLocalInterfaceActivation()
+        return session.remote
+    }
+
+    /// Build a bidirectional session over `transport`, activate the transport, run the
+    /// activation task, and hand back the remote interface. Apple's
+    /// `makeBidirectionalInterface(over: Transport, assumeLocalInterfaceActivatedIn:)`.
+    ///
+    /// The session starts **shut** (`localInterfaceActivated: false`): a bidirectional side
+    /// must export before it answers, and the activation task is what opens the gate once it
+    /// has -- so an inbound request that beats the exports parks rather than mis-resolving.
+    public func makeBidirectionalInterface(
+        over transport: Transport,
+        assumeLocalInterfaceActivatedIn body:
+            (Session.LocalInterface.UncheckedHandoff)
+            -> Task<Session.LocalInterface.ActivationToken, Never>
+    ) async throws(SetupError) -> Session.RemoteInterface {
+        let session = makeSession(
+            over: transport, localInterfaceActivated: false, isBidirectional: true)
+        try await transport.activate()
+        return try await makeBidirectionalInterface(
+            over: session, assumeLocalInterfaceActivatedIn: body)
+    }
+
+    /// Dial any ``ConnectableService`` bidirectionally. Apple's generic
+    /// `makeBidirectionalInterface<A: ConnectableService>(to:assumingPeerSatisfies:assumeLocalInterfaceActivatedIn:)`.
+    /// The dial carries `.bidirectional`, so `connect` builds the shut, exporting-capable
+    /// session the activation task then opens.
+    public func makeBidirectionalInterface<S: ConnectableService>(
+        to service: S,
+        assumingPeerSatisfies requirement: PeerRequirement?,
+        assumeLocalInterfaceActivatedIn body:
+            (Session.LocalInterface.UncheckedHandoff)
+            -> Task<Session.LocalInterface.ActivationToken, Never>
+    ) async throws(SetupError) -> Session.RemoteInterface {
+        let session = try await service.connect(
+            from: self,
+            with: ServiceConnectArguments(peerRequirement: requirement, options: [.bidirectional]))
+        return try await makeBidirectionalInterface(
+            over: session, assumeLocalInterfaceActivatedIn: body)
+    }
+
+    /// Dial `service` bidirectionally. Apple's concrete
+    /// `makeBidirectionalInterface(to: Service, assumeLocalInterfaceActivatedIn:)`.
+    public func makeBidirectionalInterface(
+        to service: Service,
+        assumeLocalInterfaceActivatedIn body:
+            (Session.LocalInterface.UncheckedHandoff)
+            -> Task<Session.LocalInterface.ActivationToken, Never>
+    ) async throws(SetupError) -> Session.RemoteInterface {
+        try await makeBidirectionalInterface(
+            to: service, assumingPeerSatisfies: nil, assumeLocalInterfaceActivatedIn: body)
+    }
+
     /// Dial `service`, run `perform` against its ``Session/RemoteInterface``, and close the
     /// connection when `perform` returns. Apple's
     /// `withRemoteInterface<A, B: ConnectableService>(to:assumingPeerSatisfies:perform:)`.
