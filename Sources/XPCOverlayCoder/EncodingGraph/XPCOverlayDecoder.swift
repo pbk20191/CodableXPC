@@ -202,7 +202,7 @@ final class OverlayDecoderImpl: Decoder {
     /// arguments array that actually reaches this unwrap.
     ///
     /// A previous revision of this comment cited a test that does not cover the claim:
-    /// `InboundInvocation` retains its arguments container unconsumed by design, so
+    /// `EncodedInvocationDecoder` retains its arguments container unconsumed by design, so
     /// decoding one never asks for a primitive here. Left recorded because citing
     /// evidence one does not have is the failure this project is organised against.
     static func unwrappedValue(_ value: OverlayValue) -> OverlayValue {

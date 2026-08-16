@@ -664,7 +664,7 @@ final class InvocationBodiesTests: XCTestCase {
         xpc_dictionary_set_value(contents, "genericSubsitutions", xpc_array_create(nil, 0))
         xpc_dictionary_set_value(contents, "arguments", xpc_array_create(nil, 0))
         xpc_dictionary_set_value(contents, "errorType", xpc_null_create())
-        let inbound = try XPCDecoder().decode(InboundInvocation.self, from: contents)
+        let inbound = try XPCDecoder().decode(EncodedInvocationDecoder.self, from: contents)
         // `decodeIfPresent` treats an explicit null as absent; what matters is that we
         // never *write* one. This pins the asymmetry so it is a decision, not a bug.
         XCTAssertNil(inbound.errorType)

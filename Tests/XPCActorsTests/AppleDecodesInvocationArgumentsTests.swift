@@ -6,7 +6,7 @@ import XPCOverlayCoder
 /// Apple's decoder, driven all the way through an invocation's **arguments**.
 ///
 /// `PacketBodyTests.testAppleDecodesARequestWeEncoded` stops short of this, and it
-/// cannot help it: it decodes ``InboundRequest``, and ``InboundInvocation`` retains
+/// cannot help it: it decodes ``InboundRequest``, and ``EncodedInvocationDecoder`` retains
 /// its arguments container *unconsumed* by design -- an argument's static type is not
 /// known until `executeDistributedTarget` asks for it. So Apple's decoder opens the
 /// `arguments` container there and never reads an element from it, and the header

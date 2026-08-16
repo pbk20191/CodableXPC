@@ -331,9 +331,8 @@ extension XPCActorSystem: DistributedActorSystem {
 /// It takes the instance as a parameter rather than capturing it, so it holds nothing: the
 /// system's registry is weak on purpose and a capturing thunk would quietly make it strong.
 ///
-/// The `InboundInvocation` is passed rather than an `InvocationDecoder` because the
-/// decoder is `inout` at the call site, and an `inout` parameter in a stored closure type
-/// buys nothing here -- the decoder is built inside and consumed there.
+/// The ``InvocationDecoder`` is passed by value: the runtime takes it `inout` when it
+/// drives `executeDistributedTarget`, but the thunk owns its copy and consumes it there.
 @available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 typealias InboundThunk = (
     _ instance: AnyObject,
@@ -387,11 +386,18 @@ private func resolveGenericSubstitutions(
     }
 }
 
-/// Apple's `XPCSystem.EncodedInvocationDecoder`: the encoded half. Holds an
-/// ``InboundInvocation``, which has already done the hard part -- the header fields are decoded
-/// eagerly and the arguments container is retained unconsumed, because an argument's type is
-/// not known until `executeDistributedTarget` asks for it by static type. **That container is
-/// the decoder's entire state**, which is why no index is tracked here and none is in Apple's.
+/// Apple's `XPCSystem.EncodedInvocationDecoder`: the encoded half, and a `Decodable` that
+/// decodes itself straight off the request. It does the hard part in `init(from:)` -- the
+/// header fields are decoded eagerly and the arguments container is *retained unconsumed*,
+/// because an argument's type is not known until `executeDistributedTarget` asks for it by
+/// static type. **That container is the decoder's entire state**, which is why no index is
+/// tracked here and none is in Apple's.
+///
+/// **An absent `arguments` key is not a decode failure.** `init(from:)` tests
+/// `container.contains(.arguments)` and leaves the field `nil` when the key is missing; the
+/// refusal comes later, from `decodeNextArgument` ("Found no arguments from decoder."), and
+/// only if an argument is actually asked for. A request with no `arguments` key against a
+/// zero-argument target therefore *succeeds* against a real peer.
 ///
 /// **The session travels with the container, not beside it.** An argument holding an `ActorID`
 /// needs `CodingUserInfoKey.xpcActorSession` to decode, and it has it: the container was vended
@@ -399,36 +405,49 @@ private func resolveGenericSubstitutions(
 /// deliberately no second `userInfo` on this type -- one would be a copy that could disagree
 /// with the one actually in force.
 @available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
-struct EncodedInvocationDecoder: DistributedTargetInvocationDecoder {
+public struct EncodedInvocationDecoder: DistributedTargetInvocationDecoder, Decodable {
 
     public typealias SerializationRequirement = any Codable
 
-    var invocation: InboundInvocation
+    public let protocolStub: SwiftType?
+    public let genericSubsitutions: [SwiftType]
+    public let errorType: SwiftType?
+    public let returnType: SwiftType?
+    /// `var` because decoding an element advances the container's own cursor -- that cursor is
+    /// the decoder's entire state, which is why no index is tracked.
+    public var argumentsContainer: (any UnkeyedDecodingContainer)?
 
-    init(_ invocation: InboundInvocation) { self.invocation = invocation }
-
-    mutating func decodeGenericSubstitutions() throws -> [Any.Type] {
-        try resolveGenericSubstitutions(
-            protocolStub: invocation.protocolStub, invocation.genericSubsitutions)
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: InvocationCodingKeys.self)
+        protocolStub = try container.decodeIfPresent(SwiftType.self, forKey: .protocolStub)
+        genericSubsitutions = try container.decode([SwiftType].self,
+                                                   forKey: .genericSubsitutions)
+        errorType = try container.decodeIfPresent(SwiftType.self, forKey: .errorType)
+        returnType = try container.decodeIfPresent(SwiftType.self, forKey: .returnType)
+        argumentsContainer = container.contains(.arguments)
+            ? try container.nestedUnkeyedContainer(forKey: .arguments)
+            : nil
     }
 
-    /// An absent `arguments` key is Apple's `nil` container and Apple's message, not a decode
-    /// failure a request away -- see ``InboundInvocation/argumentsContainer``. `decode`
-    /// advances the container's cursor in place; `self` is `mutating` so the advance is kept
-    /// (a copy that is not stored is a decoder that returns argument 0 forever).
-    mutating func decodeNextArgument<Argument: Codable>() throws -> Argument {
-        guard invocation.argumentsContainer != nil else {
+    public mutating func decodeGenericSubstitutions() throws -> [Any.Type] {
+        try resolveGenericSubstitutions(protocolStub: protocolStub, genericSubsitutions)
+    }
+
+    /// `decode` advances the container's cursor in place; `self` is `mutating` so the advance
+    /// is kept (a copy that is not stored is a decoder that returns argument 0 forever).
+    public mutating func decodeNextArgument<Argument: Codable>() throws -> Argument {
+        guard argumentsContainer != nil else {
             throw DistributedActorCodingError(message: "Found no arguments from decoder.")
         }
-        return try invocation.argumentsContainer!.decode(Argument.self)
+        return try argumentsContainer!.decode(Argument.self)
     }
 
     /// The resolved `errorType`, or `nil` for a name that does not resolve -- which is not the
     /// same as "the target cannot throw". The field whose *presence* signals throwing is read
-    /// by ``Session`` directly, off the invocation, before the decoder is handed to the runtime.
-    mutating func decodeErrorType() throws -> Any.Type? { invocation.errorType?.type }
+    /// by ``Session`` directly, off the decoder, before it is handed to the runtime.
+    public mutating func decodeErrorType() throws -> Any.Type? { errorType?.type }
 
-    mutating func decodeReturnType() throws -> Any.Type? { invocation.returnType?.type }
+    public mutating func decodeReturnType() throws -> Any.Type? { returnType?.type }
 }
 
 /// Apple's `XPCSystem.DirectInvocationDecoder`: the same-process half that ``ServiceRegistry``
@@ -481,8 +500,14 @@ struct DirectInvocationDecoder: DistributedTargetInvocationDecoder {
 /// drives the wrapper (it is the system's `InvocationDecoder` associated type), and every call
 /// forwards to whichever inner decoder the mode holds -- same header fields, same positional
 /// argument consumption, two sources.
+///
+/// `Decodable`, matching Apple's `InvocationDecoder.init(from:)`: decoding the wrapper decodes
+/// an ``EncodedInvocationDecoder`` into the encoded mode. The inbound request instead decodes
+/// the ``EncodedInvocationDecoder`` directly (see ``InboundRequest``), so ``Session`` can read
+/// `errorType` off it on the delivering context before the decoder is handed to the runtime;
+/// this conformance is the same shape by the other door.
 @available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
-public struct InvocationDecoder: DistributedTargetInvocationDecoder {
+public struct InvocationDecoder: DistributedTargetInvocationDecoder, Decodable {
 
     public typealias SerializationRequirement = any Codable
 
@@ -492,15 +517,27 @@ public struct InvocationDecoder: DistributedTargetInvocationDecoder {
     }
     private var mode: Mode
 
-    public init(_ invocation: InboundInvocation) {
-        mode = .encoded(EncodedInvocationDecoder(invocation))
+    public init(_ encoded: EncodedInvocationDecoder) {
+        mode = .encoded(encoded)
+    }
+
+    public init(from decoder: any Decoder) throws {
+        mode = .encoded(try EncodedInvocationDecoder(from: decoder))
     }
 
     /// Build the direct decoder straight from the caller's recorded invocation -- the values
-    /// are already in hand (see ``InvocationEncoder``'s "nothing is encoded here"). Apple's
-    /// `InvocationEncoder.makeDirectInvocationDecoder(senderSession:receiverSession:)` resolves
-    /// the types eagerly against the sessions; this reconstruction carries the encoder's
-    /// ``SwiftType`` values and resolves them on demand, the same as the encoded path.
+    /// are already in hand (see ``InvocationEncoder``'s "nothing is encoded here").
+    ///
+    /// **Delta from Apple, deliberate and unexercised.** Apple's
+    /// `InvocationEncoder.makeDirectInvocationDecoder(senderSession:receiverSession:)` threads
+    /// both local sessions, to *rebind* any actor reference in the arguments from the sender's
+    /// session to the receiver's -- reproducing, in-process, the resolve a wire crossing would
+    /// do. This reconstruction instead carries the encoder's recorded values by reference: in a
+    /// same process that is a valid object either way, and for a local actor it is strictly
+    /// cheaper (no proxy indirection). The rebinding only becomes observable if a *distributed
+    /// actor* is passed as an argument on the direct path, which no path in this module yet
+    /// does; matching Apple's rebinding would require reading its (async-fragmented, and so
+    /// unresolved) remap logic out of the binary rather than inferring it.
     init(direct encoder: InvocationEncoder) {
         mode = .direct(DirectInvocationDecoder(
             arguments: encoder.arguments,

@@ -93,43 +93,9 @@ public struct InvocationBody: Encodable {
     }
 }
 
-/// The inbound side of an invocation.
-///
-/// Not the mirror of `InvocationBody`, and it cannot be: an argument's type is not known
-/// until `executeDistributedTarget` asks for it by static type. So every header field is
-/// decoded eagerly and the arguments container is *retained unconsumed*, for the
-/// invocation decoder to drive one element at a time.
-@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
-public struct InboundInvocation: Decodable {
-
-    public let protocolStub: SwiftType?
-    public let genericSubsitutions: [SwiftType]
-    public let errorType: SwiftType?
-    public let returnType: SwiftType?
-    /// `var` because decoding an element advances the container's own cursor -- that
-    /// cursor is the decoder's entire state, which is why no index is tracked.
-    ///
-    /// **Optional, and an absent `arguments` key is not a decode failure.** Apple's
-    /// `EncodedInvocationDecoder.init(from:)` tests `container.contains(.arguments)` and
-    /// leaves the field `nil` when the key is missing; the refusal comes later, from
-    /// `decodeNextArgument` ("Found no arguments from decoder."), and only if an argument
-    /// is actually asked for. A request with no `arguments` key against a zero-argument
-    /// target therefore *succeeds* against a real peer. This was non-optional until S4 and
-    /// rejected the whole request, which refused traffic Apple accepts.
-    public var argumentsContainer: (any UnkeyedDecodingContainer)?
-
-    public init(from decoder: any Decoder) throws {
-        let container = try decoder.container(keyedBy: InvocationCodingKeys.self)
-        protocolStub = try container.decodeIfPresent(SwiftType.self, forKey: .protocolStub)
-        genericSubsitutions = try container.decode([SwiftType].self,
-                                                   forKey: .genericSubsitutions)
-        errorType = try container.decodeIfPresent(SwiftType.self, forKey: .errorType)
-        returnType = try container.decodeIfPresent(SwiftType.self, forKey: .returnType)
-        argumentsContainer = container.contains(.arguments)
-            ? try container.nestedUnkeyedContainer(forKey: .arguments)
-            : nil
-    }
-}
+// The inbound side of an invocation is Apple's `EncodedInvocationDecoder` -- a `Decodable`
+// that decodes itself off the request and retains its arguments container unconsumed. It
+// lives with the other invocation-decoder types in `XPCActorSystem.swift`.
 
 // MARK: - the request
 
@@ -183,8 +149,10 @@ public struct RemoteInvocationRequest: Encodable {
 }
 
 /// The inbound side of a request. Splits from `RemoteInvocationRequest` for the reason
-/// `InboundInvocation` splits from `InvocationBody`: the arguments cannot be decoded
-/// here.
+/// ``EncodedInvocationDecoder`` splits from `InvocationBody`: the arguments cannot be decoded
+/// here. `contents` decodes directly into the ``EncodedInvocationDecoder`` (Apple's
+/// `EncodedInvocationDecoder.init(from:)`), which ``Session`` then reads `errorType` off and
+/// wraps in an ``InvocationDecoder``.
 @available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 public struct InboundRequest: Decodable {
 
@@ -192,7 +160,7 @@ public struct InboundRequest: Decodable {
     public let basePriority: TaskPriority?
     public let targetedSharedActor: SharedActorKey
     public let remoteCallIdentifier: String
-    public var contents: InboundInvocation
+    public var contents: EncodedInvocationDecoder
 
     public init(from decoder: any Decoder) throws {
         let container = try decoder.container(
@@ -204,7 +172,7 @@ public struct InboundRequest: Decodable {
                                                    forKey: .targetedSharedActor)
         remoteCallIdentifier = try container.decode(String.self,
                                                     forKey: .remoteCallIdentifier)
-        contents = try container.decode(InboundInvocation.self, forKey: .contents)
+        contents = try container.decode(EncodedInvocationDecoder.self, forKey: .contents)
     }
 }
 
