@@ -396,4 +396,61 @@ extension XPCActorSystem {
 
 @available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 extension XPCActorSystem.Service: ConnectableService {}
+
+// ===========================================================================================
+// MARK: - EphemeralService
+// ===========================================================================================
+
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
+extension XPCActorSystem {
+
+    /// Apple's `XPCSystem.EphemeralService` -- an anonymous service addressed not by a launchd
+    /// name but by the live ``XPCEndpoint`` an anonymous `XPCListener` vended. It is `Codable`,
+    /// and that is the point: you hand a peer an `EphemeralService` (over a message, over the
+    /// XPC coder that can carry a live endpoint) and it dials you back. A ``ConnectableService``,
+    /// so every `makeRemoteInterface`/`withRemoteInterface`/`makeBidirectionalInterface` factory
+    /// accepts it.
+    ///
+    /// [sym] `endpoint : XPC.XPCEndpoint` is the sole field; `XPCEndpoint` carries its own
+    /// `Codable` in the XPC overlay, so this type's is synthesized (Apple's `(CodingKeys)` is
+    /// that synthesized enum). This is the *dialling* half; standing up the anonymous listener
+    /// that vends the endpoint (Apple's `makeEphemeralService(_:assumeActivatedIn:)`, with its
+    /// `Receiver`/`ListeningToken`) is a separate piece.
+    public struct EphemeralService: ConnectableService, Codable, Sendable {
+
+        public let endpoint: XPCEndpoint
+
+        public init(endpoint: XPCEndpoint) { self.endpoint = endpoint }
+
+        /// Dial the endpoint. The XPC path of ``Service/connect(from:with:)`` with the endpoint
+        /// in place of a launchd name, and no ``ServiceRegistry`` lookup -- an endpoint is not a
+        /// name a same-process service could be registered under.
+        public func connect(
+            from actorSystem: XPCActorSystem,
+            with arguments: ServiceConnectArguments
+        ) async throws(SetupError) -> Session {
+            let raw: XPCRawTransport
+            do {
+                raw = try XPCRawTransport.connecting(to: endpoint)
+            } catch {
+                throw SetupError("could not dial ephemeral service: \(error)")
+            }
+            if let requirement = arguments.peerRequirement {
+                raw.setPeerRequirement(requirement)
+            }
+            let transport = Transport(
+                debugName: "ephemeral", role: .initiator, rawTransport: raw)
+            let session = actorSystem.makeSession(
+                over: transport,
+                localInterfaceActivated: !arguments.options.contains(.bidirectional),
+                isBidirectional: arguments.options.contains(.bidirectional))
+            do {
+                try await transport.activate()
+            } catch {
+                throw SetupError("could not activate ephemeral service: \(error)")
+            }
+            return session
+        }
+    }
+}
 #endif
