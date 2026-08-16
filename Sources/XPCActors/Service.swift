@@ -234,6 +234,43 @@ extension XPCActorSystem {
             with: ServiceConnectArguments(peerRequirement: requirement, options: []))
         return session.remote
     }
+
+    /// Dial `service`, run `perform` against its ``Session/RemoteInterface``, and close the
+    /// connection when `perform` returns. Apple's
+    /// `withRemoteInterface<A, B: ConnectableService>(to:assumingPeerSatisfies:perform:)`.
+    ///
+    /// The interface -- and so the session -- lives only for the duration of `perform`: it is
+    /// dropped at return, and dropping it closes the connection, the module's lifetime rule
+    /// (see ``makeRemoteInterface(to:)``). A setup failure throws `SetupError`; `perform`
+    /// itself cannot throw in this overload.
+    public func withRemoteInterface<A: Sendable, S: ConnectableService>(
+        to service: S,
+        assumingPeerSatisfies requirement: PeerRequirement? = nil,
+        perform: @isolated(any) (Session.RemoteInterface) async -> A
+    ) async throws(SetupError) -> A {
+        let remote = try await makeRemoteInterface(to: service, assumingPeerSatisfies: requirement)
+        return await perform(remote)
+    }
+
+    /// The throwing counterpart. Apple's
+    /// `withRemoteInterface<A, B: Error, C: ConnectableService>(to:assumingPeerSatisfies:perform:)`.
+    ///
+    /// **Two error channels, kept apart.** A *setup* failure (the dial) throws `SetupError`;
+    /// a failure inside `perform` is captured into the returned `Result<A, E>` rather than
+    /// thrown, so a caller can tell "could not connect" from "the work failed" without
+    /// inspecting an error's type. Apple's signature returns exactly this `Result`.
+    public func withRemoteInterface<A: Sendable, E: Error, S: ConnectableService>(
+        to service: S,
+        assumingPeerSatisfies requirement: PeerRequirement? = nil,
+        perform: @isolated(any) (Session.RemoteInterface) async throws(E) -> A
+    ) async throws(SetupError) -> Result<A, E> {
+        let remote = try await makeRemoteInterface(to: service, assumingPeerSatisfies: requirement)
+        do {
+            return .success(try await perform(remote))
+        } catch {
+            return .failure(error)
+        }
+    }
 }
 
 // ===========================================================================================
