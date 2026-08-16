@@ -1,4 +1,5 @@
 import XCTest
+import Distributed
 @testable import XPCActors
 
 /// ``BackpressureManager`` -- the actor that bounds in-flight requests for a
@@ -64,6 +65,37 @@ final class BackpressureTests: XCTestCase {
         waiter.cancel()
         let resumed = await waitUntil { done.isSet }
         XCTAssertTrue(resumed, "a cancelled waiter must be resumed (nil), never left dangling")
+    }
+
+    /// Integration: a policy set on a real (in-process transport) connection bounds the send
+    /// path without breaking it -- several concurrent calls through a limit of 2 all complete,
+    /// the third waiting for a slot to free rather than deadlocking or being dropped.
+    func testABoundedConnectionStillCarriesConcurrentCalls() async throws {
+        let serverSystem = XPCActorSystem("bp-server")
+        let service = XPCActorSystem.InProcessService("test.backpressure.integration")
+        let listening = Task {
+            try await serverSystem.listen(on: service) { local in
+                local.export(DirectGreeter(actorSystem: serverSystem), asServerActorFor: "greeter")
+                return await local.activateThenWaitForCancellation()
+            }
+        }
+        defer { listening.cancel() }
+        guard await waitUntil({
+            InProcessListenerRegistry.shared.receiver(for: service.name) != nil
+        }) else {
+            return XCTFail("the in-process listener never registered")
+        }
+
+        let client = XPCActorSystem("bp-client")
+        let remote = try await client.makeRemoteInterface(to: service)
+        remote.setBackpressurePolicy(.custom(maxConcurrentRequests: 2))
+        let proxy: DirectGreeter = remote.import(clientActorFor: "greeter")
+
+        async let a = proxy.greet(name: "1")
+        async let b = proxy.greet(name: "2")
+        async let c = proxy.greet(name: "3")
+        let results = try await [a, b, c]
+        XCTAssertEqual(Set(results), ["hello, 1", "hello, 2", "hello, 3"])
     }
 
     func testPolicyFactories() {

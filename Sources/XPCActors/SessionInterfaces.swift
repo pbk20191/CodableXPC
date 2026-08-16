@@ -313,5 +313,12 @@ extension Session {
             guard let attestation = session.peerAttestation else { return nil }
             return attestation.satisfies(requirement)
         }
+
+        /// Apple's `Session.RemoteInterface.setBackpressurePolicy(_:)`: bound the number of
+        /// in-flight requests on this connection. A no-op on a same-process `.local` session,
+        /// which has no transport to bound.
+        public func setBackpressurePolicy(_ policy: XPCActorSystem.BackpressurePolicy) {
+            session.setBackpressurePolicy(policy)
+        }
     }
 }

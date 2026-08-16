@@ -126,6 +126,16 @@ public final class Session: SessionCoding, OutboundSession, InboundSession, @unc
         return transport
     }
 
+    /// Apply an outbound backpressure policy to this session's transport. A `.local`
+    /// (same-process, direct-invocation) session has no transport to bound, so this is a no-op
+    /// there -- backpressure is a wire concept. Reached through
+    /// ``RemoteInterface/setBackpressurePolicy(_:)``.
+    func setBackpressurePolicy(_ policy: XPCActorSystem.BackpressurePolicy) {
+        if case .xpc(let transport) = kind {
+            transport.setBackpressurePolicy(policy)
+        }
+    }
+
     /// Which actor system this session belongs to. See ``SessionCoding/systemID``.
     ///
     /// Now derived rather than stored: the previous slice stored an `ID64` beside a
