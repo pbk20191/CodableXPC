@@ -3,6 +3,30 @@ import Foundation
 import XPC
 
 // ===========================================================================================
+// MARK: - ConnectableService
+// ===========================================================================================
+
+/// Apple's `XPCSystem.ConnectableService` -- the one thing a dial-able service must do: hand
+/// back a live ``XPCActorSystem/Session`` speaking to a peer. ``XPCActorSystem/Service``
+/// conforms, and (in a later phase) `EphemeralService` will too; the generic
+/// `makeRemoteInterface`/`makeBidirectionalInterface`/`withRemoteInterface` factories are
+/// written over it.
+///
+/// **Rendered top-level, not nested.** Apple declares it `XPCSystem.ConnectableService`; this
+/// module renders every protocol Apple nests in `XPCSystem` at top level, the same convention
+/// ``SessionCoding``, ``PeerAttestation`` and ``RestrictedAccessDistributedActor`` already take.
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
+public protocol ConnectableService {
+
+    /// Apple's `ConnectableService.connect(from:with:)`. **`async`** because a dial can await:
+    /// an ephemeral service exchanges an endpoint, and a launchd service activates its session.
+    func connect(
+        from system: XPCActorSystem,
+        with arguments: XPCActorSystem.ServiceConnectArguments
+    ) async throws(SetupError) -> Session
+}
+
+// ===========================================================================================
 // MARK: - Service
 // ===========================================================================================
 
@@ -95,9 +119,9 @@ extension XPCActorSystem {
         /// optimization for service %s'` and `'preserveSelfIPC set, forcing XPC for service
         /// %s'`. The `.local` session, its `LocalSessionState` peer, and the direct-invocation
         /// path are all here now; see ``Session/Kind`` and ``ServiceRegistry``.
-        func connect(
+        public func connect(
             from actorSystem: XPCActorSystem, with arguments: ServiceConnectArguments
-        ) throws(SetupError) -> Session {
+        ) async throws(SetupError) -> Session {
             // Apple's body first consults the process-wide registry: a service served in
             // this same process is reached directly unless `preserveSelfIPC` forces XPC.
             if let local = ServiceRegistry.shared.lookUpAndConnect(
@@ -191,23 +215,31 @@ extension XPCActorSystem {
     /// the `RemoteInterface` struct, which is one word. Drop the interface and the connection
     /// closes, which is the lifetime rule the whole module runs on: nothing global keeps a
     /// conversation alive.
-    public func makeRemoteInterface(to service: Service) throws(SetupError)
+    public func makeRemoteInterface(to service: Service) async throws(SetupError)
     -> Session.RemoteInterface {
-        try makeRemoteInterface(to: service, assumingPeerSatisfies: nil)
+        try await makeRemoteInterface(to: service, assumingPeerSatisfies: nil)
     }
 
-    /// Dial `service`, refusing unless the peer satisfies `requirement`.
+    /// Dial any ``ConnectableService``, refusing unless the peer satisfies `requirement`.
+    /// Apple's generic `makeRemoteInterface<A: ConnectableService>(to:assumingPeerSatisfies:)`.
     ///
     /// The requirement is applied to the `XPCSession` *before* it is activated, so it is
     /// libxpc that refuses rather than us -- which matters, because it means no byte of ours
     /// ever reaches a peer that fails it.
-    public func makeRemoteInterface(
-        to service: Service, assumingPeerSatisfies requirement: PeerRequirement?
-    ) throws(SetupError) -> Session.RemoteInterface {
-        let session = try service.connect(
+    public func makeRemoteInterface<S: ConnectableService>(
+        to service: S, assumingPeerSatisfies requirement: PeerRequirement?
+    ) async throws(SetupError) -> Session.RemoteInterface {
+        let session = try await service.connect(
             from: self,
             with: ServiceConnectArguments(peerRequirement: requirement, options: []))
         return session.remote
     }
 }
+
+// ===========================================================================================
+// MARK: - Service : ConnectableService
+// ===========================================================================================
+
+@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
+extension XPCActorSystem.Service: ConnectableService {}
 #endif

@@ -26,7 +26,7 @@ final class SameProcessOptimizationTests: XCTestCase {
         serve(service, on: serverSystem)
 
         let clientSystem = XPCActorSystem("client")
-        let session = try service.connect(from: clientSystem, with: .init(options: []))
+        let session = try await service.connect(from: clientSystem, with: .init(options: []))
         let proxy: DirectGreeter = session.remote.import(clientActorFor: "greeter")
 
         let result = try await proxy.greet(name: "world")
@@ -39,7 +39,7 @@ final class SameProcessOptimizationTests: XCTestCase {
         defer { ServiceRegistry.shared.unregister(service) }
         serve(service, on: serverSystem)
 
-        let session = try service.connect(from: XPCActorSystem("client"), with: .init(options: []))
+        let session = try await service.connect(from: XPCActorSystem("client"), with: .init(options: []))
         let proxy: DirectGreeter = session.remote.import(clientActorFor: "greeter")
         let sum = try await proxy.add(3, 4)
         XCTAssertEqual(sum, 7)
@@ -62,7 +62,7 @@ final class SameProcessOptimizationTests: XCTestCase {
         ServiceRegistry.shared.register(
             service, receiver: receiver, actorSystem: serverSystem, targetQueue: nil)
 
-        let session = try service.connect(from: XPCActorSystem("client"), with: .init(options: []))
+        let session = try await service.connect(from: XPCActorSystem("client"), with: .init(options: []))
         let proxy: DirectGreeter = session.remote.import(clientActorFor: "greeter")
         _ = try await proxy.greet(name: "x")   // establish the pair; the server handler parks
         XCTAssertFalse(released.isSet, "the server handler released before the client went away")
@@ -79,16 +79,16 @@ final class SameProcessOptimizationTests: XCTestCase {
     /// The `isBidirectional` axis is wired from the connect option, and it is distinct from
     /// the activation-gate default. A plain client is not bidirectional (exporting on it would
     /// trap); a `.bidirectional` one is.
-    func testTheBidirectionalAxisFollowsTheConnectOption() throws {
+    func testTheBidirectionalAxisFollowsTheConnectOption() async throws {
         let serverSystem = XPCActorSystem("server")
         let service = XPCActorSystem.Service.machService("com.example.sameprocess.bidi")
         defer { ServiceRegistry.shared.unregister(service) }
         serve(service, on: serverSystem)
 
-        let plain = try service.connect(from: XPCActorSystem("c1"), with: .init(options: []))
+        let plain = try await service.connect(from: XPCActorSystem("c1"), with: .init(options: []))
         XCTAssertFalse(plain.isBidirectional, "a plain client must not be bidirectional")
 
-        let bidi = try service.connect(
+        let bidi = try await service.connect(
             from: XPCActorSystem("c2"), with: .init(options: [.bidirectional]))
         XCTAssertTrue(bidi.isBidirectional, "a .bidirectional client must be bidirectional")
     }
@@ -107,7 +107,7 @@ final class SameProcessOptimizationTests: XCTestCase {
         serve(service, on: serverSystem)
 
         let clientSystem = XPCActorSystem("client")
-        let session = try service.connect(from: clientSystem, with: .init(options: []))
+        let session = try await service.connect(from: clientSystem, with: .init(options: []))
         let proxy: DirectGreeter = session.remote.import(clientActorFor: "greeter")
 
         let callback = DirectCallback(actorSystem: clientSystem)
@@ -121,7 +121,7 @@ final class SameProcessOptimizationTests: XCTestCase {
         defer { ServiceRegistry.shared.unregister(service) }
         serve(service, on: serverSystem)
 
-        let session = try service.connect(from: XPCActorSystem("client"), with: .init(options: []))
+        let session = try await service.connect(from: XPCActorSystem("client"), with: .init(options: []))
         let proxy: DirectGreeter = session.remote.import(clientActorFor: "greeter")
         do {
             _ = try await proxy.failing()
