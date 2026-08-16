@@ -1,4 +1,5 @@
 import Distributed
+import Synchronization
 
 // ===========================================================================================
 // MARK: - The two faces of a session
@@ -194,6 +195,47 @@ extension Session {
             }
 
             public init(id: ID64) { self.id = id }
+        }
+
+        // ---------------------------------------------------------------------------------
+        // MARK: UncheckedHandoff
+        // ---------------------------------------------------------------------------------
+
+        /// Apple's `Session.LocalInterface.UncheckedHandoff`: a one-shot, `@unchecked Sendable`
+        /// carrier that moves this not-yet-activated local interface into the caller's
+        /// activation closure -- the `assumeLocalInterfaceActivatedIn:` of
+        /// ``XPCActorSystem/makeBidirectionalInterface(over:assumeLocalInterfaceActivatedIn:)``.
+        /// The closure returns a `Task` that ``complete()``s the handoff, exports on the
+        /// interface it gets back, and activates -- producing the ``ActivationToken`` receipt.
+        ///
+        /// [refl] `(Box).mutex : Synchronization.Mutex<Session?>` -- the session lives in a
+        /// reference `Box`'s mutex, which is what lets the value-typed handoff cross an
+        /// isolation boundary the compiler could not otherwise prove safe; hence "unchecked".
+        /// [sym] `init(Session)`, `complete() -> LocalInterface`.
+        public struct UncheckedHandoff: @unchecked Sendable {
+
+            private final class Box {
+                let mutex: Mutex<Session?>
+                init(_ session: Session) { mutex = Mutex(session) }
+            }
+            private let box: Box
+
+            init(_ session: Session) { box = Box(session) }
+
+            /// Take the local interface out of the handoff. **One-shot:** the session leaves
+            /// the mutex on the first call, so a second traps -- an interface handed off once
+            /// cannot be claimed twice. [sym] `complete() -> LocalInterface`.
+            public func complete() -> LocalInterface {
+                let session = box.mutex.withLock { held -> Session in
+                    guard let session = held else {
+                        preconditionFailure(
+                            "UncheckedHandoff.complete() called more than once")
+                    }
+                    held = nil
+                    return session
+                }
+                return LocalInterface(session: session)
+            }
         }
     }
 
