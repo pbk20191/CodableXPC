@@ -1,5 +1,7 @@
 .DS_Store
 /.build
+Demo/.build
+Demo/.swiftpm
 /Packages
 /*.xcodeproj
 xcuserdata/
@@ -7,3 +9,9 @@ DerivedData/
 .swiftpm/config/registries.json
 .swiftpm/xcode/package.xcworkspace/contents.xcworkspacedata
 .netrc
+
+# Reverse-engineering artifacts kept locally only, never committed: Apple binary
+# decompilations and interop probes. Removed from history; do not re-add.
+/xpcdump/
+/xpcDistributed/
+/Tools/

@@ -6,6 +6,7 @@
 //
 
 import Foundation
+import XPCDispatchDataBridge
 #if canImport(XPC)
 import XPC
 
@@ -13,9 +14,21 @@ import XPC
 
 internal extension Date {
     
+    /// `xpc_date_create` takes nanoseconds in an `Int64`, which reaches roughly
+    /// ±292 years around 1970. `Date.distantPast` and `Date.distantFuture` are
+    /// thousands of years outside it, and the conversion used to trap on the way
+    /// — a crash, in an encoder, for a value `Date` hands out as a constant.
     @usableFromInline
-    var xpcRepresentation:xpc_object_t {
-        xpc_date_create(Int64.init(timeIntervalSince1970 * 1_000_000_000))
+    func xpcRepresentation(at path: [any CodingKey]) throws -> xpc_object_t {
+        let nanos = timeIntervalSince1970 * 1_000_000_000
+        guard nanos >= -9.223372036854775e18, nanos <= 9.223372036854775e18,
+              nanos.isFinite else {
+            throw EncodingError.invalidValue(self, .init(
+                codingPath: path,
+                debugDescription: "an xpc date is nanoseconds in an Int64, which "
+                    + "reaches about ±292 years around 1970; this one is outside that"))
+        }
+        return xpc_date_create(Int64(nanos))
     }
 
     @usableFromInline
@@ -39,13 +52,42 @@ internal extension UUID {
     
 }
 
+internal extension String {
+
+    /// `xpc_string_create` takes a C string, so it stops at the first NUL while a
+    /// Swift `String` may contain one. Encoding such a value would silently drop
+    /// everything after it, which is worse than refusing.
+    @usableFromInline
+    func xpcString(at path: [any CodingKey]) throws -> xpc_object_t {
+        // memchr rather than `utf8.contains(0)`: the scan is unavoidable, but the
+        // element-by-element version dominated string encoding -- 18x the cost of
+        // xpc_string_create itself, and far worse without optimisation.
+        //
+        // Going through `(self as NSString).utf8String` and checking with `strlen`
+        // was measured and is no faster. That pointer really is free and really
+        // does alias the string's own storage, but the cost here is not the
+        // bridging: it is the one copy libxpc has to make to own the bytes, which
+        // runs at memcpy speed either way.
+        let hasNul = utf8.withContiguousStorageIfAvailable {
+            memchr($0.baseAddress, 0, $0.count) != nil
+        } ?? utf8.contains(0)
+        guard !hasNul else {
+            throw EncodingError.invalidValue(self, .init(
+                codingPath: path,
+                debugDescription: "an xpc string cannot carry an embedded NUL; "
+                    + "this one would be truncated there, silently, so it is refused"))
+        }
+        return xpc_string_create(self)
+    }
+}
+
 internal extension Data {
     
+    /// Routed through ``DispatchDataBridge``, which takes the cheaper of two
+    /// copies at size and the plain one below it.
     @usableFromInline
     var xpcData: xpc_object_t {
-        return withUnsafeBytes {
-            xpc_data_create($0.baseAddress, $0.count)
-        }
+        DispatchDataBridge.xpcData(for: self)
     }
     
     
@@ -55,7 +97,8 @@ internal extension Data {
 internal func xpcTypeName(_ type:xpc_type_t) -> String {
     
     if #available(macOS 10.15, macCatalyst 13.1, *) {
-        return String(cString: xpc_type_get_name(type))
+        
+        return CFStringCreateWithCStringNoCopy(nil, xpc_type_get_name(type), CFStringBuiltInEncodings.UTF8.rawValue, kCFAllocatorNull) as String
     } else {
         switch type {
         case XPC_TYPE_NULL:

@@ -103,7 +103,7 @@ private class _XPCEncoderImp: Encoder, SingleValueEncodingContainer {
     
     func encode(_ value: String) throws {
         assertCanEncodeNewValue()
-        xpc = xpc_string_create(value)
+        xpc = try value.xpcString(at: codingPath)
     }
     
     func encode(_ value: Double) throws {
@@ -164,18 +164,13 @@ private class _XPCEncoderImp: Encoder, SingleValueEncodingContainer {
     func encode<T>(_ value: T) throws where T : Encodable {
         assertCanEncodeNewValue()
         switch value {
+        case let native as XPCNativeObject:
+            xpc = native.object
         case let data as Data:
             xpc = data.xpcData
             break
-        case let fd as any XPCFileDescriptorProtocol:
-            if let xpcObject = xpc_fd_create(fd.rawValue) {
-                xpc = xpcObject
-            } else {
-                let context = EncodingError.Context(codingPath: codingPath, debugDescription: "XPC doesn't recognize this FileDescriptor")
-                throw EncodingError.invalidValue(fd, context)
-            }
         case let date as Date:
-           xpc = date.xpcRepresentation
+           xpc = try date.xpcRepresentation(at: codingPath)
         case let uid as UUID:
             xpc = uid.xpcUUID
             break
@@ -204,7 +199,7 @@ private struct _XPCKeyedEncodingContainer<Key : CodingKey>: KeyedEncodingContain
     }
     
     mutating func encode(_ value: String, forKey key: Key) throws {
-        xpc_dictionary_set_value(ref, key.stringValue, xpc_string_create(value))
+        xpc_dictionary_set_value(ref, key.stringValue, try value.xpcString(at: codingPath + [key]))
     }
     
     mutating func encode(_ value: Double, forKey key: Key) throws {
@@ -257,18 +252,13 @@ private struct _XPCKeyedEncodingContainer<Key : CodingKey>: KeyedEncodingContain
     
     mutating func encode<T>(_ value: T, forKey key: Key) throws where T : Encodable {
         switch value {
+        case let native as XPCNativeObject:
+            xpc_dictionary_set_value(ref, key.stringValue, native.object)
         case let data as Data:
             xpc_dictionary_set_value(ref, key.stringValue, data.xpcData)
             break
-        case let fd as any XPCFileDescriptorProtocol:
-            if let xpcObject = xpc_fd_create(fd.rawValue) {
-                xpc_dictionary_set_value(ref, key.stringValue, xpcObject)
-            } else {
-                let context = EncodingError.Context(codingPath: codingPath, debugDescription: "XPC doesn't recognize this FileDescriptor")
-                throw EncodingError.invalidValue(fd, context)
-            }
         case let date as Date:
-            xpc_dictionary_set_value(ref, key.stringValue, date.xpcRepresentation)
+            xpc_dictionary_set_value(ref, key.stringValue, try date.xpcRepresentation(at: codingPath + [key]))
         case let uid as UUID:
             xpc_dictionary_set_value(ref, key.stringValue, uid.xpcUUID)
             break
@@ -288,7 +278,7 @@ private struct _XPCKeyedEncodingContainer<Key : CodingKey>: KeyedEncodingContain
         let newPath = codingPath + [key]
         let newRef = xpc_dictionary_create(nil, nil, 0)
         xpc_dictionary_set_value(ref, key.stringValue, newRef)
-        let childContainer = _XPCKeyedEncodingContainer<NestedKey>(ref: ref, path: newPath, userInfo: userInfo)
+        let childContainer = _XPCKeyedEncodingContainer<NestedKey>(ref: newRef, path: newPath, userInfo: userInfo)
         return KeyedEncodingContainer<NestedKey>(childContainer)
     }
     
@@ -296,7 +286,7 @@ private struct _XPCKeyedEncodingContainer<Key : CodingKey>: KeyedEncodingContain
         let newPath = codingPath + [key]
         let newRef =  xpc_array_create(nil, 0)
         xpc_dictionary_set_value(ref, key.stringValue, newRef)
-        let childContainer = _XPCUnkeyedEncodingContainer(ref: ref, path: newPath, userInfo: userInfo)
+        let childContainer = _XPCUnkeyedEncodingContainer(ref: newRef, path: newPath, userInfo: userInfo)
         return childContainer
     }
     
@@ -367,7 +357,7 @@ private struct _XPCUnkeyedEncodingContainer: UnkeyedEncodingContainer {
     }
     
     mutating func encode(_ value: String) throws {
-        xpc_array_append_value(ref, xpc_string_create(value))
+        xpc_array_append_value(ref, try value.xpcString(at: codingPath))
     }
     
     mutating func encode(_ value: Double) throws {
@@ -420,19 +410,13 @@ private struct _XPCUnkeyedEncodingContainer: UnkeyedEncodingContainer {
     
     mutating func encode<T>(_ value: T) throws where T : Encodable {
         switch value {
+        case let native as XPCNativeObject:
+            xpc_array_append_value(ref, native.object)
         case let data as Data:
             xpc_array_append_value(ref, data.xpcData)
             break
-        case let fd as any XPCFileDescriptorProtocol:
-            if let xpcObject = xpc_fd_create(fd.rawValue) {
-                
-                xpc_array_append_value(ref, xpcObject)
-            } else {
-                let context = EncodingError.Context(codingPath: codingPath, debugDescription: "XPC doesn't recognize this FileDescriptor")
-                throw EncodingError.invalidValue(fd, context)
-            }
         case let date as Date:
-            xpc_array_append_value(ref, date.xpcRepresentation)
+            xpc_array_append_value(ref, try date.xpcRepresentation(at: codingPath))
         case let uid as UUID:
             xpc_array_append_value(ref, uid.xpcUUID)
             break

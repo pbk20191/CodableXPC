@@ -100,11 +100,14 @@ extension _XPCDecoderImp: SingleValueDecodingContainer {
             throw DecodingError.typeMismatch(type, context)
         }
 
-        let buffer = UnsafeBufferPointer(
-            start: xpc_string_get_string_ptr(ref),
-            count: xpc_string_get_length(ref) + 1
-        ).map{ $0 }
-        return String(cString: buffer)
+        // `String(cString:)` reads the NUL-terminated buffer straight from libxpc.
+        // Copying it into a Swift array first, which is what `.map { $0 }` did,
+        // cost more than every other part of decoding a string put together.
+        guard let cString = xpc_string_get_string_ptr(ref) else {
+            throw DecodingError.dataCorrupted(.init(
+                codingPath: codingPath, debugDescription: "xpc string with no bytes"))
+        }
+        return String(cString: cString)
     }
     
     func decode(_ type: Double.Type) throws -> Double {
@@ -158,21 +161,8 @@ extension _XPCDecoderImp: SingleValueDecodingContainer {
     func decode<T>(_ type: T.Type) throws -> T where T : Decodable {
         let xpcType = xpc_get_type(ref)
         switch type {
-        case is any XPCFileDescriptorProtocol.Type:
-            guard xpcType == XPC_TYPE_FD else {
-                let context = DecodingError.Context(codingPath: codingPath, debugDescription: "expected FileDescriptor but found \(xpcTypeName(xpcType)) instead")
-                throw DecodingError.typeMismatch(type, context)
-            }
-            let rawFd = xpc_fd_dup(ref)
-            guard rawFd != -1 else {
-                let context = DecodingError.Context(codingPath: codingPath, debugDescription: "can't retreive FileDescriptor from xpc framework")
-                throw DecodingError.dataCorrupted(context)
-            }
-            guard let actualFd = (type as! any XPCFileDescriptorProtocol.Type).init(rawValue: rawFd) else {
-                let context = DecodingError.Context(codingPath: codingPath, debugDescription: "can't create \(type) from valid fileDescriptor \(rawFd)")
-                throw DecodingError.dataCorrupted(context)
-            }
-            return actualFd as! T
+        case is XPCNativeObject.Type:
+            return XPCNativeObject(ref) as! T
         case is UUID.Type:
             guard xpcType == XPC_TYPE_UUID else {
                 let context = DecodingError.Context(
@@ -248,7 +238,16 @@ extension _XPCDecoderImp: SingleValueDecodingContainer {
         switch xpcType {
         case XPC_TYPE_DOUBLE:
             let rawValue = xpc_double_get_value(ref)
-            return rawValue.isSignalingNaN ? T.signalingNaN : .init(rawValue)
+            if rawValue.isSignalingNaN { return T.signalingNaN }
+            let converted = T(rawValue)
+            // Rounding is expected -- 0.1 is not representable as a Float either.
+            // Turning a finite number into an infinity is not rounding.
+            guard rawValue.isFinite == converted.isFinite else {
+                throw DecodingError.typeMismatch(type, DecodingError.Context(
+                    codingPath: codingPath,
+                    debugDescription: "\(rawValue) overflows \(type)"))
+            }
+            return converted
         case XPC_TYPE_INT64:
             let rawValue = xpc_int64_get_value(ref)
             if let realValue = T.init(exactly: rawValue) {
@@ -288,12 +287,12 @@ private struct _XPCUnKeyedDecodingContainer: UnkeyedDecodingContainer {
             let context = DecodingError.Context(codingPath: currentPath, debugDescription: "Expected String but found \(xpcTypeName(xpcType)) instead")
             throw DecodingError.typeMismatch(type, context)
         }
-        let buffer = UnsafeBufferPointer(
-            start: xpc_string_get_string_ptr(object),
-            count: xpc_string_get_length(object) + 1
-        ).map{ $0 }
+        guard let cString = xpc_string_get_string_ptr(object) else {
+            throw DecodingError.dataCorrupted(.init(
+                codingPath: currentPath, debugDescription: "xpc string with no bytes"))
+        }
         currentIndex += 1
-        return String(cString: buffer)
+        return String(cString: cString)
     }
     
     mutating func decode(_ type: Double.Type) throws -> Double {
@@ -354,26 +353,9 @@ private struct _XPCUnKeyedDecodingContainer: UnkeyedDecodingContainer {
         let xpcType = xpc_get_type(object)
         let value:T
         switch type {
-        case is any XPCFileDescriptorProtocol.Type:
-            guard xpcType == XPC_TYPE_FD else {
-                let context = DecodingError.Context(
-                    codingPath: currentPath,
-                    debugDescription: "Expected FileDescriptor but found \(xpcTypeName(xpcType)) instead"
-                )
-                throw DecodingError.typeMismatch(type, context)
-            }
-            let rawFD = xpc_fd_dup(object)
-            guard rawFD != -1 else {
-                let context = DecodingError.Context(codingPath: currentPath, debugDescription: "XPC Frame work failed recognize FileDescriptor ")
-                throw DecodingError.dataCorrupted(context)
-            }
-            if let realFd = (type as! any XPCFileDescriptorProtocol.Type).init(rawValue: rawFD) {
-                value = realFd as! T
-            } else {
-                let context = DecodingError.Context(codingPath: currentPath, debugDescription: "fail to create \(type) from valid fileDescriptor \(rawFD)")
-                throw DecodingError.dataCorrupted(context)
-            }
-            break
+        case is XPCNativeObject.Type:
+            currentIndex += 1
+            return XPCNativeObject(object) as! T
         case is Data.Type:
             guard xpcType == XPC_TYPE_DATA else {
                 let context = DecodingError.Context(
@@ -447,7 +429,14 @@ private struct _XPCUnKeyedDecodingContainer: UnkeyedDecodingContainer {
         switch xpcType {
         case XPC_TYPE_DOUBLE:
             let double = xpc_double_get_value(object)
-            value = double.isSignalingNaN ? T.signalingNaN : T.init(double)
+            if double.isSignalingNaN { value = T.signalingNaN } else {
+                let converted = T(double)
+                guard double.isFinite == converted.isFinite else {
+                    throw DecodingError.typeMismatch(type, DecodingError.Context(
+                        codingPath: currentPath, debugDescription: "\(double) overflows \(type)"))
+                }
+                value = converted
+            }
         case XPC_TYPE_INT64:
             let integer = xpc_int64_get_value(object)
             if let float = T(exactly: integer) {
@@ -691,11 +680,14 @@ private struct _XPCKeyedDecodingContainer<Key:CodingKey>: KeyedDecodingContainer
             let context = DecodingError.Context.init(codingPath: currentPath, debugDescription: "Expected \(type) but find \(xpcTypeName(xpcType)) instead")
             throw DecodingError.typeMismatch(type, context)
         }
-        let buffer = UnsafeBufferPointer(
-            start: xpc_string_get_string_ptr(object),
-            count: xpc_string_get_length(object) + 1
-        ).map{ $0 }
-        return String(cString: buffer)
+        // `String(cString:)` reads the NUL-terminated buffer straight from libxpc.
+        // Copying it into a Swift array first, which is what `.map { $0 }` did,
+        // cost more than every other part of decoding a string put together.
+        guard let cString = xpc_string_get_string_ptr(object) else {
+            throw DecodingError.dataCorrupted(.init(
+                codingPath: codingPath, debugDescription: "xpc string with no bytes"))
+        }
+        return String(cString: cString)
     }
     
     func decodeBinaryFloatingPoint<T:BinaryFloatingPoint>(_ type: T.Type, forKey key:Key) throws -> T {
@@ -705,7 +697,12 @@ private struct _XPCKeyedDecodingContainer<Key:CodingKey>: KeyedDecodingContainer
         switch xpcType {
         case XPC_TYPE_DOUBLE:
             let rawValue = xpc_double_get_value(object)
-            return .init(rawValue)
+            let converted = T(rawValue)
+            guard rawValue.isFinite == converted.isFinite else {
+                throw DecodingError.typeMismatch(type, DecodingError.Context(
+                    codingPath: currentPath, debugDescription: "\(rawValue) overflows \(type)"))
+            }
+            return converted
         case XPC_TYPE_UINT64:
             let rawValue = xpc_uint64_get_value(object)
             if let realValue = T.init(exactly: rawValue) {
@@ -812,30 +809,24 @@ private struct _XPCKeyedDecodingContainer<Key:CodingKey>: KeyedDecodingContainer
     
     func decode<T>(_ type: T.Type, forKey key: Key) throws -> T where T : Decodable {
         let currentPath = codingPath + [key]
-        let object = try getValue(type, forKey: key)
+        // Null has to reach the value: `Optional`'s own conformance asks a
+        // single-value container for it and answers `.none`. Rejecting it here
+        // is why `[String: Int?]` failed while `[Int?]`, which reads the element
+        // directly, always worked.
+        let object = try getValue(forKey: key)
         let xpcType = xpc_get_type(object)
+        // The types handled below are concrete, so for them null really is a
+        // missing value rather than a representable one.
+        if type is XPCNativeObject.Type {
+            return XPCNativeObject(object) as! T
+        }
+        if xpcType == XPC_TYPE_NULL, type is Data.Type || type is Date.Type || type is UUID.Type {
+            throw DecodingError.valueNotFound(type, .init(
+                codingPath: currentPath,
+                debugDescription: "Expected \(type) but found null instead"))
+        }
         let value:T
         switch type {
-        case is any XPCFileDescriptorProtocol.Type:
-            guard xpcType == XPC_TYPE_FD else {
-                let context = DecodingError.Context(
-                    codingPath: currentPath,
-                    debugDescription: "Expected FileDescriptor but found \(xpcTypeName(xpcType)) instead"
-                )
-                throw DecodingError.typeMismatch(type, context)
-            }
-            let rawFD = xpc_fd_dup(object)
-            guard rawFD != -1 else {
-                let context = DecodingError.Context(codingPath: currentPath, debugDescription: "XPC Frame work failed recognize FileDescriptor ")
-                throw DecodingError.dataCorrupted(context)
-            }
-            if let realFd = (type as! any XPCFileDescriptorProtocol.Type).init(rawValue: rawFD) {
-                value = realFd as! T
-            } else {
-                let context = DecodingError.Context(codingPath: currentPath, debugDescription: "fail to create \(type) from valid fileDescriptor \(rawFD)")
-                throw DecodingError.dataCorrupted(context)
-            }
-            break
         case is Data.Type:
             guard xpcType == XPC_TYPE_DATA else {
                 let context = DecodingError.Context(
