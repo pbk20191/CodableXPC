@@ -31,22 +31,23 @@ final class XPCRawTransportTests: XCTestCase {
         // live* `XPCSession`, so the transport is built `isAlreadyActive: true` and there is
         // nothing left to activate on the peer side.
         let listener = try XPCListener { request in
-            let (decision, raw) = XPCRawTransport.accepting(request)
-            let transport = Transport(debugName: "server", role: .responder, rawTransport: raw)
+            let (decision, raw) = Transport.XPCRawTransport.accepting(request)
+            let transport = Transport(debugName: "server", rawTransport: raw)
             transport.inboundRequestHandler = { _, payload, reply in
                 guard let ping = try? payload.decode(as: Ping.self),
                       let body = try? Packet.Payload(encoding: Ping(value: ping.value + 1), userInfo: [:])
                 else { return }
                 reply(body)
             }
+            try? raw.activate(linking: transport)
             box.transport = transport
             serverReady.fulfill()
             return decision
         }
 
-        let clientRaw = try XPCRawTransport.connecting(to: listener.endpoint)
-        let client = Transport(debugName: "client", role: .initiator, rawTransport: clientRaw)
-        try await client.activate()
+        let clientRaw = try Transport.XPCRawTransport.connecting(to: listener.endpoint)
+        let client = Transport(debugName: "client", rawTransport: clientRaw)
+        try client.activate()
 
         // Send *before* waiting for the server, not after. With the handshake gone,
         // `activate()` puts nothing on the wire, and an XPC session is not established
@@ -62,26 +63,26 @@ final class XPCRawTransportTests: XCTestCase {
         guard case .reply(let payload) = outcome else { return XCTFail("expected a reply") }
         XCTAssertEqual(try payload.decode(as: Ping.self), Ping(value: 42))
 
-        client.cancel(reason: "test over")
+        client.cancel()
         // Also cancel the server-side transport, reached through the box the listener
         // callback populated. This exercises the box-clearing added to
-        // XPCRawTransport.cancel(reason:) to break the transport -> session ->
+        // Transport.XPCRawTransport.cancel(reason:) to break the transport -> session ->
         // closure -> box -> transport retain cycle, on both ends of the pipe.
-        box.transport?.cancel(reason: "test over")
+        box.transport?.cancel()
         listener.cancel()
     }
 
     /// Keeps the raw transport as well, so the attestation can be read off the accepted
     /// side of a live connection.
     final class RawBox: @unchecked Sendable {
-        var raw: XPCRawTransport?
+        var raw: Transport.XPCRawTransport?
         var transport: Transport?
     }
 
     /// **The peer check, over a real connection, with nothing stubbed.**
     ///
     /// This is the test behind the claim that Apple's overlay gives us what the gates need.
-    /// `XPCRawTransport.peerAttestation` reads `XPCSession.auditToken` and
+    /// `Transport.XPCRawTransport.peerAttestation` reads `XPCSession.auditToken` and
     /// `audit_token_t.isValid` through symbols that `libswiftXPC` exports and the public
     /// `.swiftinterface` does not declare; here they run against a connection libxpc
     /// actually established, and the token comes back **valid** -- which is the one thing a
@@ -99,8 +100,8 @@ final class XPCRawTransportTests: XCTestCase {
         let box = RawBox()
 
         let listener = try XPCListener { request in
-            let (decision, raw) = XPCRawTransport.accepting(request)
-            let transport = Transport(debugName: "server", role: .responder, rawTransport: raw)
+            let (decision, raw) = Transport.XPCRawTransport.accepting(request)
+            let transport = Transport(debugName: "server", rawTransport: raw)
             transport.inboundRequestHandler = { _, payload, reply in
                 guard let ping = try? payload.decode(as: Ping.self),
                       let body = try? Packet.Payload(encoding: Ping(value: ping.value + 1),
@@ -108,15 +109,16 @@ final class XPCRawTransportTests: XCTestCase {
                 else { return }
                 reply(body)
             }
+            try? raw.activate(linking: transport)
             box.raw = raw
             box.transport = transport
             serverReady.fulfill()
             return decision
         }
 
-        let clientRaw = try XPCRawTransport.connecting(to: listener.endpoint)
-        let client = Transport(debugName: "client", role: .initiator, rawTransport: clientRaw)
-        try await client.activate()
+        let clientRaw = try Transport.XPCRawTransport.connecting(to: listener.endpoint)
+        let client = Transport(debugName: "client", rawTransport: clientRaw)
+        try client.activate()
 
         // The session is not established until the first message, so one round trip first.
         let request = try Packet.Payload(encoding: Ping(value: 1), userInfo: [:])
@@ -138,8 +140,8 @@ final class XPCRawTransportTests: XCTestCase {
                 "\(side): an entitlement nothing holds must not read as satisfied")
         }
 
-        client.cancel(reason: "test over")
-        box.transport?.cancel(reason: "test over")
+        client.cancel()
+        box.transport?.cancel()
         listener.cancel()
     }
 }

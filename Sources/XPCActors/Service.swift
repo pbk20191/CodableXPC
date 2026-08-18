@@ -88,12 +88,12 @@ extension XPCActorSystem {
         /// applied before any byte moves.
         private func makeTransport(
             peerRequirement: PeerRequirement?, targetQueue: DispatchQueue?
-        ) throws(SetupError) -> XPCRawTransport {
-            let transport: XPCRawTransport
+        ) throws(SetupError) -> Transport.XPCRawTransport {
+            let transport: Transport.XPCRawTransport
             do {
                 transport = isMach
-                    ? try XPCRawTransport.connectingToMachService(name, targetQueue: targetQueue)
-                    : try XPCRawTransport.connectingToXPCService(name, targetQueue: targetQueue)
+                    ? try Transport.XPCRawTransport.connectingToMachService(name, targetQueue: targetQueue)
+                    : try Transport.XPCRawTransport.connectingToXPCService(name, targetQueue: targetQueue)
             } catch {
                 throw SetupError("could not dial \(debugName): \(error)")
             }
@@ -130,7 +130,7 @@ extension XPCActorSystem {
             }
             let raw = try makeTransport(peerRequirement: arguments.peerRequirement,
                                         targetQueue: nil)
-            let transport = Transport(debugName: debugName, role: .initiator, rawTransport: raw)
+            let transport = Transport(debugName: debugName, rawTransport: raw)
             let session = actorSystem.makeSession(
                 over: transport,
                 // Inverted, and the inversion is the whole meaning of the flag. A
@@ -145,7 +145,7 @@ extension XPCActorSystem {
                 localInterfaceActivated: !arguments.options.contains(.bidirectional),
                 isBidirectional: arguments.options.contains(.bidirectional))
             do {
-                try raw.activate()
+                try transport.activate()
             } catch {
                 throw SetupError("Could not activate \(debugName): \(error)")
             }
@@ -252,7 +252,7 @@ extension XPCActorSystem {
     -> Session.RemoteInterface {
         let session = makeSession(
             over: transport, localInterfaceActivated: true, isBidirectional: false)
-        try await transport.activate()
+        try transport.activate()
         return session.remote
     }
 
@@ -295,7 +295,7 @@ extension XPCActorSystem {
     ) async throws(SetupError) -> Session.RemoteInterface {
         let session = makeSession(
             over: transport, localInterfaceActivated: false, isBidirectional: true)
-        try await transport.activate()
+        try transport.activate()
         return try await makeBidirectionalInterface(
             over: session, assumeLocalInterfaceActivatedIn: body)
     }
@@ -429,23 +429,22 @@ extension XPCActorSystem {
             from actorSystem: XPCActorSystem,
             with arguments: ServiceConnectArguments
         ) async throws(SetupError) -> Session {
-            let raw: XPCRawTransport
+            let raw: Transport.XPCRawTransport
             do {
-                raw = try XPCRawTransport.connecting(to: endpoint)
+                raw = try Transport.XPCRawTransport.connecting(to: endpoint)
             } catch {
                 throw SetupError("could not dial ephemeral service: \(error)")
             }
             if let requirement = arguments.peerRequirement {
                 raw.setPeerRequirement(requirement)
             }
-            let transport = Transport(
-                debugName: "ephemeral", role: .initiator, rawTransport: raw)
+            let transport = Transport(debugName: "ephemeral", rawTransport: raw)
             let session = actorSystem.makeSession(
                 over: transport,
                 localInterfaceActivated: !arguments.options.contains(.bidirectional),
                 isBidirectional: arguments.options.contains(.bidirectional))
             do {
-                try await transport.activate()
+                try transport.activate()
             } catch {
                 throw SetupError("could not activate ephemeral service: \(error)")
             }

@@ -7,172 +7,184 @@ import XPC
 // MARK: - A RawTransport on Apple's XPCSession / XPCListener overlay
 // ===========================================================================================
 
-/// A ``RawTransportProtocol`` over Apple's `XPCSession`, with peers accepted through
-/// `XPCListener.IncomingSessionRequest`.
-///
-/// **This is the overlay Apple's own `XPCSystem` transport uses**, restored now that the
-/// module's floor is macOS 26: `XPCRawTransport.accepting(_:)` is
-/// `Transport.XPCRawTransport.accepting`, wrapping the *already-live* `XPCSession` that
-/// `IncomingSessionRequest.accept` returns (`isAlreadyActive: true`); the client dials are
-/// `XPCSession(machService:)` / `XPCSession(xpcService:)` / `XPCSession(endpoint:)`.
-///
-/// Sends are one-way -- `XPCSession.send(message:)`, never the reply overload -- and the
-/// incoming-message handler always returns `nil`, so XPC's reply channel stays unused and
-/// replies travel as ordinary inbound packets. That is what lets the listening side
-/// originate calls.
 @available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
-public final class XPCRawTransport: RawTransportProtocol, @unchecked Sendable {
+extension Transport {
 
-    private let session: XPCSession
-    private let isAlreadyActive: Bool
-
-    private struct State {
-        var handler: (@Sendable (Packet) -> Void)?
-        var cancellationHandler: (@Sendable (String) -> Void)?
-        var cancellationReason: String?
-        /// The box whose closure keeps this transport reachable from the session's
-        /// incoming-message handler. Held so ``cancel(reason:)`` can break the resulting
-        /// retain cycle (transport -> session -> closure -> box -> transport).
-        var box: Box?
-        /// The most recent message the peer sent, retained so the peer gates have something
-        /// to interrogate. Message-scoped at capture, peer-scoped in meaning: every message
-        /// on one session comes from the same peer.
-        var lastReceivedMessage: xpc_object_t?
-    }
-    private let state = Mutex<State>(State())
-
-    /// - Parameter isAlreadyActive: `true` for a session handed to us by
-    ///   `IncomingSessionRequest.accept`, which is live on return. Calling
-    ///   `session.activate()` on such a session does *not* throw a catchable Swift error --
-    ///   it is a fatal `libxpc` API-misuse trap (SIGTRAP, "Attempting to activate an
-    ///   already active listener/session"), confirmed empirically by temporarily removing
-    ///   this guard and observing the crash. `isAlreadyActive` is load-bearing, not
-    ///   defensive boilerplate.
-    public init(session: XPCSession, isAlreadyActive: Bool = false) {
-        self.session = session
-        self.isAlreadyActive = isAlreadyActive
-    }
-
-    // MARK: Peer identity
-
-    /// What the peer can attest, if anything.
+    /// A ``RawTransportProtocol`` over Apple's `XPCSession`, with peers accepted through
+    /// `XPCListener.IncomingSessionRequest` -- Apple's `Transport.XPCRawTransport`.
     ///
-    /// **Message-level, not session-level.** Apple's `Transport.XPCRawTransport.auditToken`
-    /// read `XPCSession.auditToken`, but that getter is **gone** from the current overlay
-    /// (measured -- see `PeerRequirement.swift`), so the token is taken from the last
-    /// message and kept, which lands in the same place: every message on one `XPCSession`
-    /// comes from the same peer, so "the last message's sender" and "this session's peer"
-    /// are the same process. `AuditTokenAttestation.init?` rejects an invalid token, so a
-    /// dictionary that never crossed a connection reports "cannot tell", not "not entitled".
-    public var peerAttestation: (any PeerAttestation)? {
-        #if os(macOS) || targetEnvironment(macCatalyst)
-        guard let message = state.withLock({ $0.lastReceivedMessage }) else { return nil }
-        return AuditTokenAttestation(XPCDictionary(message).xpcBridgedAuditToken())
-        #else
-        return nil
-        #endif
-    }
+    /// It follows Apple's back-reference model: the raw transport stores its parent
+    /// ``Transport`` (set by ``activate(linking:)``) and routes inbound packets into
+    /// `parentTransport.handleReceivedPacket` and pipe-death into
+    /// `parentTransport.handleCancellation` -- there are no injected closures.
+    ///
+    /// Sends are one-way -- `XPCSession.send(message:)`, never the reply overload -- and the
+    /// incoming-message handler always returns `nil`, so XPC's reply channel stays unused and
+    /// replies travel as ordinary inbound packets. That is what lets the listening side
+    /// originate calls.
+    public final class XPCRawTransport: RawTransportProtocol, @unchecked Sendable {
 
-    // MARK: RawTransportProtocol
-
-    public func setPacketHandler(_ handler: @escaping @Sendable (Packet) -> Void) {
-        state.withLock { $0.handler = handler }
-    }
-
-    public func setCancellationHandler(_ handler: @escaping @Sendable (String) -> Void) {
-        state.withLock { $0.cancellationHandler = handler }
-    }
-
-    /// Apply a client-side peer requirement to the underlying session, Apple's
-    /// `XPCSession.setPeerRequirement(_:)`. A no-op for a requirement that carries no overlay
-    /// `XPCPeerRequirement` (a named-only stand-in libxpc cannot express).
-    public func setPeerRequirement(_ requirement: PeerRequirement) {
-        guard let xpc = requirement.xpcRequirement else { return }
-        session.setPeerRequirement(xpc)
-    }
-
-    public func activate() throws(RawTransportError) {
-        guard !isAlreadyActive else { return }
-        do {
-            try session.activate()
-        } catch {
-            throw RawTransportError.rawTransportCancelled(
-                message: "could not activate XPCSession: \(error)")
+        /// Apple's peer gate -- a class holding a `Mutex<State>`. It governs one-time
+        /// activation and one-time cancellation of an accepted (peer) session.
+        public final class PeerGate {
+            enum State { case initial, activated, canceled }
+            let state = Mutex<State>(.initial)
+            public init() {}
         }
-    }
 
-    public func send(packet: Packet) throws(RawTransportError) {
-        if let reason = state.withLock({ $0.cancellationReason }) {
-            throw RawTransportError.rawTransportCancelled(message: reason)
+        /// Which end this is. `.peer` wraps an *already-live* session handed back by
+        /// `IncomingSessionRequest.accept`; `.client` wraps an inactive session that
+        /// ``activate(linking:)`` configures and activates.
+        public enum Role {
+            case peer(gate: PeerGate)
+            case client
+
+            /// A fresh gate on every access -- Apple's `static var peer`, which mints a gate for
+            /// callers who do not have one.
+            public static var peer: Role { .peer(gate: PeerGate()) }
         }
-        do {
-            try session.send(message: XPCDictionary(packet.rawValue))
-        } catch {
-            throw RawTransportError.rawTransportCancelled(message: "XPCSession send: \(error)")
+
+        /// Apple's `parentTransport` -- a strong `var`, cleared on cancellation. Together with
+        /// the session's handler closures (which capture `self` weakly) this is what keeps the
+        /// `Transport <-> XPCRawTransport` cycle breakable.
+        private var parentTransport: Transport?
+        private let session: XPCSession
+        private let role: Role
+
+        private struct State {
+            /// The most recent message the peer sent, retained so the peer gates have something
+            /// to interrogate. Message-scoped at capture, peer-scoped in meaning: every message
+            /// on one session comes from the same peer. This is the deliberate deviation the
+            /// module keeps -- `XPCSession.auditToken` is gone from the current overlay.
+            var lastReceivedMessage: xpc_object_t?
         }
-    }
+        private let state = Mutex<State>(State())
 
-    public func cancel(reason: String) {
-        let box: Box? = state.withLock { state in
-            guard state.cancellationReason == nil else { return nil }
-            state.cancellationReason = reason
-            state.handler = nil
-            let box = state.box
-            // Break the retain cycle the message handler closes over: transport -> session
-            // -> closure -> box -> transport. Clearing `box.transport` also means a packet
-            // delivered after cancellation finds nothing to dispatch to.
-            state.box = nil
-            state.lastReceivedMessage = nil
-            return box
+        public init(session: XPCSession, role: Role = .client) {
+            self.session = session
+            self.role = role
         }
-        guard let box else { return }
-        session.cancel(reason: reason)
-        box.transport = nil
-    }
 
-    // MARK: Delivery
+        // MARK: Peer identity
 
-    /// Feed an inbound `XPCDictionary` in. Wired to the session's or the listener's
-    /// incoming-message handler, which always returns `nil`.
-    func handleIncoming(_ message: XPCDictionary) {
-        let handler: (@Sendable (Packet) -> Void)? = message.withUnsafeUnderlyingDictionary { raw in
-            state.withLock { state in
-                // Retained before the packet is parsed: a malformed message still identifies
-                // its sender, and the gate that will ask about the sender must not depend on
-                // this side having understood what it said.
-                state.lastReceivedMessage = raw
-                return state.handler
+        /// What the peer can attest, if anything -- message-level, from the last message's
+        /// sender. `AuditTokenAttestation.init?` rejects an invalid token, so a dictionary that
+        /// never crossed a connection reports "cannot tell", not "not entitled".
+        public var peerAttestation: (any PeerAttestation)? {
+            #if os(macOS) || targetEnvironment(macCatalyst)
+            guard let message = state.withLock({ $0.lastReceivedMessage }) else { return nil }
+            return AuditTokenAttestation(XPCDictionary(message).xpcBridgedAuditToken())
+            #else
+            return nil
+            #endif
+        }
+
+        /// Apply a client-side peer requirement to the underlying (inactive) session -- Apple's
+        /// `XPCSession.setPeerRequirement(_:)`. A no-op for a requirement that carries no overlay
+        /// `XPCPeerRequirement` (a named-only stand-in libxpc cannot express). Called before
+        /// ``activate(linking:)``, i.e. before any byte moves.
+        public func setPeerRequirement(_ requirement: PeerRequirement) {
+            guard let xpc = requirement.xpcRequirement else { return }
+            session.setPeerRequirement(xpc)
+        }
+
+        // MARK: RawTransportProtocol
+
+        /// Apple's `activate(linking:)`: store the back-reference, then configure-and-activate.
+        /// For a `.peer` gate the work runs only when the gate is still `.initial`; an accepted
+        /// session is already live, so configuration only marks the gate and installs nothing
+        /// more (its handlers were wired at `accept` time). For a `.client` the inactive session
+        /// is configured and activated here.
+        public func activate(linking transport: Transport) throws(SetupError) {
+            self.parentTransport = transport
+            switch role {
+            case .peer(let gate):
+                let proceed: Bool = gate.state.withLock { st in
+                    guard st == .initial else { return false }
+                    st = .activated
+                    return true
+                }
+                guard proceed else { return }
+                // The accepted session is already active with handlers wired at `accept`; there
+                // is nothing to activate. (Deviation from Apple, whose accepted session is
+                // inactive at this point -- ours is live, the documented `isAlreadyActive` case.)
+            case .client:
+                try configureAndActivateSession(queue: transport.queue)
             }
         }
-        guard let handler else { return }
-        message.withUnsafeUnderlyingDictionary { raw in
-            guard let packet = Packet(rawValue: raw) else { return }
-            handler(packet)
-        }
-    }
 
-    /// The overlay told us the session died. Wired to the `cancellationHandler:` the
-    /// session was built with.
-    ///
-    /// Deaths that originate here go through ``cancel(reason:)`` instead, which sets
-    /// `cancellationReason` *before* calling `session.cancel`. The overlay then calls this
-    /// back for our own cancellation too, and the guard below stops that echo being
-    /// reported upward as a peer death.
-    func handleSessionCancellation(_ error: XPCRichError) {
-        let message = "XPCSession cancelled: \(error)"
-        let result: (handler: (@Sendable (String) -> Void), box: Box?)? = state.withLock { state in
-            guard state.cancellationReason == nil else { return nil }
-            guard let handler = state.cancellationHandler else { return nil }
-            state.cancellationReason = message
-            state.handler = nil
-            state.cancellationHandler = nil
-            let box = state.box
-            state.box = nil
-            return (handler, box)
+        /// Install the session's incoming-message and error handlers -- routing into
+        /// `parentTransport.handleReceivedPacket` / `.handleCancellation` -- then activate the
+        /// session on `queue`.
+        private func configureAndActivateSession(queue: DispatchSerialQueue) throws(SetupError) {
+            session.setIncomingMessageHandler { [weak self] (message: XPCDictionary) -> XPCDictionary? in
+                self?.handleIncoming(message)
+                return nil
+            }
+            session.setCancellationHandler { [weak self] (error: XPCRichError) in
+                self?.handleSessionCancellation(error)
+            }
+            session.setTargetQueue(queue)
+            do {
+                try session.activate()
+            } catch {
+                throw SetupError("Failed to activate XPCSession (error: \(error))")
+            }
         }
-        guard let result else { return }
-        result.box?.transport = nil
-        result.handler(message)
+
+        public func send(packet: Packet) throws(RawTransportError) {
+            do {
+                try session.send(message: XPCDictionary(packet.rawValue))
+            } catch {
+                throw RawTransportError.rawTransportCancelled(message: "XPCSession send: \(error)")
+            }
+        }
+
+        /// Tear the session down and drop the back-reference. For a `.peer` gate this runs once
+        /// (guarded by the gate's `.canceled` state).
+        ///
+        /// **Deviation:** Apple's peer branch calls `session.rejectPeer(reason:)`, which the
+        /// current overlay does not export; both branches use `session.cancel(reason:)` here.
+        public func cancel() {
+            switch role {
+            case .peer(let gate):
+                let proceed: Bool = gate.state.withLock { st in
+                    guard st != .canceled else { return false }
+                    st = .canceled
+                    return true
+                }
+                guard proceed else { break }
+                session.cancel(reason: "(transport cancelled by client)")
+            case .client:
+                session.cancel(reason: "(transport cancelled by client)")
+            }
+            parentTransport = nil
+            state.withLock { $0.lastReceivedMessage = nil }
+        }
+
+        // MARK: Delivery
+
+        /// Wired to the session's incoming-message handler. Retains the raw message (for the
+        /// gates), parses the packet, and hops onto the parent's queue to route it -- so
+        /// `Transport.handleReceivedPacket` always runs on `parentTransport.queue`.
+        private func handleIncoming(_ message: XPCDictionary) {
+            guard let parent = parentTransport else { return }
+            let packet: Packet? = message.withUnsafeUnderlyingDictionary { raw in
+                // Retained before the packet is parsed: a malformed message still identifies its
+                // sender, and the gate that will ask about the sender must not depend on this
+                // side having understood what it said.
+                state.withLock { $0.lastReceivedMessage = raw }
+                return Packet(rawValue: raw)
+            }
+            guard let packet else { return }
+            parent.queue.async { parent.handleReceivedPacket(packet) }
+        }
+
+        /// Wired to the session's error handler: route the death into the parent. The parent's
+        /// fuse makes our own `cancel()` echo harmless.
+        private func handleSessionCancellation(_ error: XPCRichError) {
+            parentTransport?.handleCancellation()
+        }
     }
 }
 
@@ -181,25 +193,26 @@ public final class XPCRawTransport: RawTransportProtocol, @unchecked Sendable {
 // ===========================================================================================
 
 @available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
-extension XPCRawTransport {
+extension Transport.XPCRawTransport {
 
     /// Breaks the chicken-and-egg between a session's message handler and the transport that
-    /// handler dispatches to. Lock-guarded because `accepting` returns a session that is
-    /// already live: a peer's first message can reach the handler before the assignment on
-    /// the next line completes.
+    /// handler dispatches to: `accept` returns an already-live session, so a peer's first
+    /// message can reach the handler before the transport is assigned. The handlers route
+    /// through this box; the transport is published into it immediately after.
     final class Box: @unchecked Sendable {
-        private let _transport = Mutex<XPCRawTransport?>(nil)
-        var transport: XPCRawTransport? {
+        private let _transport = Mutex<Transport.XPCRawTransport?>(nil)
+        var transport: Transport.XPCRawTransport? {
             get { _transport.withLock { $0 } }
             set { _transport.withLock { $0 = newValue } }
         }
     }
 
-    /// Accept an inbound peer. The returned session is already live, so the transport is
-    /// built with `isAlreadyActive: true`. Apple's `Transport.XPCRawTransport.accepting`.
+    /// Accept an inbound peer. The returned session is already live, so the transport takes the
+    /// `.peer` role; its handlers are wired here, through a ``Box``, and begin routing into the
+    /// transport as soon as it is published. Apple's `Transport.XPCRawTransport.accepting`.
     public static func accepting(
         _ request: XPCListener.IncomingSessionRequest
-    ) -> (XPCListener.IncomingSessionRequest.Decision, XPCRawTransport) {
+    ) -> (XPCListener.IncomingSessionRequest.Decision, Transport.XPCRawTransport) {
         let box = Box()
         let (decision, session) = request.accept(
             incomingMessageHandler: { (message: XPCDictionary) -> XPCDictionary? in
@@ -209,97 +222,54 @@ extension XPCRawTransport {
             cancellationHandler: { (error: XPCRichError) in
                 box.transport?.handleSessionCancellation(error)
             })
-        let transport = XPCRawTransport(session: session, isAlreadyActive: true)
-        // Order matters: `accept` returns the session already live, so giving the transport
-        // its box before publishing the box is what keeps the retain-cycle clear sound
-        // against a peer that dies on the very next instruction.
-        transport.state.withLock { $0.box = box }
+        let transport = Transport.XPCRawTransport(session: session, role: .peer)
         box.transport = transport
         return (decision, transport)
     }
 
-    /// Dial a launchd Mach service by name. The session comes back inactive; `activate()`
-    /// starts it.
+    /// Dial a launchd Mach service by name. The session comes back inactive; the client-role
+    /// transport activates and configures it in ``activate(linking:)``.
     public static func connectingToMachService(
         _ name: String, targetQueue: DispatchQueue? = nil
-    ) throws(RawTransportError) -> XPCRawTransport {
-        try dialling { box in
-            try XPCSession(
-                machService: name, targetQueue: targetQueue, options: .inactive,
-                incomingMessageHandler: { (message: XPCDictionary) -> XPCDictionary? in
-                    box.transport?.handleIncoming(message); return nil
-                },
-                cancellationHandler: { (error: XPCRichError) in
-                    box.transport?.handleSessionCancellation(error)
-                })
-        }
+    ) throws(RawTransportError) -> Transport.XPCRawTransport {
+        try dialling { try XPCSession(machService: name, targetQueue: targetQueue, options: .inactive) }
     }
 
     /// Dial an XPC service bundle inside the calling application, by bundle identifier.
     public static func connectingToXPCService(
         _ name: String, targetQueue: DispatchQueue? = nil
-    ) throws(RawTransportError) -> XPCRawTransport {
-        try dialling { box in
-            try XPCSession(
-                xpcService: name, targetQueue: targetQueue, options: .inactive,
-                incomingMessageHandler: { (message: XPCDictionary) -> XPCDictionary? in
-                    box.transport?.handleIncoming(message); return nil
-                },
-                cancellationHandler: { (error: XPCRichError) in
-                    box.transport?.handleSessionCancellation(error)
-                })
-        }
+    ) throws(RawTransportError) -> Transport.XPCRawTransport {
+        try dialling { try XPCSession(xpcService: name, targetQueue: targetQueue, options: .inactive) }
     }
 
     /// Dial an anonymous listener through the `XPCEndpoint` it vended.
     public static func connecting(
         to endpoint: XPCEndpoint, targetQueue: DispatchQueue? = nil
-    ) throws(RawTransportError) -> XPCRawTransport {
-        try dialling { box in
-            try XPCSession(
-                endpoint: endpoint, targetQueue: targetQueue, options: .inactive,
-                incomingMessageHandler: { (message: XPCDictionary) -> XPCDictionary? in
-                    box.transport?.handleIncoming(message); return nil
-                },
-                cancellationHandler: { (error: XPCRichError) in
-                    box.transport?.handleSessionCancellation(error)
-                })
-        }
-    }
-    
-    public static func connecting(
-        using session:XPCSession, targetQueue: DispatchQueue? = nil
-    ) throws(RawTransportError) -> XPCRawTransport {
-        try dialling { box in
-            targetQueue.flatMap(session.setTargetQueue)
-            session.setCancellationHandler { error in
-                box.transport?.handleSessionCancellation(error)
-            }
-            session.setIncomingMessageHandler { (message:XPCDictionary) ->XPCDictionary? in
-                box.transport?.handleIncoming(message)
-                return nil
-            }
-            return session
-        }
+    ) throws(RawTransportError) -> Transport.XPCRawTransport {
+        try dialling { try XPCSession(endpoint: endpoint, targetQueue: targetQueue, options: .inactive) }
     }
 
-    /// Build a client transport from an inactive session, wiring the box before anything can
-    /// call back (the session is `.inactive`, so nothing does until `activate()`).
+    /// Dial using a caller-provided (inactive) session.
+    public static func connecting(
+        using session: XPCSession, targetQueue: DispatchQueue? = nil
+    ) -> Transport.XPCRawTransport {
+        targetQueue.flatMap(session.setTargetQueue)
+        return Transport.XPCRawTransport(session: session, role: .client)
+    }
+
+    /// Build a client transport from an inactive session. Its handlers are installed later, in
+    /// ``activate(linking:)`` -- nothing calls back before then because the session is inactive.
     private static func dialling(
-        _ makeSession: (Box) throws -> XPCSession
-    ) throws(RawTransportError) -> XPCRawTransport {
-        let box = Box()
+        _ makeSession: () throws -> XPCSession
+    ) throws(RawTransportError) -> Transport.XPCRawTransport {
         let session: XPCSession
         do {
-            session = try makeSession(box)
+            session = try makeSession()
         } catch {
             throw RawTransportError.rawTransportCancelled(
                 message: "could not create XPCSession: \(error)")
         }
-        let transport = XPCRawTransport(session: session, isAlreadyActive: false)
-        transport.state.withLock { $0.box = box }
-        box.transport = transport
-        return transport
+        return Transport.XPCRawTransport(session: session, role: .client)
     }
 }
 #endif

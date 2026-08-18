@@ -2,20 +2,6 @@ import Foundation
 import Synchronization
 import XPC
 
-/// Which end of the pipe this is.
-///
-/// It no longer selects any behaviour. Both roles now do the same thing on
-/// `activate()`, because there is no handshake to be asymmetric about: an initiator
-/// dialled out and a responder was accepted, and that is the whole of the difference.
-/// Kept because it is still a true and useful fact about a transport -- every debug
-/// message and every future asymmetry wants it -- not because anything branches on it.
-public enum TransportRole: Sendable {
-    /// Dialled out to a peer.
-    case initiator
-    /// Accepted an inbound connection.
-    case responder
-}
-
 /// The session on the receiving end of a transport.
 ///
 /// Apple's `InboundSessionProtocol`, which is class-bound and has six requirements:
@@ -43,10 +29,11 @@ public protocol InboundSession: AnyObject, Sendable {
 /// originate a call. Apple's `XPCRawTransport.send(packet:)` sends all three kinds
 /// through the one-way `XPCSession.send(message:)` for the same reason.
 ///
-/// There is no version negotiation. `hello` and `helloAck` do not exist in
-/// `XPCDistributed`, so sending them would put a packet category on the wire that no
-/// real peer can decode. What that costs is written down where the version key used to
-/// be, in `EnvelopeKey`.
+/// **The raw transport is a back-reference.** Apple hands the raw transport its parent
+/// ``Transport`` via ``RawTransportProtocol/activate(linking:)``; the raw transport then
+/// routes inbound packets into ``handleReceivedPacket(_:)`` and pipe-death into
+/// ``handleCancellation()``. There is no injected packet/cancellation closure and no
+/// per-role branching at this level -- role now lives on ``XPCRawTransport``.
 @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
 public final class Transport: @unchecked Sendable {
 
@@ -60,19 +47,28 @@ public final class Transport: @unchecked Sendable {
     public typealias NotificationHandler = @Sendable (Packet.Payload) -> Void
 
     private let debugName: String
-    public let role: TransportRole
-    private let rawTransport: RawTransportProtocol
-    private let requests = RequestTable()
+    private let rawTransport: any RawTransportProtocol
+    /// Apple's `Transport.queue: OS_dispatch_queue_serial` -- the transport's single serial queue,
+    /// shared as the executor of both ``requests`` and the backpressure manager, and the queue the
+    /// raw transports hop onto to deliver inbound traffic (so ``handleReceivedPacket(_:)`` always
+    /// runs on it). Label `XPCTransport-<debugName>`. Internal, not private, because the nested raw
+    /// transports -- in their own files -- deliver onto it.
+    let queue: DispatchSerialQueue
+    private let requests: RequestTable
+
+    /// The one-shot teardown fuse; `beginCancelling` is its `compareExchange`.
+    private let cancelledFuse = Atomic<Bool>(false)
 
     /// Disjoint from the handlers below -- nothing reads a seq and a handler in one critical
     /// section -- so the monotonic id source is a plain `Atomic<UInt64>`.
     private let nextSeq = Atomic<UInt64>(1)
-    /// The one-shot teardown fuse; `beginCancelling` is its `compareExchange`.
-    private let cancelledFuse = Atomic<Bool>(false)
 
-    /// The outbound backpressure manager, or `nil` when the policy is disabled (the default).
-    /// Apple's `Transport` holds a `BackpressureManager<ID64>`; set via ``setBackpressurePolicy(_:)``.
-    private let backpressure = Mutex<BackpressureManager<UInt64>?>(nil)
+    /// The outbound backpressure manager. Apple's `Transport` holds a long-lived
+    /// `BackpressureManager<ID64>` created in its initializer and reconfigured in place; this
+    /// mirrors that -- created disabled (`N: 0, enabled: false`), then reconfigured by
+    /// ``setBackpressurePolicy(_:)``. A `let`: the reference never changes, only the actor's state,
+    /// so no lock is needed around it (the actor guards its own state).
+    private let backpressure: BackpressureManager<UInt64>
 
     /// The inbound handlers and the weakly-held session, under one `Synchronization.Mutex`.
     private struct Handlers {
@@ -82,31 +78,20 @@ public final class Transport: @unchecked Sendable {
     }
     private let handlers = Mutex<Handlers>(Handlers())
 
-    /// The session speaking over this transport, held **weakly**.
-    ///
-    /// Apple's `Transport.(inboundSession)` is a weak `InboundSessionProtocol?` that
-    /// `Session.init(actorSystem:transport:options:)` assigns itself into
-    /// (`swift_unknownObjectWeakAssign` into `transport+0x10`). The direction of the
-    /// strength is the whole of it: the session owns the transport, so the back-pointer
-    /// must not own the session.
-    ///
-    /// Read-only from outside, because Apple's field is `private` and has exactly one
-    /// writer. See ``install(inboundSession:)``.
+    /// The session speaking over this transport, held **weakly** (Apple's
+    /// `Transport.(inboundSession)`). The session owns the transport, so the back-pointer must
+    /// not own the session.
     public var inboundSession: (any InboundSession)? { handlers.withLock { $0.inboundSession } }
 
     /// Seat the session that speaks over this transport. The one writer, called from
     /// `Session`'s initializer.
     ///
-    /// **Traps on a second live install**, and the alternative is worse than a trap: a
-    /// silent overwrite orphans the first session, which would then never be told the pipe
-    /// died and would hold its exported actors strongly for the life of the process. There
-    /// is no correct recovery and nothing a peer can do to reach it -- the only way here is
-    /// calling `makeSession(over:)` twice on one transport, in our own code, which is the
-    /// same criterion `actorReady`'s trap uses.
+    /// **Traps on a second live install**, and the alternative is worse than a trap: a silent
+    /// overwrite orphans the first session, which would then never be told the pipe died and
+    /// would hold its exported actors strongly for the life of the process.
     ///
-    /// A *dead* previous session is not an error: the weak reference is already `nil`, so
-    /// re-using a transport whose session has gone is allowed. So is re-installing the
-    /// same session, which makes the call idempotent.
+    /// A *dead* previous session is not an error, and re-installing the same session is
+    /// idempotent.
     func install(inboundSession session: any InboundSession) {
         handlers.withLock { handlers in
             if let existing = handlers.inboundSession, existing !== session {
@@ -144,31 +129,24 @@ public final class Transport: @unchecked Sendable {
     /// Internal for tests: requests registered and not yet resolved.
     var pendingRequestCount: Int { get async { await requests.pendingCount } }
 
-    public init(debugName: String, role: TransportRole, rawTransport: RawTransportProtocol) {
+    /// - Parameter qos: the QoS of the transport's serial queue. Apple's is `.unspecified`;
+    ///   this is a knob (defaulting to Apple's value) so an in-process test can pin the
+    ///   delivering context's priority floor -- the one input to the inbound priority clamp
+    ///   that is read off the delivering context rather than the wire.
+    public init(debugName: String, qos: DispatchQoS = .unspecified,
+                rawTransport: any RawTransportProtocol) {
         self.debugName = debugName
-        self.role = role
         self.rawTransport = rawTransport
-        rawTransport.setPacketHandler { [weak self] packet in
-            self?.handleReceived(packet: packet)
-        }
-        // The death channel. Without it a request whose peer crashed is
-        // indistinguishable from one whose peer is slow, and this protocol has no
-        // timeout to fall back on -- it would wait forever.
-        rawTransport.setCancellationHandler { [weak self] reason in
-            self?.handleRawTransportCancellation(reason: reason)
-        }
+        // Apple's `Transport` mints one serial queue and shares it with the request manager and
+        // the backpressure manager (their `init(queue:)`), so both serialize on the same executor.
+        let queue = DispatchSerialQueue(label: "XPCTransport-\(debugName)", qos: qos)
+        self.queue = queue
+        self.requests = RequestTable(queue: queue)
+        self.backpressure = BackpressureManager<UInt64>(queue: queue, N: 0, enabled: false)
     }
 
-    /// The pipe died from the far side. Fail everything, but do *not* call
-    /// `rawTransport.cancel` -- the raw transport is the thing telling us it is
-    /// already gone, and re-entering it would just echo.
-    private func handleRawTransportCancellation(reason: String) {
-        guard beginCancelling() else { return }
-        failEverything(reason: reason)
-    }
-
-    /// Claim the one-shot teardown. Returns `false` if teardown already ran, so our
-    /// own `cancel` and a remote death cannot double-fire.
+    /// Claim the one-shot teardown. Returns `false` if teardown already ran, so our own
+    /// `cancel` and a remote death cannot double-fire.
     private func beginCancelling() -> Bool {
         cancelledFuse.compareExchange(
             expected: false, desired: true, ordering: .sequentiallyConsistent).exchanged
@@ -177,11 +155,8 @@ public final class Transport: @unchecked Sendable {
     /// Both teardown paths -- our own `cancel` and the peer's death -- funnel here, and
     /// `beginCancelling` has already made sure this runs once.
     ///
-    /// The session is told **first**, and synchronously. Failing the request table is a
-    /// hop through the actor, so a caller that observes its own failure would otherwise
-    /// be able to see a session that had not yet cleared its exported-actor table. Apple
-    /// runs `handleTransportCancellation` on the transport's serial queue for the same
-    /// class of reason.
+    /// The session is told **first**, and synchronously, so a caller that observes its own
+    /// failure cannot see a session that had not yet cleared its exported-actor table.
     private func failEverything(reason: String) {
         inboundSession?.handleTransportCancellation()
         Task { await requests.failAll(with: .transportCancelled(message: reason)) }
@@ -189,54 +164,26 @@ public final class Transport: @unchecked Sendable {
 
     // MARK: activation
 
-    /// Bring the pipe up.
-    ///
-    /// Nothing is exchanged and nothing is awaited: with no version to agree, there is
-    /// no state a peer has to reach before traffic can flow, for either role.
-    ///
-    /// **A listener does not learn of a peer until that peer sends something.** An XPC
-    /// session is not established by activation alone, so a responder waiting to be told
-    /// a peer exists will wait forever if the initiator only activates. This is
-    /// Apple's behaviour too -- `XPCDistributed` has no handshake either -- but it is a
-    /// change from the version of this transport that exchanged `hello`, where
-    /// activation *was* the notification. Anything that assumed "activate implies the
-    /// far side exists" has to send first now.
-    public func activate() async throws(SetupError) {
-        do {
-            try rawTransport.activate()
-        } catch {
-            throw SetupError("could not activate transport: \(error)")
-        }
+    /// Bring the pipe up. Apple's `Transport.activate() throws(SetupError)`: the whole body is
+    /// `try rawTransport.activate(linking: self)`. There is no handshake and nothing to await.
+    public func activate() throws(SetupError) {
+        try rawTransport.activate(linking: self)
     }
 
     // MARK: sending
 
     /// Reserve a correlation id. Split from `sendRequest` so a caller can register
     /// cancellation bookkeeping against the id before the request is in flight.
-    ///
-    /// Ids come from a per-transport monotonic counter and are unique within a
-    /// transport, not globally -- which is all `headerID` needs, since a peer matches a
-    /// response against the requests it has outstanding on this one pipe. Reserving one
-    /// and never sending it is harmless: no state is allocated until `sendRequest`
-    /// registers a waiter.
     public func allocateSeq() -> UInt64 {
         nextSeq.wrappingAdd(1, ordering: .relaxed).oldValue
     }
 
-    /// Send a request under a `seq` obtained from `allocateSeq()` and await its
-    /// response.
-    ///
-    /// Reusing a `seq` that is still in flight fails the *new* caller rather than
-    /// displacing the old one; see `RequestTable.waitForReply`.
+    /// Send a request under a `seq` obtained from `allocateSeq()` and await its response.
     public func sendRequest(seq: UInt64, _ payload: Packet.Payload) async -> RequestTable.Outcome {
-        // Backpressure, when a policy is set: acquire a send slot before the request goes out
-        // and release it once its reply is in, so a fast caller cannot outrun a slow peer past
-        // the configured limit. Disabled (no manager) is the default and costs one lock read.
-        let manager = backpressure.withLock { $0 }
-        let token = await manager?.acquireSlot(for: seq, priority: Task.currentPriority)
+        let token = await backpressure.acquireSlot(for: seq, priority: Task.currentPriority)
         defer {
-            if let token, let manager {
-                Task { await manager.releaseSlot(token: token) }
+            if let token {
+                Task { await backpressure.releaseSlot(token: token) }
             }
         }
         let packet = Packet(header: .request(ID64(rawValue: seq)), payload: payload)
@@ -250,34 +197,42 @@ public final class Transport: @unchecked Sendable {
     /// Apple's `Transport.setBackpressurePolicy(_:)`: bound the number of in-flight requests to
     /// the policy's limit, or remove the bound when the policy is disabled.
     public func setBackpressurePolicy(_ policy: XPCActorSystem.BackpressurePolicy) {
-        let manager = policy.enabled
-            ? BackpressureManager<UInt64>(N: policy.maxConcurrentRequests, enabled: true)
-            : nil
-        backpressure.withLock { $0 = manager }
+        _ = backpressure.syncToActor { $0.apply(N: policy.maxConcurrentRequests, enabled: policy.enabled) }
     }
 
     public func sendNotification(_ payload: Packet.Payload) throws(RawTransportError) {
         try rawTransport.send(packet: Packet(header: .notification, payload: payload))
     }
 
-    public func cancel(reason: String) {
-        guard beginCancelling() else { return }
-        rawTransport.cancel(reason: reason)
-        failEverything(reason: reason)
+    /// Our own teardown. Apple's `Transport.cancel() -> Bool`: trips the fuse and calls
+    /// `rawTransport.cancel()` only on the first transition. We additionally fail our own
+    /// outstanding requests here rather than relying on the raw transport's death channel to
+    /// loop back -- the same effect, one hop sooner. Returns whether this call was the one
+    /// that cancelled.
+    @discardableResult
+    public func cancel() -> Bool {
+        guard beginCancelling() else { return false }
+        rawTransport.cancel()
+        failEverything(reason: "the transport was cancelled")
+        return true
     }
 
     // MARK: receiving
 
-    /// Internal for tests; the raw transport calls this for every inbound packet.
+    /// The raw transport calls this for every inbound packet, on ``queue``.
     ///
-    /// A malformed message never reaches here -- `Packet.init?(rawValue:)` has already
-    /// dropped it -- so the only thing left to decide is which of the three kinds it is.
-    func handleReceived(packet: Packet) {
+    /// Apple's `Transport.handleReceivedPacket(_:)` asserts `.onQueue(queue)` and switches on
+    /// the header tag. A malformed message never reaches here -- `Packet.init?(rawValue:)` has
+    /// already dropped it -- so the only thing left to decide is which of the three kinds it is.
+    func handleReceivedPacket(_ packet: Packet) {
+        dispatchPrecondition(condition: .onQueue(queue))
         switch packet.header {
         case .request(let id):
             guard let handler = inboundRequestHandler else { return }
-            handler(id.rawValue, packet.payload) { [weak self] reply in
-                self?.sendResponse(id: id, payload: reply)
+            // Apple's reply closure captures the request `id` and `self` (strongly): the reply
+            // must land whether or not the transport has other references left.
+            handler(id.rawValue, packet.payload) { [id, self] reply in
+                self.sendResponse(id: id, payload: reply)
             }
         case .response(let id):
             Task { await requests.complete(seq: id.rawValue, with: .reply(packet.payload)) }
@@ -286,9 +241,17 @@ public final class Transport: @unchecked Sendable {
         }
     }
 
-    /// A response re-uses the id it received, which is what lets the peer's request
-    /// table find the waiter. Apple's reply closure captures the request id and stores
-    /// it into the header it builds, for the same reason.
+    /// The pipe died, from the far side. Apple's `Transport.handleCancellation()`: trip the
+    /// fuse, fail every pending request, and clear-and-notify the inbound session. Do *not*
+    /// call `rawTransport.cancel()` -- the raw transport is the thing telling us it is already
+    /// gone. Runs at most once (the shared fuse gates it against our own `cancel()`).
+    func handleCancellation() {
+        guard beginCancelling() else { return }
+        failEverything(reason: "the transport's peer is gone")
+    }
+
+    /// A response re-uses the id it received, which is what lets the peer's request table
+    /// find the waiter.
     private func sendResponse(id: ID64, payload: Packet.Payload) {
         try? rawTransport.send(packet: Packet(header: .response(id), payload: payload))
     }

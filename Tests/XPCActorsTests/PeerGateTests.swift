@@ -26,7 +26,7 @@ import Distributed
 /// A transport-level attestation that answers from a table.
 ///
 /// This stands in for `AuditTokenAttestation` on the in-process pipe, and it is not a
-/// weakening of the gate: the production path (`XPCRawTransport.peerAttestation`) builds a
+/// weakening of the gate: the production path (`Transport.XPCRawTransport.peerAttestation`) builds a
 /// real `AuditTokenAttestation` over Apple's own `audit_token_t.satisfies(requirement:)`, and
 /// `testTheOverlayBridgeResolvesAndRefusesADictionaryThatNeverCrossedAConnection` exercises
 /// that code for real. What a test cannot do is *forge* a peer that satisfies an
@@ -81,8 +81,8 @@ distributed actor Vault: RestrictedAccessDistributedActor {
 private final class GatedLink: @unchecked Sendable {
     let clientSystem: XPCActorSystem
     let serverSystem: XPCActorSystem
-    let near: InProcessRawTransport
-    let far: InProcessRawTransport
+    let near: Transport.InProcessRawTransport
+    let far: Transport.InProcessRawTransport
     let clientTransport: Transport
     let serverTransport: Transport
     let clientSession: Session
@@ -94,18 +94,22 @@ private final class GatedLink: @unchecked Sendable {
          qos: DispatchQoS = .unspecified) throws {
         clientSystem = XPCActorSystem("client")
         serverSystem = XPCActorSystem("server", peerRequirement: serverRequirement)
-        let pair = InProcessRawTransport.makePair(debugName: "gated", qos: qos)
+        let pair = Transport.InProcessRawTransport.makePair("gated")
         near = pair.0
         far = pair.1
         // The *server* end's attestation is what it can prove about the client.
         far.peerAttestation = serverAttestation
-        clientTransport = Transport(debugName: "client", role: .initiator, rawTransport: near)
-        serverTransport = Transport(debugName: "server", role: .responder, rawTransport: far)
+        clientTransport = Transport(debugName: "client", rawTransport: near)
+        // The queue QoS moved from the raw pair (which no longer has a queue of its own) onto
+        // the *server* transport's queue -- that is the delivering context whose priority floor
+        // an inbound execution is escalated to, and the one input to the clamp read off the
+        // delivering context rather than the wire.
+        serverTransport = Transport(debugName: "server", qos: qos, rawTransport: far)
         clientSession = clientSystem.makeSession(over: clientTransport)
         serverSession = serverSystem.makeSession(over: serverTransport,
                                                  localInterfaceActivated: serverActivated)
-        try near.activate()
-        try far.activate()
+        try near.activate(linking: clientTransport)
+        try far.activate(linking: serverTransport)
     }
 
     @discardableResult
@@ -190,7 +194,7 @@ final class PeerGateTests: XCTestCase {
         let settled = await settle(box) { try await proxy.add(20, 22) }
         XCTAssertTrue(settled)
         XCTAssertEqual(try box.value?.get(), 42)
-        link.clientTransport.cancel(reason: "done")
+        link.clientTransport.cancel()
     }
 
     // -------------------------------------------------------------------------------------
@@ -210,7 +214,7 @@ final class PeerGateTests: XCTestCase {
         let settled = await settle(box) { try await proxy.add(1, 2) }
         XCTAssertTrue(settled)
         XCTAssertEqual(try box.value?.get(), 3)
-        link.clientTransport.cancel(reason: "done")
+        link.clientTransport.cancel()
     }
 
     /// **The refusal, and it is not a failure response.**
@@ -306,8 +310,11 @@ final class PeerGateTests: XCTestCase {
                 and an unentitled peer's bytes reached the decoder.
                 """)
         }
-        XCTAssertTrue(message.contains("does not satisfy actor system's peer requirement"),
-                      "cancelled for the wrong reason: \(message)")
+        // The gate cancelled the session -- a `.transportCancelled` above, not a `.reply` with a
+        // decode-failure body -- which is the discriminator that the unentitled peer's bytes were
+        // never parsed. The specific cancel reason no longer crosses the pipe in Apple's
+        // back-reference model (the death path carries a fixed message), so it is not asserted;
+        // that the failure is not a decode failure still is.
         XCTAssertFalse(message.contains("could not decode"),
                        "the payload was parsed before the gate ran")
     }
@@ -367,7 +374,7 @@ final class PeerGateTests: XCTestCase {
         // would find -- the orphan shape the duplicate-id guard exists for.
         let drained = await waitUntil { link.serverSession.pendingInvocationIDs.isEmpty }
         XCTAssertTrue(drained, "the refused execution left its pending-table entry behind")
-        link.clientTransport.cancel(reason: "done")
+        link.clientTransport.cancel()
     }
 
     func testARestrictedActorAdmitsAPeerThatSatisfiesItsOwnRequirement() async throws {
@@ -382,7 +389,7 @@ final class PeerGateTests: XCTestCase {
         XCTAssertTrue(settled)
         XCTAssertEqual(try box.value?.get(), 99)
         XCTAssertTrue(vaultLog.has("vault ran"))
-        link.clientTransport.cancel(reason: "done")
+        link.clientTransport.cancel()
     }
 
     /// **Apple traps here; we answer.** A restricted actor reached over a transport that
@@ -441,7 +448,7 @@ final class PeerGateTests: XCTestCase {
         let answered = await waitUntil { box.value != nil }
         XCTAssertTrue(answered)
         XCTAssertEqual(try box.value?.get(), 13)
-        link.clientTransport.cancel(reason: "done")
+        link.clientTransport.cancel()
     }
 
     /// A parked execution must not outlive the pipe. Apple's `cancellationCompleted()`
@@ -459,7 +466,7 @@ final class PeerGateTests: XCTestCase {
         let answeredEarly = await waitUntil(timeout: 0.2) { box.value != nil }
         XCTAssertFalse(answeredEarly)
 
-        link.serverTransport.cancel(reason: "peer went away")
+        link.serverTransport.cancel()
 
         let answered = await waitUntil { box.value != nil }
         XCTAssertTrue(answered)
@@ -519,7 +526,7 @@ final class PeerGateTests: XCTestCase {
         XCTAssertTrue(drained, "the cancelled execution never finished")
         XCTAssertFalse(log.has("must not run"),
                        "a peer-cancelled invocation ran the target after activation")
-        link.clientTransport.cancel(reason: "done")
+        link.clientTransport.cancel()
     }
 
     /// The event itself: one-shot, idempotent, and it does not suspend once posted.
@@ -642,7 +649,7 @@ final class PeerGateTests: XCTestCase {
                              "the execution was not escalated to the delivering floor")
         XCTAssertLessThanOrEqual(observed, Int(TaskPriority.userInitiated.rawValue),
                                  "the execution ran above the ceiling")
-        link.clientTransport.cancel(reason: "done")
+        link.clientTransport.cancel()
     }
 
     // -------------------------------------------------------------------------------------

@@ -177,24 +177,40 @@ private final class Peer: @unchecked Sendable {
     let transport: Transport
     let session: Session
     /// The far end of the pipe. Ours to drive.
-    let far: InProcessRawTransport
+    let far: Transport.InProcessRawTransport
+    /// The far end's own `Transport`, whose inbound handlers capture the traffic the code
+    /// under test emits. Held so it outlives the peer.
+    private let farTransport: Transport
 
     private let lock = NSLock()
     private var _packets: [Packet] = []
 
     init(_ debugName: String = "peer") throws {
-        let (near, far) = InProcessRawTransport.makePair(debugName: debugName)
+        let (near, far) = Transport.InProcessRawTransport.makePair(debugName)
         self.far = far
         system = XPCActorSystem(debugName)
-        transport = Transport(debugName: debugName, role: .initiator, rawTransport: near)
+        transport = Transport(debugName: debugName, rawTransport: near)
         session = system.makeSession(over: transport)
-        // Raw activation rather than `Transport.activate()`, which only forwards to it
-        // and is `async`. Nothing is exchanged either way.
-        try near.activate()
-        try far.activate()
-        far.setPacketHandler { [weak self] packet in
+        let farTransport = Transport(debugName: "\(debugName).far", rawTransport: far)
+        self.farTransport = farTransport
+        // Raw activation via `activate(linking:)`, the sync back-reference install -- nothing
+        // is exchanged and `Peer.init` is not async.
+        try near.activate(linking: transport)
+        try far.activate(linking: farTransport)
+        // Capture every inbound packet the code under test sends -- both kinds, reconstructed
+        // from the far transport's handlers -- without answering, exactly as the old raw packet
+        // handler did.
+        farTransport.inboundRequestHandler = { [weak self] seq, payload, _ in
             guard let self else { return }
-            self.lock.withLock { self._packets.append(packet) }
+            self.lock.withLock {
+                self._packets.append(Packet(header: .request(ID64(rawValue: seq)), payload: payload))
+            }
+        }
+        farTransport.inboundNotificationHandler = { [weak self] payload in
+            guard let self else { return }
+            self.lock.withLock {
+                self._packets.append(Packet(header: .notification, payload: payload))
+            }
         }
     }
 
@@ -768,12 +784,14 @@ final class OutboundInvocationTests: XCTestCase {
         let (task, box) = call(peer, on: proxy, target: "double", returning: Int.self)
         try await expectPackets(peer, 1, "the call never went out")
 
-        peer.far.cancel(reason: "peer went away")
+        peer.far.cancel()
         await settle(task, box)
 
         let error = try cancellationError(box.outcome)
         XCTAssertEqual(error.reason, .underlyingSessionCancelled)
-        XCTAssertTrue(error.message.contains("peer went away"), error.message)
+        // The cancellation reason no longer crosses the pipe (Apple's death path carries a fixed
+        // message), so the caller sees the peer-gone reason rather than the far end's wording.
+        XCTAssertTrue(error.message.contains("peer is gone"), error.message)
         XCTAssertEqual(peer.session.sharedActorCount, 0,
                        "a cancelled session must not still be exporting actors")
         XCTAssertNil(peer.session.shareDynamically(local),
@@ -790,7 +808,7 @@ final class OutboundInvocationTests: XCTestCase {
         }
         XCTAssertNotNil(peer.session.shareDynamically(local))
 
-        peer.transport.cancel(reason: "shutting down")
+        peer.transport.cancel()
         XCTAssertEqual(peer.session.sharedActorCount, 0)
         withExtendedLifetime(resident) {}
     }
@@ -869,7 +887,7 @@ final class OutboundInvocationTests: XCTestCase {
         let (task, box) = call(peer, on: proxy, target: "doomed", returning: Int.self)
         try await expectPackets(peer, 1)
 
-        peer.far.cancel(reason: "peer went away")
+        peer.far.cancel()
         task.cancel()
         await settle(task, box)
         XCTAssertNotNil(box.outcome, "the caller is failed whichever arm won")

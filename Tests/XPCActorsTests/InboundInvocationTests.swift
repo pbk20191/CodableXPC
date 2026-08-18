@@ -6,7 +6,7 @@ import Distributed
 
 /// The inbound path, and the first end-to-end call.
 ///
-/// Two real `XPCActorSystem`s, two real `Session`s, one `InProcessRawTransport` pair. A
+/// Two real `XPCActorSystem`s, two real `Session`s, one `Transport.InProcessRawTransport` pair. A
 /// `distributed func` called on one side runs on the other and its answer comes back
 /// through the same bytes a peer would see.
 ///
@@ -238,13 +238,13 @@ private final class Link: @unchecked Sendable {
     let serverSession: Session
 
     init() throws {
-        let (near, far) = InProcessRawTransport.makePair(debugName: "link")
-        clientTransport = Transport(debugName: "client", role: .initiator, rawTransport: near)
-        serverTransport = Transport(debugName: "server", role: .responder, rawTransport: far)
+        let (near, far) = Transport.InProcessRawTransport.makePair("link")
+        clientTransport = Transport(debugName: "client", rawTransport: near)
+        serverTransport = Transport(debugName: "server", rawTransport: far)
         clientSession = clientSystem.makeSession(over: clientTransport)
         serverSession = serverSystem.makeSession(over: serverTransport)
-        try near.activate()
-        try far.activate()
+        try near.activate(linking: clientTransport)
+        try far.activate(linking: serverTransport)
     }
 
     /// Export a server-side actor into the server's session and hand back the key naming
@@ -288,20 +288,27 @@ private final class Link: @unchecked Sendable {
 private final class Harvester: @unchecked Sendable {
     let system = XPCActorSystem("harvest")
     let transport: Transport
+    /// The far end is wired through its own `Transport`, whose request handler harvests the
+    /// packet the runtime built. Held so it stays alive for the life of the harvester.
+    private let farTransport: Transport
     let session: Session
     private let lock = NSLock()
     private var _packets: [Packet] = []
     var packets: [Packet] { lock.withLock { _packets } }
 
     init() throws {
-        let (near, far) = InProcessRawTransport.makePair(debugName: "harvest")
-        transport = Transport(debugName: "harvest", role: .initiator, rawTransport: near)
+        let (near, far) = Transport.InProcessRawTransport.makePair("harvest")
+        transport = Transport(debugName: "harvest", rawTransport: near)
         session = system.makeSession(over: transport)
-        try near.activate()
-        try far.activate()
-        far.setPacketHandler { [weak self] packet in
-            guard let self, case .request = packet.header else { return }
-            self.lock.withLock { self._packets.append(packet) }
+        let farTransport = Transport(debugName: "harvest-far", rawTransport: far)
+        self.farTransport = farTransport
+        try near.activate(linking: transport)
+        try far.activate(linking: farTransport)
+        farTransport.inboundRequestHandler = { [weak self] seq, payload, _ in
+            guard let self else { return }
+            self.lock.withLock {
+                self._packets.append(Packet(header: .request(ID64(rawValue: seq)), payload: payload))
+            }
         }
     }
 
@@ -849,7 +856,7 @@ final class InboundInvocationTests: XCTestCase {
             return XCTFail("the callee never started")
         }
 
-        link.serverTransport.cancel(reason: "the pipe died")
+        link.serverTransport.cancel()
         guard await waitUntil({ log.has("cancelled") }) else {
             return XCTFail("the callee was never cancelled: \(log.all)")
         }

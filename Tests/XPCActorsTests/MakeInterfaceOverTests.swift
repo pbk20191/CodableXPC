@@ -13,8 +13,8 @@ final class MakeInterfaceOverTests: XCTestCase {
 
     func testMakeRemoteInterfaceOverSessionReturnsAUsableRemote() async throws {
         let system = XPCActorSystem("over-session")
-        let (near, _) = InProcessRawTransport.makePair(debugName: "over-session")
-        let transport = Transport(debugName: "client", role: .initiator, rawTransport: near)
+        let (near, _) = Transport.InProcessRawTransport.makePair("over-session")
+        let transport = Transport(debugName: "client", rawTransport: near)
         let session = system.makeSession(over: transport)
 
         let remote = try await system.makeRemoteInterface(over: session)
@@ -24,8 +24,8 @@ final class MakeInterfaceOverTests: XCTestCase {
 
     func testMakeRemoteInterfaceOverTransportActivatesAndReturnsARemote() async throws {
         let system = XPCActorSystem("over-transport")
-        let (near, _) = InProcessRawTransport.makePair(debugName: "over-transport")
-        let transport = Transport(debugName: "client", role: .initiator, rawTransport: near)
+        let (near, _) = Transport.InProcessRawTransport.makePair("over-transport")
+        let transport = Transport(debugName: "client", rawTransport: near)
 
         // Builds the session and activates the transport; must not throw with no peer present.
         let remote = try await system.makeRemoteInterface(over: transport)
@@ -39,8 +39,8 @@ final class MakeInterfaceOverTests: XCTestCase {
     /// activates -- so by the time the remote interface is handed back, the export has run.
     func testMakeBidirectionalInterfaceRunsTheHandoffAndActivates() async throws {
         let system = XPCActorSystem("bidi")
-        let (near, _) = InProcessRawTransport.makePair(debugName: "bidi")
-        let transport = Transport(debugName: "client", role: .initiator, rawTransport: near)
+        let (near, _) = Transport.InProcessRawTransport.makePair("bidi")
+        let transport = Transport(debugName: "client", rawTransport: near)
 
         let exported = Flag()
         let remote = try await system.makeBidirectionalInterface(over: transport) { handoff in

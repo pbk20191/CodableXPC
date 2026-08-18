@@ -187,16 +187,16 @@ private final class ServedLink: @unchecked Sendable {
 
         let receiver = self.receiver
         listener = try XPCListener { request in
-            let (decision, raw) = XPCRawTransport.accepting(request)
+            let (decision, raw) = Transport.XPCRawTransport.accepting(request)
             receiver.accept(raw, debugName: "served")
             return decision
         }
         receiver.setCancellationHandler { [listener] in listener.cancel() }
 
-        let raw = try XPCRawTransport.connecting(to: listener.endpoint)
-        clientTransport = Transport(debugName: "client", role: .initiator, rawTransport: raw)
+        let raw = try Transport.XPCRawTransport.connecting(to: listener.endpoint)
+        clientTransport = Transport(debugName: "client", rawTransport: raw)
         client = clientSystem.makeSession(over: clientTransport)
-        try raw.activate()
+        try raw.activate(linking: clientTransport!)
 
         // The listener's handler does not run until the peer's first message arrives -- dialling
         // alone establishes nothing. A notification needs no reply, so it is the cheapest nudge.
@@ -216,7 +216,7 @@ private final class ServedLink: @unchecked Sendable {
     }
 
     func tearDown() {
-        clientTransport?.cancel(reason: "test over")
+        clientTransport?.cancel()
         listener.cancel()
     }
 }

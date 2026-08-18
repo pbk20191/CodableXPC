@@ -280,12 +280,16 @@ extension XPCActorSystem.TransportReceiver {
     /// unlike the suspended-connection path there is nothing left to start; the session, its
     /// handlers and its peer task are all in place, and the local-interface gate carries the
     /// export-then-serve ordering.
-    public func accept(_ raw: XPCRawTransport, debugName: String = "peer") {
-        let transport = Transport(debugName: debugName, role: .responder, rawTransport: raw)
+    public func accept(_ raw: Transport.XPCRawTransport, debugName: String = "peer") {
+        let transport = Transport(debugName: debugName, rawTransport: raw)
         do {
+            // Link the raw transport (sets its back-reference and marks the peer gate
+            // activated) synchronously, before `attachTransport` seats the session, so the
+            // accepted session's already-installed handlers have somewhere to route.
+            try raw.activate(linking: transport)
             try attachTransport(transport)
         } catch {
-            raw.cancel(reason: "\(error)")
+            raw.cancel()
         }
     }
 }
@@ -362,7 +366,7 @@ extension XPCActorSystem {
                 // attach it -- all before returning the decision, so the session's packet
                 // handler is installed before any inbound message can be delivered on the
                 // same serial queue.
-                let (decision, transport) = XPCRawTransport.accepting(request)
+                let (decision, transport) = Transport.XPCRawTransport.accepting(request)
                 receiver.accept(transport, debugName: service.debugName)
                 return decision
             }

@@ -9,7 +9,7 @@ import Distributed
 /// Apple's intent (Apple's is a libxpc listener requirement; this side's attestation is
 /// message-level, so the check is per request).
 ///
-/// Both branches are driven deterministically over an ``InProcessRawTransport`` pair by setting
+/// Both branches are driven deterministically over an ``Transport.InProcessRawTransport`` pair by setting
 /// the server end's ``PeerAttestation`` to a stub.
 @available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 final class ConnectionRequirementTests: XCTestCase {
@@ -29,15 +29,15 @@ final class ConnectionRequirementTests: XCTestCase {
             local.export(DirectGreeter(actorSystem: serverSystem), asServerActorFor: "greeter")
             return await local.activateThenWaitForCancellation()
         }
-        let (near, far) = InProcessRawTransport.makePair(debugName: "cr")
+        let (near, far) = Transport.InProcessRawTransport.makePair("cr")
         far.peerAttestation = peerAttestation
-        let farTransport = Transport(debugName: "server", role: .responder, rawTransport: far)
-        try await farTransport.activate()
+        let farTransport = Transport(debugName: "server", rawTransport: far)
+        try farTransport.activate()
         try receiver.attachTransport(farTransport)
 
-        let clientTransport = Transport(debugName: "client", role: .initiator, rawTransport: near)
+        let clientTransport = Transport(debugName: "client", rawTransport: near)
         let clientSession = clientSystem.makeSession(over: clientTransport)
-        try await clientTransport.activate()
+        try clientTransport.activate()
 
         alive.append(contentsOf: [serverSystem, clientSystem, receiver, farTransport, clientTransport])
         return clientSession

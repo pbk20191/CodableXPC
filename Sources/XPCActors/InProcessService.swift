@@ -62,13 +62,13 @@ extension XPCActorSystem {
             guard let receiver = InProcessListenerRegistry.shared.receiver(for: name) else {
                 throw SetupError("no in-process service is listening as \(name)")
             }
-            let (near, far) = InProcessRawTransport.makePair(debugName: name)
+            let (near, far) = Transport.InProcessRawTransport.makePair(name)
             // Hand the far end to the listener: activate it, then attach, which runs the peer
             // handler (export + activate) under the shut-interface gate exactly as the XPC
             // accept path does.
-            let farTransport = Transport(debugName: name, role: .responder, rawTransport: far)
+            let farTransport = Transport(debugName: name, rawTransport: far)
             do {
-                try await farTransport.activate()
+                try farTransport.activate()
             } catch {
                 throw SetupError(
                     "could not activate the in-process server end for \(name): \(error)")
@@ -78,7 +78,7 @@ extension XPCActorSystem {
             } catch {
                 throw SetupError("the in-process listener for \(name) refused the peer: \(error)")
             }
-            return Transport(debugName: name, role: .initiator, rawTransport: near)
+            return Transport(debugName: name, rawTransport: near)
         }
     }
 

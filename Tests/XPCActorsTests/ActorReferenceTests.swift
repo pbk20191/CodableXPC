@@ -14,11 +14,11 @@ final class ActorReferenceTests: XCTestCase {
     func testAnActorReferenceRoundTripsToARemoteProxy() throws {
         let serverSystem = XPCActorSystem("ref-server")
         let clientSystem = XPCActorSystem("ref-client")
-        let (near, far) = InProcessRawTransport.makePair(debugName: "ref")
+        let (near, far) = Transport.InProcessRawTransport.makePair("ref")
         let clientSession = clientSystem.makeSession(
-            over: Transport(debugName: "client", role: .initiator, rawTransport: near))
+            over: Transport(debugName: "client", rawTransport: near))
         let serverSession = serverSystem.makeSession(
-            over: Transport(debugName: "server", role: .responder, rawTransport: far))
+            over: Transport(debugName: "server", rawTransport: far))
 
         let greeter = DirectGreeter(actorSystem: serverSystem)
         let reference = XPCActorSystem.ActorReference(greeter, as: DirectGreeter.self)

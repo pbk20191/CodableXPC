@@ -57,10 +57,21 @@ extension XPCActorSystem {
 ///
 /// [sym] `init(queue:N:)`, `acquireSlot(for:) async -> SendToken?`, `releaseSlot(token:)`, with
 /// `inflightCountByPrio`, `pendingRequestsByPrio`, `PriorityBucket`, `SendToken`, `PendingRequest`.
-/// The logic below is a designed reconstruction of that surface (the bodies do not resolve); it
-/// is a plain `actor` where Apple's is `ActorBackedByDispatchSerialQueue` (same serial
-/// guarantee), and uses arrays where Apple uses `Deque` (see the file note).
-actor BackpressureManager<A: Hashable & Sendable> {
+/// The slot-acquisition/queuing logic below is a designed reconstruction of that surface (the
+/// bodies do not resolve); it uses arrays where Apple uses `Deque` (see the file note).
+///
+/// It conforms to ``ActorBackedByDispatchSerialQueue`` as Apple's does, so its executor *is* a
+/// `DispatchSerialQueue` -- which gives it Apple's synchronous entry (`syncToActor`) on top of
+/// the async actor API. The existing `async` `acquireSlot`/`releaseSlot` keep working over that
+/// executor; Apple additionally reaches in *synchronously* (a `syncToActor ... -> Bool` slot
+/// grant), a path the async surface here does not yet expose.
+@available(macOS 14.0, iOS 17.0, tvOS 17.0, watchOS 10.0, *)
+actor BackpressureManager<A: Hashable & Sendable>: ActorBackedByDispatchSerialQueue {
+
+    /// The ``ActorBackedByDispatchSerialQueue/queue`` requirement -- the serial queue that is this
+    /// actor's executor. Apple threads in the **transport's** single serial queue via
+    /// `init(queue:N:)`, shared with the `RequestManager`; see ``Transport``.
+    nonisolated let queue: DispatchSerialQueue
 
     /// Apple's `PriorityBucket: RawRepresentable<UInt8>` -- requests are bucketed into four
     /// priority bands so a freed slot wakes the highest-priority waiter first. `high` is `0` so
@@ -90,9 +101,11 @@ actor BackpressureManager<A: Hashable & Sendable> {
         let continuation: CheckedContinuation<SendToken?, Never>
     }
 
-    /// Apple's `N` -- the maximum number of in-flight requests.
-    let N: UInt8
-    private let isEnabled: Bool
+    /// Apple's `N` -- the maximum number of in-flight requests. `var` because the policy can be
+    /// reconfigured on the live actor via ``apply(_:)`` (Apple's synchronous `setBackpressurePolicy`
+    /// path).
+    var N: UInt8
+    private var isEnabled: Bool
 
     /// Apple's `inflightCountByPrio` / `pendingRequestsByPrio`, one entry per ``PriorityBucket``.
     private var inflightByBucket: [Int]
@@ -100,8 +113,12 @@ actor BackpressureManager<A: Hashable & Sendable> {
 
     private var nextWaiterID: UInt64 = 0
 
-    /// Apple's `init(queue:N:)` -- the serial queue is subsumed by actor isolation here.
-    init(N: UInt8, enabled: Bool) {
+    /// Apple's `init(queue:N:)`. `queue` is the transport's shared serial queue and becomes this
+    /// actor's executor; it defaults to a fresh queue only for standalone construction (tests),
+    /// where Apple would still be handed the transport's.
+    init(queue: DispatchSerialQueue = DispatchSerialQueue(label: "XPCTransport-BackpressureManager"),
+         N: UInt8, enabled: Bool) {
+        self.queue = queue
         self.N = N
         self.isEnabled = enabled
         let bucketCount = PriorityBucket.allCases.count
@@ -110,6 +127,35 @@ actor BackpressureManager<A: Hashable & Sendable> {
     }
 
     private func totalInflight() -> Int { inflightByBucket.reduce(0, +) }
+
+    /// Reconfigure the live limiter to `policy`, returning whether limiting is now active.
+    ///
+    /// This is the isolated body Apple's `Transport.setBackpressurePolicy` reaches **synchronously**
+    /// through ``ActorBackedByDispatchSerialQueue/syncToActor(_:file:line:)`` -- the whole reason
+    /// the manager is a `DispatchSerialQueue`-backed actor rather than a plain one: a non-`async`
+    /// `setBackpressurePolicy` cannot `await`, so it hops onto the queue and mutates in place.
+    ///
+    /// [sym] Apple runs *two* `syncToActor` closures here (one `-> Bool`, one `-> ()`); the exact
+    /// division does not resolve. [inf] Reconstructed as a single apply: on disable it resumes every
+    /// parked waiter with `nil` (they proceed unthrottled, matching ``acquireSlot(for:priority:)``'s
+    /// disabled path) and zeroes the in-flight counts, so nothing stays blocked under a bound that
+    /// no longer applies.
+    ///
+    /// Takes `N`/`enabled` rather than the `XPCActorSystem.BackpressurePolicy` struct so this stays
+    /// at the manager's macOS-14 floor (the policy type is nested in the macOS-15 `XPCActorSystem`).
+    func apply(N: UInt8, enabled: Bool) -> Bool {
+        self.N = N
+        self.isEnabled = enabled
+        if !isEnabled {
+            for bucket in 0..<pendingByBucket.count {
+                while !pendingByBucket[bucket].isEmpty {
+                    pendingByBucket[bucket].removeFirst().continuation.resume(returning: nil)
+                }
+            }
+            inflightByBucket = Array(repeating: 0, count: PriorityBucket.allCases.count)
+        }
+        return isEnabled
+    }
 
     /// Acquire a send slot for `id` at `priority`. `nil` when backpressure is disabled (the
     /// caller proceeds and owes no release). Otherwise a ``SendToken`` -- immediately if a slot

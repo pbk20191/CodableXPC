@@ -903,7 +903,7 @@ public final class Session: SessionCoding, OutboundSession, InboundSession, @unc
     func cancel(because reason: String) {
         switch kind {
         case .xpc(let transport):
-            transport.cancel(reason: reason)
+            transport.cancel()
         case .local(let local):
             // A `.local` session has no transport to tear down: trip its own one-shot fuse
             // (Apple's `LocalSessionState`'s) and release the exported actors.

@@ -33,10 +33,10 @@ private final class EphemeralServing: @unchecked Sendable {
 
     private let lock = NSLock()
     private var receiver: XPCActorSystem.TransportReceiver?
-    private var pending: [(XPCRawTransport, String)] = []
+    private var pending: [(Transport.XPCRawTransport, String)] = []
 
     /// Called from the listener's (synchronous) accept handler.
-    func accept(_ raw: XPCRawTransport, debugName: String) {
+    func accept(_ raw: Transport.XPCRawTransport, debugName: String) {
         lock.lock()
         if let receiver {
             lock.unlock()
@@ -204,7 +204,7 @@ extension XPCActorSystem {
     ) -> EphemeralServiceWithListeningTask {
         let serving = EphemeralServing()
         let listener = XPCListener { request in
-            let (decision, raw) = XPCRawTransport.accepting(request)
+            let (decision, raw) = Transport.XPCRawTransport.accepting(request)
             serving.accept(raw, debugName: name)
             return decision
         }

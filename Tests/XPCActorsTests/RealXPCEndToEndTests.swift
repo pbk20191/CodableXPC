@@ -8,7 +8,7 @@ import XPCOverlayCoder
 /// The whole stack over **real XPC**, not the in-process loopback.
 ///
 /// Every other end-to-end test in this package runs two `XPCActorSystem`s over
-/// `InProcessRawTransport`, a queue-based pair that never touches XPC. That exercises
+/// `Transport.InProcessRawTransport`, a queue-based pair that never touches XPC. That exercises
 /// the format and the session layer and proves nothing about the transport: the
 /// envelope is handed straight from one closure to another, so `xpc_dictionary_*`
 /// round-tripping, the overlay coder's `xpc_data` body, and the connection lifecycle
@@ -44,7 +44,7 @@ final class RealXPCEndToEndTests: XCTestCase {
 
     /// Our packet survives a real XPC crossing with its body still an `xpc_data` blob.
     ///
-    /// Separate from the call above on purpose: `XPCRawTransport.accepting` owns the
+    /// Separate from the call above on purpose: `Transport.XPCRawTransport.accepting` owns the
     /// listener's message handler, so there is no seam to snoop the actor stack's own
     /// traffic without adding production API for a test. This sends the same bytes our
     /// transport would send, through the same machinery, and inspects what arrives —
@@ -135,7 +135,7 @@ final class RealXPCEndToEndTests: XCTestCase {
             return await local.activateThenWaitForCancellation()
         }
         let listener = XPCListener { request in
-            let (decision, raw) = XPCRawTransport.accepting(request)
+            let (decision, raw) = Transport.XPCRawTransport.accepting(request)
             receiver.accept(raw, debugName: "ephemeral")
             return decision
         }
@@ -235,17 +235,20 @@ private final class RealLink: @unchecked Sendable {
         listener = try XPCListener { request in
             // Apple's overlay: the accepted session is already live, so there is nothing to
             // activate -- the transport is built `isAlreadyActive: true`.
-            let (decision, raw) = XPCRawTransport.accepting(request)
-            let transport = Transport(debugName: "server", role: .responder, rawTransport: raw)
+            let (decision, raw) = Transport.XPCRawTransport.accepting(request)
+            let transport = Transport(debugName: "server", rawTransport: raw)
             let session = system.makeSession(over: transport)
+            // Link the accepted (already-live) raw transport so inbound traffic has somewhere to
+            // route; for the peer role this only sets the back-reference and marks the gate.
+            try? raw.activate(linking: transport)
             ready.publish(transport: transport, session: session, raw: raw)
             return decision
         }
 
-        let raw = try XPCRawTransport.connecting(to: listener.endpoint)
-        clientTransport = Transport(debugName: "client", role: .initiator, rawTransport: raw)
+        let raw = try Transport.XPCRawTransport.connecting(to: listener.endpoint)
+        clientTransport = Transport(debugName: "client", rawTransport: raw)
         clientSession = clientSystem.makeSession(over: clientTransport)
-        try raw.activate()
+        try raw.activate(linking: clientTransport)
 
         // The server side is built inside the listener's handler, which does not run
         // until the peer's first message arrives -- an XPC session is not established by
@@ -262,8 +265,8 @@ private final class RealLink: @unchecked Sendable {
     }
 
     func tearDown() {
-        clientTransport?.cancel(reason: "test over")
-        serverTransport?.cancel(reason: "test over")
+        clientTransport?.cancel()
+        serverTransport?.cancel()
         listener.cancel()
     }
 
@@ -287,11 +290,11 @@ private final class RealLink: @unchecked Sendable {
         private let lock = NSLock()
         private var _transport: Transport?
         private var _session: Session?
-        private var _raw: XPCRawTransport?
+        private var _raw: Transport.XPCRawTransport?
         var transport: Transport? { lock.withLock { _transport } }
         var session: Session? { lock.withLock { _session } }
-        var raw: XPCRawTransport? { lock.withLock { _raw } }
-        func publish(transport: Transport, session: Session, raw: XPCRawTransport) {
+        var raw: Transport.XPCRawTransport? { lock.withLock { _raw } }
+        func publish(transport: Transport, session: Session, raw: Transport.XPCRawTransport) {
             lock.withLock { _transport = transport; _session = session; _raw = raw }
         }
     }

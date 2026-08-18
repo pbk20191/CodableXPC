@@ -94,10 +94,10 @@ final class RequestTableTerminalTests: XCTestCase {
     /// through `Transport`, a send after cancellation reports the transport failure
     /// even without the terminal state.
     func testSendRequestAfterCancelReturnsRatherThanHanging() async throws {
-        let (a, _) = InProcessRawTransport.makePair()
-        let transport = Transport(debugName: "terminal", role: .initiator, rawTransport: a)
-        try await transport.activate()
-        transport.cancel(reason: "probe")
+        let (a, _) = Transport.InProcessRawTransport.makePair()
+        let transport = Transport(debugName: "terminal", rawTransport: a)
+        try transport.activate()
+        transport.cancel()
 
         let payload = try Packet.Payload(encoding: 1 as Int, userInfo: [:])
         let outcome = await withTimeout { await transport.sendRequest(seq: 7, payload) }

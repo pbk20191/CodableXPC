@@ -1,4 +1,5 @@
 import Foundation
+import Dispatch
 
 /// Correlates replies with the requests that are waiting for them.
 ///
@@ -8,7 +9,23 @@ import Foundation
 ///
 /// There is no timeout. A request waits until the peer replies, the calling task
 /// is cancelled, or the transport dies.
-public actor RequestTable {
+///
+/// [sym] Apple's counterpart is the generic `XPCDistributed.RequestManager<A, B>` --
+/// specialized on this transport as `RequestManager<ID64, Result<Payload, TransportError>>`
+/// (its `withRequest(id:replyHandler:perform:)` / `cancel(to:with:)` are what ``waitForReply``
+/// and ``deliver``/``failAll`` reconstruct). Like Apple's, it conforms to
+/// ``ActorBackedByDispatchSerialQueue``, so its executor *is* a `DispatchSerialQueue`. The
+/// per-request `RequestManager<A, B>.Request` state machine is folded into this table's
+/// `waiters`/`terminalFailure` here (see the note on ``terminalFailure``).
+@available(macOS 14.0, iOS 17.0, tvOS 17.0, watchOS 10.0, *)
+public actor RequestTable: ActorBackedByDispatchSerialQueue {
+
+    /// The ``ActorBackedByDispatchSerialQueue/queue`` requirement -- the serial queue that is this
+    /// actor's executor, matching Apple's serial-queue-backed `RequestManager`. Apple threads in
+    /// the **transport's** single serial queue (shared with the `BackpressureManager`); see
+    /// ``Transport``. `public` because this actor is public and the requirement lives in a public
+    /// protocol.
+    public nonisolated let queue: DispatchSerialQueue
 
     public enum Outcome: Sendable {
         case reply(Packet.Payload)
@@ -36,7 +53,11 @@ public actor RequestTable {
     /// event we have: the transport dying takes every request with it.
     private var terminalFailure: TransportError?
 
-    public init() {}
+    /// `queue` is the transport's shared serial queue and becomes this actor's executor; it
+    /// defaults to a fresh queue only for standalone construction (tests).
+    public init(queue: DispatchSerialQueue = DispatchSerialQueue(label: "XPCTransport-RequestManager")) {
+        self.queue = queue
+    }
 
     public var pendingCount: Int { waiters.count }
 

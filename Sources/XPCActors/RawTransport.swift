@@ -1,59 +1,48 @@
 import Foundation
 
-/// The byte pipe, with everything above it abstracted away.
-///
-/// This seam is why the whole stack is testable without XPC, a second process, or
-/// an installed service, and it is where an `xpc_connection_t`-backed transport
-/// would slot in later to lower the deployment floor to macOS 13.
-public protocol RawTransportProtocol: AnyObject, Sendable {
-    /// Install the inbound handler. Must be called before `activate()`; packets
-    /// that arrive with no handler installed are dropped.
-    func setPacketHandler(_ handler: @escaping @Sendable (Packet) -> Void)
+@available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
+extension Transport {
 
-    /// Called when the pipe dies for a reason that did not originate on this side --
-    /// the peer crashed, exited, or cancelled. Install before `activate()`.
+    /// The byte pipe, with everything above it abstracted away.
     ///
-    /// This exists because the protocol has no timeout: without it, a request whose
-    /// peer died is indistinguishable from one whose peer is merely slow, and waits
-    /// forever.
-    func setCancellationHandler(_ handler: @escaping @Sendable (String) -> Void)
+    /// This seam is why the whole stack is testable without XPC, a second process, or an
+    /// installed service, and it is where a different transport would slot in.
+    ///
+    /// Apple's `Transport.RawTransportProtocol` -- **exactly four requirements**, and not
+    /// class-constrained (`Transport.rawTransport` is a boxed opaque existential, not two
+    /// words). The raw transport is handed its parent ``Transport`` via ``activate(linking:)``
+    /// and routes inbound packets and pipe-death back into it through the parent's
+    /// ``Transport/handleReceivedPacket(_:)`` and ``Transport/handleCancellation()`` -- a
+    /// back-reference, not injected closures.
+    public protocol RawTransportProtocol: Sendable {
 
-    func activate() throws(RawTransportError)
+        /// Bring the pipe up, linking it to the ``Transport`` that owns it. The raw transport
+        /// stores the back-reference and routes inbound traffic and pipe-death into it.
+        func activate(linking transport: Transport) throws(SetupError)
 
-    func send(packet: Packet) throws(RawTransportError)
+        /// The only place a packet leaves this side.
+        func send(packet: Packet) throws(RawTransportError)
 
-    /// Tear the pipe down and release what it holds.
-    ///
-    /// **This call is mandatory, not merely tidy.** Every conformer holds a reference
-    /// cycle that only `cancel` breaks, because a live pipe must stay reachable from
-    /// the callback that feeds it:
-    ///
-    /// - `InProcessRawTransport` — each end strongly holds `remoteEnd`, so the pair
-    ///   keeps itself alive; `cancel` unlinks it.
-    /// - `XPCRawTransport` — transport → session → incoming-message closure → box →
-    ///   transport; `cancel` clears the box.
-    ///
-    /// A transport that is dropped without being cancelled leaks itself and its
-    /// session. `cancel` is idempotent and keeps the first reason, which is the one
-    /// that explains why the pipe died.
-    func cancel(reason: String)
+        /// Tear the pipe down and release what it holds. Idempotent.
+        func cancel()
 
-    /// What this transport can prove about the process on the other end, or `nil` when it
-    /// can prove nothing.
-    ///
-    /// Apple's `RawTransportProtocol.auditToken : audit_token_t?`, one level of indirection
-    /// further out: the *token* is the only identity an XPC pipe has, but it is not the only
-    /// identity a transport could have, and every consumer of it only ever asks it one
-    /// question. Handing over the question-answerer rather than the token keeps
-    /// ``Session``'s two gates written against "can the peer prove this" instead of against
-    /// Mach.
-    ///
-    /// Defaulted to `nil` so that a transport which cannot attest says so by saying nothing.
-    /// `nil` is **not** "yes": see ``PeerAttestation``.
-    var peerAttestation: (any PeerAttestation)? { get }
+        /// What this transport can prove about the process on the other end, or `nil` when it
+        /// can prove nothing.
+        ///
+        /// Apple's `RawTransportProtocol.auditToken : audit_token_t?`, one level of indirection
+        /// further out -- a deliberate, documented deviation: the *token* is the only identity
+        /// an XPC pipe has, but it is not the only identity a transport could have, and every
+        /// consumer only ever asks it one question. Handing over the question-answerer rather
+        /// than the token keeps ``Session``'s gates written against "can the peer prove this"
+        /// instead of against Mach.
+        ///
+        /// Defaulted to `nil` so a transport that cannot attest says so by saying nothing.
+        /// `nil` is **not** "yes": see ``PeerAttestation``.
+        var peerAttestation: (any PeerAttestation)? { get }
+    }
 }
 
 @available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
-extension RawTransportProtocol {
+extension Transport.RawTransportProtocol {
     public var peerAttestation: (any PeerAttestation)? { nil }
 }

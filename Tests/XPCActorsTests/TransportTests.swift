@@ -17,11 +17,11 @@ final class TransportTests: XCTestCase {
     /// A live pair. `activate()` exchanges nothing now, so there is no state either end
     /// has to reach before traffic flows.
     private func makePair() async throws -> (Transport, Transport) {
-        let (rawA, rawB) = InProcessRawTransport.makePair(debugName: "transport")
-        let client = Transport(debugName: "client", role: .initiator, rawTransport: rawA)
-        let server = Transport(debugName: "server", role: .responder, rawTransport: rawB)
-        try await server.activate()
-        try await client.activate()
+        let (rawA, rawB) = Transport.InProcessRawTransport.makePair("transport")
+        let client = Transport(debugName: "client", rawTransport: rawA)
+        let server = Transport(debugName: "server", rawTransport: rawB)
+        try server.activate()
+        try client.activate()
         return (client, server)
     }
 
@@ -29,23 +29,23 @@ final class TransportTests: XCTestCase {
     /// packet category on the wire that no real peer has a case for, and would then wait
     /// forever for an answer nobody sends. Activation must complete on its own.
     func testActivateSendsNothingAndBlocksOnNothing() async throws {
-        let (rawA, rawB) = InProcessRawTransport.makePair(debugName: "silent-activate")
-        let client = Transport(debugName: "client", role: .initiator, rawTransport: rawA)
+        let (rawA, rawB) = Transport.InProcessRawTransport.makePair("silent-activate")
+        let client = Transport(debugName: "client", rawTransport: rawA)
         // The far end is never activated and never handles a packet, so a client that
         // waited for a peer would hang here rather than return.
-        let server = Transport(debugName: "server", role: .responder, rawTransport: rawB)
+        let server = Transport(debugName: "server", rawTransport: rawB)
         server.inboundRequestHandler = { _, _, _ in XCTFail("nothing is sent on activate") }
         server.inboundNotificationHandler = { _ in XCTFail("nothing is sent on activate") }
-        try await client.activate()
-        try await server.activate()
+        try client.activate()
+        try server.activate()
     }
 
     func testBothRolesActivateTheSameWay() async throws {
         let (client, server) = try await makePair()
-        XCTAssertEqual(client.role, .initiator)
-        XCTAssertEqual(server.role, .responder)
-        // And either can immediately originate, with no ordering between the two
-        // activations having mattered.
+        // Role no longer lives on `Transport` (it moved onto `XPCRawTransport` in Apple's
+        // back-reference model), so there is nothing to assert about it here. What the test
+        // is really about survives: either end can immediately originate, with no ordering
+        // between the two activations having mattered.
         server.inboundRequestHandler = { _, _, reply in
             reply(try! Packet.Payload(encoding: Ping(value: 1), userInfo: [:]))
         }
@@ -71,19 +71,20 @@ final class TransportTests: XCTestCase {
     /// A response re-uses the request's `headerID`, which is the only thing correlating
     /// the two: both travel one-way and XPC's own reply channel is unused.
     func testAReplyCarriesTheRequestsHeaderID() async throws {
-        let (rawA, rawB) = InProcessRawTransport.makePair(debugName: "header-id")
-        let client = Transport(debugName: "client", role: .initiator, rawTransport: rawA)
+        let (rawA, rawB) = Transport.InProcessRawTransport.makePair("header-id")
+        let client = Transport(debugName: "client", rawTransport: rawA)
+        // The far end is wired through its own `Transport`, whose request handler is given the
+        // id and answers by hand -- so the assertion is about the id on the wire rather than
+        // about our own reply path agreeing with our own send path.
+        let server = Transport(debugName: "server", rawTransport: rawB)
         let seen = SeqBox()
-        rawB.setPacketHandler { packet in
-            guard case .request(let id) = packet.header else { return }
-            seen.value = id.rawValue
-            // Answer by hand, so the assertion is about the id on the wire rather than
-            // about our own reply path agreeing with our own send path.
-            try? rawB.send(packet: Packet(header: .response(id),
+        server.inboundRequestHandler = { seq, _, _ in
+            seen.value = seq
+            try? rawB.send(packet: Packet(header: .response(ID64(rawValue: seq)),
                                           payload: try! Packet.Payload(encoding: Ping(value: 9), userInfo: [:])))
         }
-        try await client.activate()
-        try rawB.activate()
+        try client.activate()
+        try server.activate()
 
         let seq = client.allocateSeq()
         let outcome = await client.sendRequest(seq: seq, try Packet.Payload(encoding: Ping(value: 1), userInfo: [:]))
@@ -205,14 +206,15 @@ final class TransportTests: XCTestCase {
     /// A notification is sent with no id at all, and an inbound one is delivered without
     /// consulting the request table -- so it can never resolve somebody's request.
     func testANotificationCarriesNoCorrelationID() async throws {
-        let (rawA, rawB) = InProcessRawTransport.makePair(debugName: "notification-id")
-        let client = Transport(debugName: "client", role: .initiator, rawTransport: rawA)
+        let (rawA, rawB) = Transport.InProcessRawTransport.makePair("notification-id")
+        let client = Transport(debugName: "client", rawTransport: rawA)
+        let server = Transport(debugName: "server", rawTransport: rawB)
         let seen = SeqBox()
-        rawB.setPacketHandler { packet in
-            if case .notification = packet.header { seen.value = packet.header.id?.rawValue ?? 0 }
-        }
-        try await client.activate()
-        try rawB.activate()
+        // A notification is delivered without a header id at all; the inbound notification
+        // handler is handed only the payload, so "no correlation id" is what it observes.
+        server.inboundNotificationHandler = { _ in seen.value = 0 }
+        try client.activate()
+        try server.activate()
         try client.sendNotification(try Packet.Payload(encoding: Ping(value: 1), userInfo: [:]))
         let arrived = await waitUntil({ seen.value != nil })
         XCTAssertTrue(arrived, "the notification never arrived")
@@ -229,7 +231,7 @@ final class TransportTests: XCTestCase {
             )
         }
         while await client.pendingRequestCount == 0 { await Task.yield() }
-        client.cancel(reason: "shutting down")
+        client.cancel()
 
         // Watched, not awaited -- the same discipline as the peer-death test below, and
         // for the same reason: the regression this guards is "the caller is never
@@ -258,7 +260,7 @@ final class TransportTests: XCTestCase {
         while await client.pendingRequestCount == 0 { await Task.yield() }
 
         // Kill only the far end. The client is never told directly.
-        server.cancel(reason: "peer went away")
+        server.cancel()
 
         // Wait on the observable, not on the request itself: without the death channel
         // `task.value` never returns, and awaiting it would hang the suite instead of
@@ -270,18 +272,20 @@ final class TransportTests: XCTestCase {
         guard case .failed(.transportCancelled(let message)) = box.outcome else {
             return XCTFail("expected .transportCancelled, got \(String(describing: box.outcome))")
         }
-        XCTAssertTrue(message.contains("peer went away"), message)
+        // The cancellation reason no longer crosses the pipe -- Apple's death path carries a
+        // fixed message -- so the client sees the peer-gone reason, not the far end's wording.
+        XCTAssertTrue(message.contains("peer is gone"), message)
     }
 
     func testRemoteDeathAndLocalCancelCannotDoubleFire() async throws {
         // Both paths run the same teardown; the `cancelled` flag is what stops the
         // second one.
         let (client, server) = try await makePair()
-        server.cancel(reason: "peer went away")
+        server.cancel()
         let noticed = await waitUntil({ client.isCancelled })
         XCTAssertTrue(noticed, "the client should have learned of the peer's death")
-        client.cancel(reason: "and now us too")
-        client.cancel(reason: "again")
+        client.cancel()
+        client.cancel()
         // Reaching here without a crash is the assertion; confirm state is coherent.
         XCTAssertTrue(client.isCancelled)
         let pending = await client.pendingRequestCount
@@ -292,13 +296,13 @@ final class TransportTests: XCTestCase {
     /// "no version negotiated yet"; there is nothing left to negotiate, so a caller who
     /// activates and immediately sends is doing nothing wrong.
     func testTrafficNeedsNoPreamble() async throws {
-        let (rawA, rawB) = InProcessRawTransport.makePair(debugName: "no-preamble")
-        let client = Transport(debugName: "client", role: .initiator, rawTransport: rawA)
-        let server = Transport(debugName: "server", role: .responder, rawTransport: rawB)
+        let (rawA, rawB) = Transport.InProcessRawTransport.makePair("no-preamble")
+        let client = Transport(debugName: "client", rawTransport: rawA)
+        let server = Transport(debugName: "server", rawTransport: rawB)
         let arrived = expectation(description: "notification arrives")
         server.inboundNotificationHandler = { _ in arrived.fulfill() }
-        try await client.activate()
-        try await server.activate()
+        try client.activate()
+        try server.activate()
         try client.sendNotification(try Packet.Payload(encoding: Ping(value: 1), userInfo: [:]))
         await fulfillment(of: [arrived], timeout: 2)
     }

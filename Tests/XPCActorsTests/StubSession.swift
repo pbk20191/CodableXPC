@@ -14,10 +14,9 @@ extension XPCActorSystem {
     /// these call sites were spelled before; it now comes from the system that owns it,
     /// so this is the whole of what those call sites need.
     func makeDetachedSession(debugName: String = "detached") -> Session {
-        let (near, _) = InProcessRawTransport.makePair(debugName: debugName)
+        let (near, _) = Transport.InProcessRawTransport.makePair(debugName)
         return makeSession(over: Transport(debugName: debugName,
-                                           role: .initiator,
-                                           rawTransport: near))
+                                                                                      rawTransport: near))
     }
 }
 

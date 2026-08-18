@@ -5,7 +5,7 @@ import Distributed
 
 /// ``XPCActorSystem/InProcessService`` -- a named service reached over an in-process transport,
 /// no launchd and no XPC crossing. `listen(on:executingForEachPeer:)` registers a server under a
-/// name; `makeRemoteInterface(to:)` dials it, paired over an ``InProcessRawTransport``, and a
+/// name; `makeRemoteInterface(to:)` dials it, paired over an ``Transport.InProcessRawTransport``, and a
 /// call crosses that transport and comes back.
 ///
 /// The mechanism here is a designed reconstruction (Apple's `InProcessService.connect` does not
