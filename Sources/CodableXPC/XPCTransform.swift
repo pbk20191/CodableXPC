@@ -97,7 +97,8 @@ internal extension Data {
 internal func xpcTypeName(_ type:xpc_type_t) -> String {
     
     if #available(macOS 10.15, macCatalyst 13.1, *) {
-        return String(cString: xpc_type_get_name(type))
+        
+        return CFStringCreateWithCStringNoCopy(nil, xpc_type_get_name(type), CFStringBuiltInEncodings.UTF8.rawValue, kCFAllocatorNull) as String
     } else {
         switch type {
         case XPC_TYPE_NULL:

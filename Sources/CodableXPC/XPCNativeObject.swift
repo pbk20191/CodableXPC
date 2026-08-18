@@ -92,6 +92,12 @@ extension XPCNativeObject: Equatable {
     }
 }
 
+extension XPCNativeObject: Hashable {
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(xpc_hash(object))
+    }
+}
+
 extension XPCNativeObject: CustomStringConvertible {
     public var description: String { "XPCNativeObject(\(xpcTypeName(type)))" }
 }

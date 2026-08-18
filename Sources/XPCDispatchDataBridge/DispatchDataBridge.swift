@@ -67,11 +67,6 @@ private extension NSData {
 /// The result is the same either way — the tests assert the two paths produce
 /// identical bytes — so losing this costs speed and nothing else.
 public enum DispatchDataBridge {
-
-    private static let canReplaceSelector =
-        NSSelectorFromString("_canReplaceWithDispatchDataForXPCCoder")
-    private static let createSelector = NSSelectorFromString("_createDispatchData")
-
     /// Whether the substitution can be attempted at all on this OS.
     ///
     /// `@NSManaged` emits the call without checking anything, so a missing
@@ -79,7 +74,7 @@ public enum DispatchDataBridge {
     /// This is what makes it a fallback.
     public static let isAvailable: Bool = {
         let probe = NSData()
-        return probe.responds(to: canReplaceSelector) && probe.responds(to: createSelector)
+        return probe.responds(to: #selector(NSData._canReplaceWithDispatchDataForXPCCoder)) && probe.responds(to: #selector(NSData._createDispatchData))
     }()
 
     /// The `xpc_data` for `data`, by whichever route is cheaper.
