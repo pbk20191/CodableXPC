@@ -24,7 +24,6 @@ import Foundation
 /// serialises, misspells it, while `DirectInvocationDecoder`, the in-process path that
 /// never touches the wire, spells it correctly. Apple fixed the typo only where it was
 /// free to.
-@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 enum InvocationCodingKeys: String, CodingKey {
     case protocolStub
     case genericSubsitutions
@@ -45,7 +44,6 @@ enum InvocationCodingKeys: String, CodingKey {
 /// `executeDistributedTarget` knows each parameter's type statically from the callee
 /// signature and asks for them in order, so a tag would be pure overhead. Labels are
 /// discarded for the same reason.
-@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 public struct InvocationBody: Encodable {
 
     /// The `_DistributedActorStub` a call goes through when it targets a distributed
@@ -104,7 +102,6 @@ public struct InvocationBody: Encodable {
 /// `contents` holds the invocation dictionary *directly*: this is a nesting relative to
 /// a flattened request, and a flattening relative to what the name `InvocationContents`
 /// suggests.
-@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 public struct RemoteInvocationRequest: Encodable {
 
     /// The correlation id. Coded through `ID64`'s own single-value conformance, so it
@@ -211,7 +208,6 @@ public struct InboundRequest: Decodable {
 /// Synthesized here on purpose. Apple's is synthesized -- it has a `CodingKeys` in the
 /// shipping reflection metadata -- so writing the conformance by hand could only
 /// diverge.
-@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 /// Its decode side accepts anything, and that is correct rather than a hole. Apple's
 /// `Ack.init(from:)` (`0x2ad4ebcdc`) opens no container at all -- it destroys the boxed
 /// decoder existential and returns -- so `[0, 7]`, `[0, "junk"]`, `[0, null]` and
@@ -265,7 +261,6 @@ public struct Ack: Codable, Hashable, Sendable {
 ///
 /// Uninhabited, so `encode(to:)` is unreachable by construction rather than by convention --
 /// there is no value of this type to call it on.
-@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 public enum NoSuccess: Codable, Hashable, Sendable {
 
     /// Reached only by a peer that sent tag `0` -- a *success* -- in a response we are decoding
@@ -281,7 +276,6 @@ public enum NoSuccess: Codable, Hashable, Sendable {
     public func encode(to encoder: any Encoder) throws {}
 }
 
-@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 public enum RemoteInvocationResponse<Success: Codable> {
 
     case result(Success)
@@ -311,21 +305,16 @@ public enum RemoteInvocationResponse<Success: Codable> {
 }
 
 /// The void reply: `[0, {}]`, tag zero over an ``Ack``.
-@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 extension RemoteInvocationResponse where Success == Ack {
     public static var void: RemoteInvocationResponse<Ack> { .result(Ack()) }
 }
 
-@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 extension RemoteInvocationResponse: Equatable where Success: Equatable {}
 
-@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 extension RemoteInvocationResponse: Hashable where Success: Hashable {}
 
-@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 extension RemoteInvocationResponse: Sendable where Success: Sendable {}
 
-@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 extension RemoteInvocationResponse: Codable {
 
     public func encode(to encoder: any Encoder) throws {
@@ -373,13 +362,11 @@ extension RemoteInvocationResponse: Codable {
 /// payload, and a text fallback -- three-tier typed propagation. Interop deletes it.
 /// Smuggling the extra fields back in would produce a dictionary a real peer cannot
 /// decode.
-@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 public enum RemoteInvocationFailure: Hashable, Sendable {
     case executionFailed(String)
     case resultPropagationFailed(String)
 }
 
-@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 extension RemoteInvocationFailure: Codable {
 
     private enum CodingKeys: String, CodingKey {
@@ -454,14 +441,12 @@ extension RemoteInvocationFailure: Codable {
 /// The escalation cases are Phase C: nothing sends them yet, but the format is complete.
 ///
 /// `Equatable` rather than `Hashable` only because `TaskPriority` is not `Hashable`.
-@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 public enum RemoteNotification: Equatable, Sendable {
     case invocationCancelled(id: ID64)
     case invocationEscalated(id: ID64, priority: TaskPriority)
     case responseEscalated(id: ID64, priority: TaskPriority)
 }
 
-@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 extension RemoteNotification: Codable {
 
     private enum CodingKeys: String, CodingKey {

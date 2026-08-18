@@ -26,7 +26,6 @@ import XPC
 /// only layer that knows who the peer is. That is Apple's arrangement too:
 /// `RawTransportProtocol.auditToken` → `Session.RemoteInterface.auditToken` →
 /// `audit_token_t.satisfies(requirement:)`.
-@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 public struct PeerRequirement: Sendable, CustomStringConvertible {
 
     /// What this requirement is, in words. Stable, and the only thing a non-token
@@ -73,14 +72,14 @@ public struct PeerRequirement: Sendable, CustomStringConvertible {
 
     #if os(macOS) || targetEnvironment(macCatalyst)
     /// The real thing: an overlay requirement, evaluated by Apple's own checker.
-    @available(macOS 26, macCatalyst 26, *)
+    @available(macOS 26, macCatalyst 26, iOS 26, tvOS 26, watchOS 26, *)
     public init(_ requirement: XPCPeerRequirement, describedAs description: String) {
         self.description = description
         self.box = requirement
     }
 
     /// The overlay requirement this stands for, if it was built from one.
-    @available(macOS 26, macCatalyst 26, *)
+    @available(macOS 26, macCatalyst 26, iOS 26, tvOS 26, watchOS 26, *)
     public var xpcRequirement: XPCPeerRequirement? { box as? XPCPeerRequirement }
     #endif
 }
@@ -96,7 +95,6 @@ public struct PeerRequirement: Sendable, CustomStringConvertible {
 /// the point: 'unknown' is distinct from 'no'."* A transport with no attestation at all
 /// returns `nil` from this, and every gate in ``Session`` folds `nil` into **refuse** — but
 /// it folds it there, deliberately, rather than losing the distinction here.
-@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 public protocol PeerAttestation: Sendable {
 
     /// `true` / `false` / `nil` — satisfied, not satisfied, cannot tell.
@@ -208,13 +206,16 @@ public struct AuditTokenAttestation: PeerAttestation {
 //
 // Each declaration below repeats the demangled signature it binds to, so a mismatch is
 // visible without a demangler.
-
 @available(macOS 26, macCatalyst 26, *)
 extension audit_token_t {
 
     /// `(extension in XPC):__C.audit_token_t.satisfies(requirement: XPC.XPCPeerRequirement)
     /// -> Swift.Bool`
     @_silgen_name("$sSo13audit_token_ta3XPCE9satisfies11requirementSbAC18XPCPeerRequirementV_tF")
+    @available(macOS 26, macCatalyst 26, *)
+    @available(iOS, unavailable)
+    @available(tvOS, unavailable)
+    @available(watchOS, unavailable)
     func xpcBridgedSatisfies(requirement: XPCPeerRequirement) -> Bool
 
     /// `(extension in XPC):__C.audit_token_t.isValid.getter : Swift.Bool`

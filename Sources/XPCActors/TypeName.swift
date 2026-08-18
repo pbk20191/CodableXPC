@@ -6,7 +6,7 @@ import Synchronization
 /// `_typeByName` performs a runtime lookup on every call, so the reverse direction
 /// is cached; the forward direction is cached with it so the two stay one component.
 /// Apple added the same cache to `XPCSystem` between the two builds we can observe.
-@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
+@available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
 public enum TypeName {
 
     /// Both directions under one `Synchronization.Mutex`. The values are metatypes

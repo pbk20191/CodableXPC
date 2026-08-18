@@ -4,7 +4,6 @@ import Foundation
 ///
 /// These never cross the wire. A failure reported *by the peer* arrives as an
 /// `err` reply body instead, and is surfaced in Phase B as `RemoteCallError`.
-@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 public enum RawTransportError: Error, Equatable, Sendable {
     case rawTransportCancelled(message: String)
 }
@@ -15,14 +14,12 @@ public enum RawTransportError: Error, Equatable, Sendable {
 /// means our own caller walked away and the peer is still healthy, the second
 /// means the pipe is gone. Only the first should provoke a cancellation
 /// notification to the peer.
-@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 public enum TransportError: Error, Equatable, Sendable {
     case transportCancelled(message: String)
     case taskCancelled
 }
 
 /// A failure to bring a session up: connecting or activating.
-@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 public struct SetupError: Error, Equatable, Sendable, CustomStringConvertible {
     public let message: String
     public init(_ message: String) { self.message = message }
@@ -34,7 +31,6 @@ public struct SetupError: Error, Equatable, Sendable, CustomStringConvertible {
 /// Envelope violations are deliberately not represented here: `Packet.init?(rawValue:)`
 /// returns `nil` rather than throwing, because a malformed envelope is dropped, never
 /// surfaced to a caller.
-@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 public enum PacketCodingError: Error, Equatable, Sendable {
     /// A `Packet.Payload` with no `"payload"` entry, so there is nothing to decode.
     ///

@@ -8,7 +8,7 @@ import XPC
 /// but the payload is a real overlay-encoded body, so serialization bugs still
 /// surface on this path. That is what makes it a legitimate test substrate rather
 /// than a mock.
-@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
+@available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
 public final class InProcessRawTransport: RawTransportProtocol, @unchecked Sendable {
 
     private let queue: DispatchQueue

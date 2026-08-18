@@ -16,7 +16,7 @@ import Synchronization
 /// initialisers, which is what a non-`final` class produces, and subclassing it is not a
 /// documented extension point. Nothing here needs to be overridable, and `final` is what
 /// lets this be `Sendable` rather than `@unchecked Sendable`.
-@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
+@available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
 public final class XPCActorSystem: Sendable {
 
     /// Diagnostics only. Apple's `XPCSystem.debugName`, never transmitted.
@@ -333,7 +333,7 @@ extension XPCActorSystem: DistributedActorSystem {
 ///
 /// The ``InvocationDecoder`` is passed by value: the runtime takes it `inout` when it
 /// drives `executeDistributedTarget`, but the thunk owns its copy and consumes it there.
-@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
+@available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
 typealias InboundThunk = (
     _ instance: AnyObject,
     _ system: XPCActorSystem,
@@ -350,7 +350,6 @@ typealias InboundThunk = (
 /// pass for anything a user called `$Something`. Runtime-gated because `_DistributedActorStub`
 /// is macOS 15+, above this module's floor; below it no conformer can exist and `false` is
 /// correct. Shared by both inner decoders.
-@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 private func isDistributedActorStub(_ type: Any.Type) -> Bool {
     guard #available(macOS 15, iOS 18, tvOS 18, watchOS 11, *) else { return false }
     return type is any _DistributedActorStub.Type
@@ -369,7 +368,7 @@ private func isDistributedActorStub(_ type: Any.Type) -> Bool {
 /// direction. Apple's message, verbatim. A name that does not resolve is rejected here too, by
 /// the same guard -- an unresolvable name is certainly not a stub, and this *is* the later
 /// failure ``SwiftType`` defers to, raised by the code that tried to use the type.
-@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
+@available(macOS 13.0, iOS 16.0, watchOS 9.0, tvOS 16.0, *)
 private func resolveGenericSubstitutions(
     protocolStub: SwiftType?, _ substitutions: [SwiftType]) throws -> [Any.Type] {
     var wire: [SwiftType] = []
@@ -404,7 +403,7 @@ private func resolveGenericSubstitutions(
 /// by the decoder that read the request, so it carries that decoder's `userInfo`. There is
 /// deliberately no second `userInfo` on this type -- one would be a copy that could disagree
 /// with the one actually in force.
-@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
+@available(macOS 13.0, iOS 16.0, watchOS 9.0, tvOS 16.0, *)
 public struct EncodedInvocationDecoder: DistributedTargetInvocationDecoder, Decodable {
 
     public typealias SerializationRequirement = any Codable
@@ -454,7 +453,7 @@ public struct EncodedInvocationDecoder: DistributedTargetInvocationDecoder, Deco
 /// takes. It carries the caller's own recorded ``InvocationEncoder`` values, consumed
 /// positionally by a cursor exactly as the encoded container's own cursor is, and decodes
 /// nothing -- these are types and values this process already holds, so nothing crosses.
-@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
+@available(macOS 13.0, iOS 16.0, watchOS 9.0, tvOS 16.0, *)
 struct DirectInvocationDecoder: DistributedTargetInvocationDecoder {
 
     public typealias SerializationRequirement = any Codable
@@ -506,7 +505,7 @@ struct DirectInvocationDecoder: DistributedTargetInvocationDecoder {
 /// the ``EncodedInvocationDecoder`` directly (see ``InboundRequest``), so ``Session`` can read
 /// `errorType` off it on the delivering context before the decoder is handed to the runtime;
 /// this conformance is the same shape by the other door.
-@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
+@available(macOS 13.0, iOS 16.0, watchOS 9.0, tvOS 16.0, *)
 public struct InvocationDecoder: DistributedTargetInvocationDecoder, Decodable {
 
     public typealias SerializationRequirement = any Codable
@@ -569,7 +568,6 @@ public struct InvocationDecoder: DistributedTargetInvocationDecoder, Decodable {
 /// `encodeReply` is non-throwing, matching the binary's signature
 /// (`encodeReply<A: Codable, B: Error>(with: Result<A, B>) -> Payload`): a result that will
 /// not encode becomes a *propagation-failure* reply rather than propagating out.
-@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 protocol ReplyHandler {
     func encodeReply<Success: Codable, Failure: Error>(
         with result: Result<Success, Failure>) -> Packet.Payload
@@ -633,7 +631,7 @@ struct RemoteInvocationReplyEncoder: ReplyHandler, @unchecked Sendable {
 /// `errorType`'s presence in a request a *peer* wrote: a peer that omits the key while naming
 /// a throwing target would otherwise be able to crash this process on demand. This is the
 /// same trade `ActorID.encode(to:)` already makes against the same binary.
-@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
+@available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
 final class EncodedResultHandler: DistributedTargetInvocationResultHandler, @unchecked Sendable {
 
     typealias SerializationRequirement = any Codable
@@ -685,7 +683,7 @@ final class EncodedResultHandler: DistributedTargetInvocationResultHandler, @unc
 /// **No `canThrow`.** Apple's `DirectResultHandler.init()` takes none: a same-process capture
 /// has no *peer*-written request to guard against, so a throw is captured unconditionally and
 /// the direct caller (``Session/directSend(key:target:invocation:peer:)``) rethrows it.
-@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
+@available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
 final class DirectResultHandler: DistributedTargetInvocationResultHandler, @unchecked Sendable {
 
     typealias SerializationRequirement = any Codable
@@ -720,11 +718,12 @@ final class DirectResultHandler: DistributedTargetInvocationResultHandler, @unch
 /// `init(direct: DirectResultHandler)`. The runtime calls `on*` on the wrapper; the wrapper
 /// forwards to whichever inner handler it holds, and ``Session`` reads the outcome back off
 /// that inner handler (``reply`` for encoded, ``capturedResult`` for direct).
-@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
+@available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
 public final class ResultHandler: DistributedTargetInvocationResultHandler,
                                   @unchecked Sendable {
 
     public typealias SerializationRequirement = any Codable
+    @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
 
     enum Mode {
         case encoded(EncodedResultHandler)
@@ -739,6 +738,7 @@ public final class ResultHandler: DistributedTargetInvocationResultHandler,
 
     /// The encoded handler built from a request's `userInfo`, the form ``Session`` and the
     /// tests reach for. Wraps a ``RemoteInvocationReplyEncoder`` -- Apple's `ReplyHandler`.
+    @available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
     convenience init(canThrow: Bool, userInfo: [CodingUserInfoKey: Any]) {
         self.init(RemoteInvocationReplyEncoder(userInfo: userInfo), canThrow: canThrow)
     }
@@ -800,7 +800,6 @@ public final class ResultHandler: DistributedTargetInvocationResultHandler,
 ///
 /// Only `.executionFailed` is constructed in this slice, by the stubs. The other three
 /// belong to the transport and cancellation paths.
-@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 public struct RemoteInvocationCancellationError: Error, Equatable, Sendable,
                                                  CustomStringConvertible {
 

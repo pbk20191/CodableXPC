@@ -10,7 +10,7 @@ import Synchronization
 /// Generic over `Thunk` so this file depends on nothing: the thunk's real type
 /// mentions `InvocationDecoder`, `ResultHandler`, and the system itself, none of
 /// which identity or registration has any business knowing about.
-@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
+@available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
 final class ActorRegistry<Thunk>: @unchecked Sendable {
 
     private struct Entry {

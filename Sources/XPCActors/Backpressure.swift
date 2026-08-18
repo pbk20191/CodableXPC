@@ -19,8 +19,7 @@ import Foundation
 // documented placeholder (the getter disassembles to garbage), and the pending queue is a plain
 // array rather than Apple's `CollectionsInternal.Deque` (functionally equivalent for a bounded
 // waiter queue, and this package takes no swift-collections dependency).
-
-@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
+@available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
 extension XPCActorSystem {
 
     /// Apple's `XPCSystem.BackpressurePolicy`. [refl] two fields, `enabled: Bool` and
@@ -61,7 +60,6 @@ extension XPCActorSystem {
 /// The logic below is a designed reconstruction of that surface (the bodies do not resolve); it
 /// is a plain `actor` where Apple's is `ActorBackedByDispatchSerialQueue` (same serial
 /// guarantee), and uses arrays where Apple uses `Deque` (see the file note).
-@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 actor BackpressureManager<A: Hashable & Sendable> {
 
     /// Apple's `PriorityBucket: RawRepresentable<UInt8>` -- requests are bucketed into four

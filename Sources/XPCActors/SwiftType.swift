@@ -15,14 +15,20 @@ import Foundation
 /// decodes cleanly. Apple's own decoder works the same way -- `"Unable to resolve
 /// type: "` is a distinct, later failure raised by whatever tries to use the type, not
 /// by decoding the wrapper.
-@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 public struct SwiftType: Sendable {
 
     public let mangledTypeName: String
 
     /// Resolved lazily, on every access, through `TypeName` -- `nil` when the name does
     /// not (yet, or ever) resolve to a loaded type.
-    public var type: Any.Type? { TypeName.type(for: mangledTypeName) }
+    
+    public var type: Any.Type? {
+        if #available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *) {
+            TypeName.type(for: mangledTypeName)
+        } else {
+            _typeByName(mangledTypeName)
+        }
+    }
 
     public init(mangledTypeName: String) {
         self.mangledTypeName = mangledTypeName
@@ -53,15 +59,21 @@ public struct SwiftType: Sendable {
     /// meaning of the call and a useless name beats no name. That trade belongs at the
     /// call site, spelled out -- `SwiftType(E.self) ?? SwiftType(mangledTypeName: "\(E.self)")`
     /// -- not hidden in an initializer that every other caller also goes through.
+    
     public init?(_ type: Any.Type) {
-        guard let mangled = TypeName.mangled(for: type),
-              TypeName.type(for: mangled) == type
-        else { return nil }
-        self.mangledTypeName = mangled
+        if #available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *) {
+            guard let mangled = TypeName.mangled(for: type),
+                  TypeName.type(for: mangled) == type
+            else { return nil }
+            self.mangledTypeName = mangled
+        } else if let name = _mangledTypeName(type) {
+            self.mangledTypeName = name
+        } else {
+            return nil
+        }
     }
 }
 
-@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 extension SwiftType: Hashable {
     // Equality and hashing are defined over `mangledTypeName` alone. `type` is a
     // derived, cache-backed lookup -- not additional identity -- and two `SwiftType`s
@@ -74,7 +86,6 @@ extension SwiftType: Hashable {
     }
 }
 
-@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 extension SwiftType: Codable {
 
     // A bare String on the wire, not `{ mangledTypeName: ... }`. The struct has two

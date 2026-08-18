@@ -26,7 +26,7 @@ import Synchronization
 /// `Synchronization.Atomic<Bool>` one-shot, read locklessly on the fast path (Apple's
 /// `ldaprb`+`tbz`) and tripped once under the state lock; the parked continuations and the
 /// ticketing live under a `Synchronization.Mutex`.
-@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
+@available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
 final class ActivationEvent: @unchecked Sendable {
 
     /// Apple's `posted: Fuse` -- `{ value: Atomic<Bool> }`. The lockless fast path reads it

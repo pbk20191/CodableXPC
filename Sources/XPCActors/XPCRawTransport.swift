@@ -266,6 +266,22 @@ extension XPCRawTransport {
                 })
         }
     }
+    
+    public static func connecting(
+        using session:XPCSession, targetQueue: DispatchQueue? = nil
+    ) throws(RawTransportError) -> XPCRawTransport {
+        try dialling { box in
+            targetQueue.flatMap(session.setTargetQueue)
+            session.setCancellationHandler { error in
+                box.transport?.handleSessionCancellation(error)
+            }
+            session.setIncomingMessageHandler { (message:XPCDictionary) ->XPCDictionary? in
+                box.transport?.handleIncoming(message)
+                return nil
+            }
+            return session
+        }
+    }
 
     /// Build a client transport from an inactive session, wiring the box before anything can
     /// call back (the session is `.inactive`, so nothing does until `activate()`).

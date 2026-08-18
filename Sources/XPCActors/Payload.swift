@@ -1,7 +1,6 @@
 import Foundation
 import XPC
 
-@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 extension Packet {
 
     /// `Packet.Payload` -- an xpc dictionary with exactly one entry, `"payload"`,
@@ -67,6 +66,7 @@ extension Packet {
         /// Note the asymmetry it protects against: outbound, a missing session **traps**
         /// (`ActorID.encode`); inbound, it **throws** (`ActorID.init(from:)`). Callers
         /// with genuinely nothing session-bound to encode pass `[:]` and say so.
+        @available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
         public init<T: Encodable>(
             encoding value: T,
             userInfo: [CodingUserInfoKey: Any]
@@ -79,7 +79,7 @@ extension Packet {
                 value, forKey: EnvelopeKey.payload, withUserInfo: userInfo)
             self.object = dictionary
         }
-
+        @available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
         public func decode<T: Decodable>(
             as type: T.Type = T.self,
             userInfo: [CodingUserInfoKey: Any] = [:]

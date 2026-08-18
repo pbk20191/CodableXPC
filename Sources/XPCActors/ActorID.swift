@@ -7,7 +7,6 @@ import Synchronization
 /// This exists to break a cycle: `ActorID` needs a session, and `Session` is built on
 /// `ActorID`. Naming only the two operations identity needs also keeps `Distributed`
 /// out of this file, and lets identity be tested with no transport at all.
-@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 public protocol SessionCoding: AnyObject, Sendable {
     /// Make a local actor reachable to the peer and return the key naming it.
     /// `nil` when the actor is not registered -- it was deallocated, or was never ready.
@@ -51,7 +50,6 @@ public protocol SessionCoding: AnyObject, Sendable {
     var systemID: ID64 { get }
 }
 
-@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 extension CodingUserInfoKey {
     /// The `SessionCoding` an `ActorID` codes itself against.
     ///
@@ -69,7 +67,6 @@ extension CodingUserInfoKey {
 ///
 /// Drawn from a process-global monotonic counter -- neither random nor pid-derived,
 /// and it never needs to be unique across processes, because it is never transmitted.
-@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 public struct ID64: Hashable, Sendable, Codable, CustomStringConvertible {
     public let rawValue: UInt64
     public init(rawValue: UInt64) { self.rawValue = rawValue }
@@ -93,17 +90,20 @@ public struct ID64: Hashable, Sendable, Codable, CustomStringConvertible {
         self.rawValue = try decoder.singleValueContainer().decode(UInt64.self)
     }
 
+
+    public var description: String { "\(rawValue)" }
+}
+
+@available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
+extension ID64 {
     /// A monotonic id source. `Synchronization.Atomic` now that the floor is macOS 26 --
     /// the increment is a single atomic, no lock.
     private static let counter = Atomic<UInt64>(0)
     public static func next() -> ID64 {
         ID64(rawValue: counter.wrappingAdd(1, ordering: .relaxed).newValue)
     }
-
-    public var description: String { "\(rawValue)" }
 }
 
-@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 public enum RawActorID: Hashable, @unchecked Sendable {
 
     case local(Local)
@@ -130,7 +130,6 @@ public enum RawActorID: Hashable, @unchecked Sendable {
     }
 }
 
-@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 extension RawActorID.Remote: Hashable {
     /// The session is compared by identity: the same key reached through two different
     /// sessions names two different actors.
@@ -147,13 +146,11 @@ extension RawActorID.Remote: Hashable {
 ///
 /// Its `Codable` conformance is the load-bearing part of the design: what goes on the
 /// wire is a `SharedActorKey` in a single-value container, never the id's own contents.
-@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 public struct ActorID: Hashable, @unchecked Sendable {
     public let raw: RawActorID
     public init(raw: RawActorID) { self.raw = raw }
 }
 
-@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
 extension ActorID: Codable {
 
     public func encode(to encoder: any Encoder) throws {

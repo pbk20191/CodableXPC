@@ -14,7 +14,7 @@ import Distributed
 /// name only means anything wrapped, and keeping the wrapper here rather than at the
 /// boundary is what stops a display string from being spelled the same way as a mangled
 /// one. See `docs/superpowers/specs/2026-08-08-xpcdistributed-interop-wire-format.md`.
-@available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
+@available(macOS 13.0, iOS 16.0, watchOS 9.0, tvOS 16.0, *)
 public struct InvocationEncoder: DistributedTargetInvocationEncoder {
 
     public typealias SerializationRequirement = any Codable
@@ -190,6 +190,7 @@ public struct InvocationEncoder: DistributedTargetInvocationEncoder {
     /// kept to match Apple's signature. **Apple's is also `throws`** -- its rebinding can fail;
     /// the by-reference path cannot, so this one does not, which keeps it callable from
     /// ``Session``'s typed-`throws` direct send without a conversion that would never fire.
+    @available(macOS 26, iOS 26, tvOS 26, watchOS 26, *)
     func makeDirectInvocationDecoder(
         senderSession: Session, receiverSession: Session
     ) -> DirectInvocationDecoder {
