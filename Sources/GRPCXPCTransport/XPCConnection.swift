@@ -36,6 +36,12 @@ struct AcceptedStream: Sendable {
 /// therefore every `route(_:)` call -- runs serially on it. That is what lets
 /// `StreamChannel.accept`'s "callers must invoke `accept` serially per stream" precondition hold
 /// without a second lock inside `StreamChannel` (see StreamChannel.swift).
+///
+/// - Important: Ownership contract -- whoever creates streams from this connection
+///   (``openClientStream(descriptor:)``, or a consumer draining ``acceptedStreams``) must keep
+///   this `XPCConnection` alive for as long as those streams are in use; a stream does not hold
+///   its connection back. Release the connection early and a stream's outbound writes fail with
+///   `RPCError(code: .unavailable, ...)` while its inbound sequence fails rather than hanging.
 @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
 final class XPCConnection: Sendable {
     enum Role: Sendable { case client, server }
@@ -61,6 +67,10 @@ final class XPCConnection: Sendable {
     /// Yields one `AcceptedStream` per inbound `.openStream` frame, each already carrying its
     /// fully built server-side `RPCStream` -- see ``AcceptedStream``'s doc comment for why accept
     /// is one phase, not two.
+    ///
+    /// - Important: whoever drains this must keep the connection alive for as long as the
+    ///   accepted streams stay in use -- see the type's doc comment for the ownership contract
+    ///   and its consequence if violated.
     let acceptedStreams: AsyncStream<AcceptedStream>
 
     /// Wraps `session`.
@@ -239,6 +249,11 @@ final class XPCConnection: Sendable {
 
     /// Allocates a `StreamID`, registers its inbound `StreamChannel`, and returns the full
     /// client-side `RPCStream` (inbound responses + outbound requests writer).
+    ///
+    /// - Important: the caller must keep this connection alive for as long as the returned
+    ///   stream is in use -- the stream does not hold it back. If the connection is released
+    ///   first, further writes fail with `RPCError(code: .unavailable, ...)` and the inbound
+    ///   sequence fails rather than hanging.
     func openClientStream(descriptor: MethodDescriptor)
     -> (StreamID, RPCStream<RPCAsyncSequence<RPCResponsePart<[UInt8]>, any Error>,
                             RPCWriter<RPCRequestPart<[UInt8]>>.Closable>) {
