@@ -1,5 +1,6 @@
 import XCTest
 import GRPCCore
+import Synchronization
 @testable import GRPCXPCTransport
 
 /// Adapted from the task-6 brief's sketch: the brief predates `AcceptedStream`'s one-phase
@@ -10,6 +11,25 @@ import GRPCCore
 /// call (see `XPCServerTransport.listen`'s doc comment for why that alternative doesn't wire up).
 @available(macOS 15.0, *)
 final class XPCServerTransportTests: XCTestCase {
+    /// The echoed message plus everything the terminal `.status` frame is meant to prove: that
+    /// it arrives at all, with the right code, and after the echoed message rather than before
+    /// or instead of it. Built entirely inside the client-side task below and handed out through
+    /// one `Mutex.withLock` write -- not through captured `var`s mutated from outside that task
+    /// -- so nothing here needs cross-task synchronization beyond that single write/read pair.
+    private struct EchoOutcome: Sendable {
+        var echoed: [UInt8]?
+        var finalStatus: Status?
+        var messageArrivedBeforeStatus = false
+    }
+
+    /// Bounded per the review's IMPORTANT 2: originally this awaited `client.withStream(...)`
+    /// directly on the test's own task, so a handler that returns without writing a status or
+    /// finishing outbound would wedge the *test process* indefinitely (reproduced live: 12s+,
+    /// no output) rather than failing fast. Racing the client call against
+    /// `fulfillment(of:timeout:)` -- the same primitive the four lifecycle tests below already
+    /// use -- bounds it the same way: run the call on its own `Task`, have that task fulfill an
+    /// expectation when (or if) it returns, and `await fulfillment(timeout:)` rather than
+    /// `await` the task directly. This is the pattern Task 7's streaming tests should copy.
     func testListenRunsHandlerAndHandlerCanReply() async throws {
         let harness = XPCPairHarness()
         let (clientConn, serverConn) = try await harness.connectPair()
@@ -36,16 +56,40 @@ final class XPCServerTransportTests: XCTestCase {
         }
         defer { listenTask.cancel(); server.beginGracefulShutdown() }
 
-        var echoed: [UInt8]?
-        try await client.withStream(
-            descriptor: MethodDescriptor(fullyQualifiedService: "pkg.S", method: "Echo"),
-            options: .defaults
-        ) { stream, _ in
-            try await stream.outbound.write(.message([7]))
-            await stream.outbound.finish()
-            for try await part in stream.inbound { if case .message(let b) = part { echoed = b } }
+        let outcomeBox = Mutex<EchoOutcome?>(nil)
+        let clientReturned = expectation(description: "client.withStream returned")
+        let clientTask = Task {
+            var outcome = EchoOutcome()
+            try? await client.withStream(
+                descriptor: MethodDescriptor(fullyQualifiedService: "pkg.S", method: "Echo"),
+                options: .defaults
+            ) { stream, _ in
+                try await stream.outbound.write(.message([7]))
+                await stream.outbound.finish()
+                for try await part in stream.inbound {
+                    switch part {
+                    case .message(let b):
+                        outcome.echoed = b
+                        // Whether the message got here before any `.status` was seen -- proves
+                        // ordering (message, then terminal status), not just that both arrived.
+                        outcome.messageArrivedBeforeStatus = outcome.finalStatus == nil
+                    case .status(let status, _):
+                        outcome.finalStatus = status
+                    default:
+                        break
+                    }
+                }
+            }
+            outcomeBox.withLock { $0 = outcome }
+            clientReturned.fulfill()
         }
-        XCTAssertEqual(echoed, [7])
+        await fulfillment(of: [clientReturned], timeout: 5)
+        clientTask.cancel()
+
+        let outcome = outcomeBox.withLock { $0 }
+        XCTAssertEqual(outcome?.echoed, [7])
+        XCTAssertEqual(outcome?.finalStatus?.code, .ok, "the terminal status must reach the client, and must be .ok")
+        XCTAssertEqual(outcome?.messageArrivedBeforeStatus, true, "the echoed message must arrive before the terminal status")
     }
 
     // MARK: - listen()/beginGracefulShutdown() lifecycle
