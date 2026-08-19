@@ -36,3 +36,40 @@ extension XPCFrameTests {
         }
     }
 }
+
+@available(macOS 15.0, *)
+extension XPCFrameTests {
+
+    /// gRPC's own discriminator is the key suffix, not a private tag: `-bin` means the value is
+    /// raw binary, anything else is UTF-8 text.
+    func testTheBinSuffixDiscriminatesBinaryFromString() throws {
+        var md = Metadata()
+        md.addString("plain", forKey: "a")
+        md.addBinary([0x00, 0xFF], forKey: "b-bin")
+        let restored = WireMetadata(md).asMetadata()
+        XCTAssertEqual(Array(restored[stringValues: "a"]), ["plain"])
+        XCTAssertEqual(Array(restored[binaryValues: "b-bin"]).first, [0x00, 0xFF])
+    }
+
+    /// gRPC requires lowercase keys; a mixed-case key must normalize, not round-trip verbatim.
+    func testKeysAreNormalizedToLowercase() throws {
+        var md = Metadata()
+        md.addString("v", forKey: "Mixed-Case")
+        let restored = WireMetadata(md).asMetadata()
+        XCTAssertEqual(Array(restored[stringValues: "mixed-case"]), ["v"])
+    }
+
+    /// Order and repeats survive, through the real xpc encoder this time.
+    func testRepeatedKeysAndOrderSurviveTheXPCRoundTrip() throws {
+        var md = Metadata()
+        md.addString("1", forKey: "k")
+        md.addString("2", forKey: "k")
+        md.addBinary([0x09], forKey: "raw-bin")
+        let frame = XPCFrame.metadata(1, WireMetadata(md))
+        let back = try XPCFrame.decode(from: try frame.encodeToXPC())
+        guard case .metadata(_, let wire) = back else { return XCTFail("wrong case: \(back)") }
+        let restored = wire.asMetadata()
+        XCTAssertEqual(Array(restored[stringValues: "k"]), ["1", "2"])
+        XCTAssertEqual(Array(restored[binaryValues: "raw-bin"]).first, [0x09])
+    }
+}

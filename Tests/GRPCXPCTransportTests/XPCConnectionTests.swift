@@ -61,7 +61,7 @@ final class XPCConnectionTests: XCTestCase {
         // flight (at minimum), well ahead of the accept below.
         try clientConn.send(.openStream(sid, method: "pkg.S/M", deadlineNanos: nil))
         try clientConn.send(.metadata(sid, WireMetadata(Metadata())))
-        try clientConn.send(.message(sid, seq: 0, bytes: Data([1, 2, 3])))
+        try clientConn.send(.message(sid, seq: 0, bytes: GRPCMessageFraming.frame([1, 2, 3])))
         try clientConn.send(.halfClose(sid))
 
         var it = serverConn.acceptedStreams.makeAsyncIterator()

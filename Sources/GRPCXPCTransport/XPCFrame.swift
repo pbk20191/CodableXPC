@@ -6,18 +6,21 @@ import XPC
 @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
 public typealias StreamID = UInt64
 
-/// A `GRPCCore.Metadata` in a Codable shape. Each entry is a key plus a tagged value:
-/// tag 0 = UTF-8 string, tag 1 = raw binary (the gRPC `-bin` convention).
+/// A `GRPCCore.Metadata` in a Codable shape. Each entry is a key plus its raw bytes; binary vs.
+/// string is decided by gRPC's own discriminator -- the `-bin` key suffix -- not by a private
+/// tag, so the wire shape matches the convention every other gRPC implementation uses. Keys are
+/// normalized to lowercase (gRPC metadata keys are case-insensitive and conventionally lowercase).
 @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
 struct WireMetadata: Codable, Sendable {
-    struct Entry: Codable, Sendable { var key: String; var tag: UInt8; var bytes: Data }
+    struct Entry: Codable, Sendable { var key: String; var bytes: Data }
     var entries: [Entry]
 
     init(_ metadata: Metadata) {
         entries = metadata.map { element in
+            let key = element.key.lowercased()
             switch element.value {
-            case .string(let s): Entry(key: element.key, tag: 0, bytes: Data(s.utf8))
-            case .binary(let b): Entry(key: element.key, tag: 1, bytes: Data(b))
+            case .string(let s): return Entry(key: key, bytes: Data(s.utf8))
+            case .binary(let b): return Entry(key: key, bytes: Data(b))
             }
         }
     }
@@ -25,8 +28,8 @@ struct WireMetadata: Codable, Sendable {
     func asMetadata() -> Metadata {
         var md = Metadata()
         for e in entries {
-            if e.tag == 0 { md.addString(String(decoding: e.bytes, as: UTF8.self), forKey: e.key) }
-            else { md.addBinary([UInt8](e.bytes), forKey: e.key) }
+            if e.key.hasSuffix("-bin") { md.addBinary([UInt8](e.bytes), forKey: e.key) }
+            else { md.addString(String(decoding: e.bytes, as: UTF8.self), forKey: e.key) }
         }
         return md
     }

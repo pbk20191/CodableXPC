@@ -70,13 +70,14 @@ final class StreamChannel<Part: Sendable>: Sendable {
             continuation.yield(toPart(.metadata(wireMetadata.asMetadata())))
 
         case .message(_, let seq, let bytes):
+            let payload = try GRPCMessageFraming.unframe(bytes)
             try state.withLock { state in
                 guard state.phase != .terminated else { throw violation() }
                 guard seq == state.nextSeq else { throw violation() }
                 state.nextSeq += 1
                 state.phase = .messages
             }
-            continuation.yield(toPart(.message([UInt8](bytes))))
+            continuation.yield(toPart(.message(payload)))
 
         case .halfClose:
             // Ends the *request* direction only; a response stream never sees halfClose.

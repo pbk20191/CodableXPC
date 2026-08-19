@@ -102,7 +102,7 @@ final class XPCOutboundWriter<Part: Sendable>: ClosableRPCWriterProtocol {
                 return .metadata(streamID, WireMetadata(m))
             case .message(let b):
                 let s = seq.wrappingAdd(1, ordering: .relaxed).oldValue
-                return .message(streamID, seq: s, bytes: Data(b))
+                return .message(streamID, seq: s, bytes: GRPCMessageFraming.frame(b))
             }
         case let resp as RPCResponsePart<[UInt8]>:
             switch resp {
@@ -110,7 +110,7 @@ final class XPCOutboundWriter<Part: Sendable>: ClosableRPCWriterProtocol {
                 return .metadata(streamID, WireMetadata(m))
             case .message(let b):
                 let s = seq.wrappingAdd(1, ordering: .relaxed).oldValue
-                return .message(streamID, seq: s, bytes: Data(b))
+                return .message(streamID, seq: s, bytes: GRPCMessageFraming.frame(b))
             case .status(let status, let trailers):
                 return .status(streamID, code: status.code.rawValue, message: status.message,
                                 trailers: WireMetadata(trailers))

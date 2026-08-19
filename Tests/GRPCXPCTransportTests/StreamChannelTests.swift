@@ -7,8 +7,8 @@ final class StreamChannelTests: XCTestCase {
     func testServerInboundDeliversMetadataThenMessagesInOrder() async throws {
         let (channel, inbound) = StreamChannel<RPCRequestPart<[UInt8]>>.serverInbound(streamID: 1)
         try channel.accept(.metadata(1, WireMetadata(Metadata())))
-        try channel.accept(.message(1, seq: 0, bytes: Data([10])))
-        try channel.accept(.message(1, seq: 1, bytes: Data([11])))
+        try channel.accept(.message(1, seq: 0, bytes: GRPCMessageFraming.frame([10])))
+        try channel.accept(.message(1, seq: 1, bytes: GRPCMessageFraming.frame([11])))
         try channel.accept(.halfClose(1))            // finishes the request stream
 
         var kinds: [String] = []
@@ -32,21 +32,21 @@ final class StreamChannelTests: XCTestCase {
 extension StreamChannelTests {
     func testClientInboundRejectsMessageAfterStatus() throws {
         let (channel, _) = StreamChannel<RPCResponsePart<[UInt8]>>.clientInbound(streamID: 3)
-        try channel.accept(.message(3, seq: 0, bytes: Data([1])))
+        try channel.accept(.message(3, seq: 0, bytes: GRPCMessageFraming.frame([1])))
         try channel.accept(.status(3, code: 0, message: "ok", trailers: WireMetadata(Metadata())))
-        XCTAssertThrowsError(try channel.accept(.message(3, seq: 1, bytes: Data([2]))))
+        XCTAssertThrowsError(try channel.accept(.message(3, seq: 1, bytes: GRPCMessageFraming.frame([2]))))
     }
 
     func testClientInboundRejectsOutOfOrderSeq() throws {
         let (channel, _) = StreamChannel<RPCResponsePart<[UInt8]>>.clientInbound(streamID: 4)
-        XCTAssertThrowsError(try channel.accept(.message(4, seq: 5, bytes: Data([1]))))
+        XCTAssertThrowsError(try channel.accept(.message(4, seq: 5, bytes: GRPCMessageFraming.frame([1]))))
     }
 
     func testServerInboundRejectsMetadataAfterMessage() throws {
         // The grammar is sequential (metadata* -> message*), not interleaved: once the first
         // message has arrived, a later metadata frame is a violation, not a second leading burst.
         let (channel, _) = StreamChannel<RPCRequestPart<[UInt8]>>.serverInbound(streamID: 5)
-        try channel.accept(.message(5, seq: 0, bytes: Data([1])))
+        try channel.accept(.message(5, seq: 0, bytes: GRPCMessageFraming.frame([1])))
         XCTAssertThrowsError(try channel.accept(.metadata(5, WireMetadata(Metadata()))))
     }
 
