@@ -262,8 +262,25 @@ guaranteed mutually ordered. Guards:
   `config(forMethod:)` returns `nil`; retry/hedge policy is a follow-up.
 - **D3 — connection-near flow control.** Per section 6/C3, not independent per-stream
   windows in v1.
-- **D4 — no compression, no message-size enforcement in v1.** XPC frames messages;
-  length-delimiting and compression are optional and deferred.
+- **D4 — REVERSED 2026-08-19 (user decision): message payloads use gRPC's standard framing.**
+  This section originally argued that because XPC already frames messages, the gRPC
+  Length-Prefixed-Message envelope was redundant and could be dropped. That is true for
+  *correctness* but costs interoperability: the payload bytes then differ from what every other
+  gRPC implementation carries, so proxying to or from a real gRPC endpoint would require
+  re-framing, and `maxRequest/ResponseMessageBytes` and compression become inexpressible.
+  A `message` frame's payload is therefore the standard
+  `Compressed-Flag (1 byte) | Message-Length (4 bytes, big-endian) | Message`,
+  making it byte-identical to gRPC over HTTP/2. Compression stays unimplemented in v1 (the flag
+  is written as 0 and a non-zero flag is rejected), and message-size enforcement stays deferred —
+  but the *shape* is now standard rather than bespoke.
+- **D5 — metadata and status use gRPC's vocabulary, carried natively.** Metadata keys are
+  normalized to lowercase ASCII and the `-bin` suffix is the binary discriminator, exactly as
+  gRPC defines — replacing this design's earlier private numeric tag. Status carries the standard
+  integer code (0–16) with a plain UTF-8 message. What is deliberately *not* copied is HTTP/2's
+  text-transport armour: binary values are not base64-encoded and status messages are not
+  percent-encoded, because an XPC dictionary carries raw bytes and Unicode strings natively.
+  Those encodings exist to squeeze binary through a text header block; reproducing them here
+  would cost size and CPU while making the payload less faithful, not more.
 
 ## 11. Risks
 

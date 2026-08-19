@@ -1251,3 +1251,217 @@ Expected: `0`.
 git commit --allow-empty -m "chore(GRPCXPCTransport): milestone 1 complete (all four call types over XPC)"
 ```
 ```
+
+---
+
+### Task 12: Standard gRPC framing for payloads, metadata and status
+
+**Inserted 2026-08-19 by user decision** ("make the byte-frame encoding as standard as possible").
+Executed **before Task 5**, so Tasks 5–10 and their tests are written against the standard shape
+instead of being retrofitted. Reverses spec deviation D4 and adds D5 — read both in the spec.
+
+**Files:**
+- Create: `Sources/GRPCXPCTransport/GRPCMessageFraming.swift`
+- Modify: `Sources/GRPCXPCTransport/XPCFrame.swift` (WireMetadata: drop `tag`, adopt `-bin`)
+- Modify: `Sources/GRPCXPCTransport/XPCOutboundWriter.swift` (frame payloads on write)
+- Modify: `Sources/GRPCXPCTransport/StreamChannel.swift` (unframe payloads on accept)
+- Test: `Tests/GRPCXPCTransportTests/GRPCMessageFramingTests.swift`
+- Test: `Tests/GRPCXPCTransportTests/XPCFrameTests.swift` (metadata cases)
+
+**Interfaces:**
+- Consumes: `XPCFrame`, `WireMetadata`, `StreamChannel`, `XPCOutboundWriter` as built in Tasks 2–4.
+- Produces:
+  - `enum GRPCMessageFraming` with
+    `static func frame(_ payload: [UInt8]) -> Data` and
+    `static func unframe(_ data: Data) throws -> [UInt8]`.
+  - `WireMetadata` without a `tag` field: binary-vs-string is decided by the `-bin` key suffix.
+  - `XPCFrame.message`'s `bytes` now carries the length-prefixed form.
+
+- [ ] **Step 1: Write the failing framing tests**
+
+`Tests/GRPCXPCTransportTests/GRPCMessageFramingTests.swift`:
+```swift
+import XCTest
+import GRPCCore
+@testable import GRPCXPCTransport
+
+@available(macOS 15.0, *)
+final class GRPCMessageFramingTests: XCTestCase {
+
+    /// The standard envelope: 1 byte compressed-flag (0), then 4 bytes big-endian length.
+    func testFramingProducesTheStandardFiveBytePrefix() {
+        let framed = GRPCMessageFraming.frame([0xAA, 0xBB, 0xCC])
+        XCTAssertEqual([UInt8](framed), [0x00, 0x00, 0x00, 0x00, 0x03, 0xAA, 0xBB, 0xCC])
+    }
+
+    func testAnEmptyPayloadStillCarriesThePrefix() {
+        XCTAssertEqual([UInt8](GRPCMessageFraming.frame([])), [0x00, 0x00, 0x00, 0x00, 0x00])
+    }
+
+    func testRoundTrip() throws {
+        let payload: [UInt8] = Array(0..<200)
+        XCTAssertEqual(try GRPCMessageFraming.unframe(GRPCMessageFraming.frame(payload)), payload)
+    }
+
+    /// Length is big-endian, so a payload longer than 255 bytes must not fit in the last byte.
+    func testLengthIsBigEndian() {
+        let framed = GRPCMessageFraming.frame([UInt8](repeating: 7, count: 300))
+        XCTAssertEqual([UInt8](framed.prefix(5)), [0x00, 0x00, 0x00, 0x01, 0x2C])
+    }
+
+    func testATruncatedFrameIsRejected() {
+        XCTAssertThrowsError(try GRPCMessageFraming.unframe(Data([0x00, 0x00, 0x00])))
+    }
+
+    /// Declared length longer than the bytes present.
+    func testALengthMismatchIsRejected() {
+        XCTAssertThrowsError(
+            try GRPCMessageFraming.unframe(Data([0x00, 0x00, 0x00, 0x00, 0x09, 0x01])))
+    }
+
+    /// Compression is not implemented in v1; a set flag must be refused, not ignored.
+    func testACompressedFlagIsRejected() {
+        XCTAssertThrowsError(
+            try GRPCMessageFraming.unframe(Data([0x01, 0x00, 0x00, 0x00, 0x01, 0x41])))
+    }
+}
+```
+
+- [ ] **Step 2: Run to verify it fails**
+
+Run: `swift test --filter GRPCMessageFramingTests --scratch-path <scratch>/build`
+Expected: FAIL — `GRPCMessageFraming` not defined.
+
+- [ ] **Step 3: Implement the framing**
+
+`Sources/GRPCXPCTransport/GRPCMessageFraming.swift`:
+```swift
+import Foundation
+import GRPCCore
+
+/// gRPC's standard `Length-Prefixed-Message`:
+///
+///     Compressed-Flag (1 byte) | Message-Length (4 bytes, big-endian) | Message
+///
+/// This is the exact byte sequence gRPC carries in an HTTP/2 DATA frame, so a payload framed here
+/// is byte-identical to one from any other gRPC implementation. XPC already delimits messages, so
+/// the prefix is redundant for *correctness* — it is here for interoperability (see spec D4).
+@available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
+enum GRPCMessageFraming {
+
+    static let prefixLength = 5
+
+    static func frame(_ payload: [UInt8]) -> Data {
+        var out = Data(capacity: prefixLength + payload.count)
+        out.append(0)                                   // compressed-flag: v1 never compresses
+        let length = UInt32(payload.count).bigEndian
+        withUnsafeBytes(of: length) { out.append(contentsOf: $0) }
+        out.append(contentsOf: payload)
+        return out
+    }
+
+    static func unframe(_ data: Data) throws -> [UInt8] {
+        guard data.count >= prefixLength else {
+            throw RPCError(code: .internalError,
+                           message: "gRPC message frame is \(data.count) bytes, shorter than its "
+                                  + "\(prefixLength)-byte prefix")
+        }
+        let bytes = [UInt8](data)
+        guard bytes[0] == 0 else {
+            throw RPCError(code: .unimplemented,
+                           message: "compressed gRPC messages are not supported (flag \(bytes[0]))")
+        }
+        let declared = (UInt32(bytes[1]) << 24) | (UInt32(bytes[2]) << 16)
+                     | (UInt32(bytes[3]) << 8)  |  UInt32(bytes[4])
+        let payload = bytes.dropFirst(prefixLength)
+        guard payload.count == Int(declared) else {
+            throw RPCError(code: .internalError,
+                           message: "gRPC message frame declares \(declared) bytes but carries "
+                                  + "\(payload.count)")
+        }
+        return Array(payload)
+    }
+}
+```
+
+- [ ] **Step 4: Run to verify the framing tests pass**
+
+Run: `swift test --filter GRPCMessageFramingTests --scratch-path <scratch>/build`
+Expected: PASS (7/7).
+
+- [ ] **Step 5: Write the failing metadata test for the `-bin` discriminator**
+
+Append to `Tests/GRPCXPCTransportTests/XPCFrameTests.swift`:
+```swift
+@available(macOS 15.0, *)
+extension XPCFrameTests {
+
+    /// gRPC's own discriminator is the key suffix, not a private tag: `-bin` means the value is
+    /// raw binary, anything else is UTF-8 text.
+    func testTheBinSuffixDiscriminatesBinaryFromString() throws {
+        var md = Metadata()
+        md.addString("plain", forKey: "a")
+        md.addBinary([0x00, 0xFF], forKey: "b-bin")
+        let restored = WireMetadata(md).asMetadata()
+        XCTAssertEqual(Array(restored[stringValues: "a"]), ["plain"])
+        XCTAssertEqual(Array(restored[binaryValues: "b-bin"]).first, [0x00, 0xFF])
+    }
+
+    /// gRPC requires lowercase keys; a mixed-case key must normalize, not round-trip verbatim.
+    func testKeysAreNormalizedToLowercase() throws {
+        var md = Metadata()
+        md.addString("v", forKey: "Mixed-Case")
+        let restored = WireMetadata(md).asMetadata()
+        XCTAssertEqual(Array(restored[stringValues: "mixed-case"]), ["v"])
+    }
+
+    /// Order and repeats survive, through the real xpc encoder this time.
+    func testRepeatedKeysAndOrderSurviveTheXPCRoundTrip() throws {
+        var md = Metadata()
+        md.addString("1", forKey: "k")
+        md.addString("2", forKey: "k")
+        md.addBinary([0x09], forKey: "raw-bin")
+        let frame = XPCFrame.metadata(1, WireMetadata(md))
+        let back = try XPCFrame.decode(from: try frame.encodeToXPC())
+        guard case .metadata(_, let wire) = back else { return XCTFail("wrong case: \(back)") }
+        let restored = wire.asMetadata()
+        XCTAssertEqual(Array(restored[stringValues: "k"]), ["1", "2"])
+        XCTAssertEqual(Array(restored[binaryValues: "raw-bin"]).first, [0x09])
+    }
+}
+```
+
+- [ ] **Step 6: Run to verify these fail, then drop `tag` from `WireMetadata`**
+
+Run: `swift test --filter XPCFrameTests --scratch-path <scratch>/build`
+Expected: FAIL on the lowercase and/or `-bin` expectations while `tag` still decides the kind.
+
+Then change `WireMetadata` so `Entry` is `{ key: String; bytes: Data }` — no `tag` — with `init(_:)`
+lowercasing keys and `asMetadata()` choosing `addBinary` when `key.hasSuffix("-bin")` and
+`addString` otherwise. Keep it an ordered array so repeats and order survive (that property is
+already tested).
+
+- [ ] **Step 7: Run to verify all frame tests pass**
+
+Run: `swift test --filter XPCFrameTests --scratch-path <scratch>/build`
+Expected: PASS.
+
+- [ ] **Step 8: Move payload framing to the transport boundary**
+
+`XPCOutboundWriter`: where a `.message` part becomes a `.message` frame, wrap the payload —
+`bytes: GRPCMessageFraming.frame(payloadBytes)`. `StreamChannel.accept`: where a `.message` frame
+becomes a `.message` part, unwrap it — `try GRPCMessageFraming.unframe(bytes)` — and let a framing
+error travel the same path as a grammar violation (fail the stream, do not deliver). Nothing else
+changes: `seq` accounting, the ordering grammar and the terminal rules stay exactly as they are.
+
+- [ ] **Step 9: Run the full suite**
+
+Run: `swift test --scratch-path <scratch>/build`
+Expected: every existing test still green — the mux and connection tests now carry standard-framed
+payloads end to end, which is the real proof this landed.
+
+- [ ] **Step 10: Commit**
+```bash
+git add Sources/GRPCXPCTransport Tests/GRPCXPCTransportTests
+git commit -m "feat(GRPCXPCTransport): standard gRPC framing for payloads, metadata and status"
+```
