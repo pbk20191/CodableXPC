@@ -15,6 +15,12 @@ import Synchronization
 ///
 /// `openStream`/`cancel`/`credit`/`goAway` are connection-level frames; `accept` ignores them
 /// (the connection handles them -- see Task 4).
+///
+/// The channel also owns this stream's ``CreditLedger`` (Task 8): the connection withholds each
+/// arriving `.message` frame's XPC reply here, and the inbound sequence the factories below hand
+/// out (a ``CreditedInbound``) releases one as each message is *pulled* by the consumer. The ledger
+/// lives on the channel because its lifetime is exactly this stream's inbound lifetime -- including
+/// ``failInbound(_:)``, which must not leave the peer's writer starved of credit it will never get.
 @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
 final class StreamChannel<Part: Sendable>: Sendable {
     /// `leading` accepts metadata; the first message frame moves the channel to `messages`,
@@ -34,6 +40,9 @@ final class StreamChannel<Part: Sendable>: Sendable {
     }
 
     let streamID: StreamID
+    /// This stream's withheld flow-control replies -- see the type's doc comment and
+    /// ``CreditLedger``.
+    let credit: CreditLedger
     private let isServer: Bool
     private let state = Mutex(State())
     private let continuation: AsyncThrowingStream<Part, any Error>.Continuation
@@ -42,10 +51,12 @@ final class StreamChannel<Part: Sendable>: Sendable {
     private init(
         streamID: StreamID,
         isServer: Bool,
+        credit: CreditLedger,
         continuation: AsyncThrowingStream<Part, any Error>.Continuation,
         toPart: @escaping @Sendable (Inbound) -> Part
     ) {
         self.streamID = streamID
+        self.credit = credit
         self.isServer = isServer
         self.continuation = continuation
         self.toPart = toPart
@@ -109,6 +120,12 @@ final class StreamChannel<Part: Sendable>: Sendable {
     func failInbound(_ error: any Error) {
         state.withLock { $0.phase = .terminated }
         continuation.finish(throwing: error)
+        // The peer's writer is owed every credit this stream is still withholding: it is suspended
+        // waiting for replies that, now that this side is dead, no consumer will ever pull for.
+        // Granting them lets that writer resume and fail on its own terminal error instead of
+        // hanging. (`CreditedInbound` does the same on the ordinary end-of-stream path, but a
+        // failure raised out-of-band never goes through it.)
+        credit.flush()
     }
 
     private func violation() -> any Error {
@@ -124,8 +141,9 @@ extension StreamChannel {
         where Part == RPCRequestPart<[UInt8]>
     {
         let (stream, continuation) = AsyncThrowingStream.makeStream(of: RPCRequestPart<[UInt8]>.self)
+        let credit = CreditLedger(streamID: streamID)
         let channel = StreamChannel<RPCRequestPart<[UInt8]>>(
-            streamID: streamID, isServer: true, continuation: continuation
+            streamID: streamID, isServer: true, credit: credit, continuation: continuation
         ) { event in
             switch event {
             case .metadata(let metadata): .metadata(metadata)
@@ -133,7 +151,10 @@ extension StreamChannel {
             case .status: fatalError("request streams carry no status part")
             }
         }
-        return (channel, RPCAsyncSequence(wrapping: stream))
+        let credited = CreditedInbound(base: stream, ledger: credit) { part in
+            if case .message = part { return true } else { return false }
+        }
+        return (channel, RPCAsyncSequence(wrapping: credited))
     }
 
     /// A client's inbound view of an RPC: the response parts the peer sends.
@@ -142,8 +163,9 @@ extension StreamChannel {
         where Part == RPCResponsePart<[UInt8]>
     {
         let (stream, continuation) = AsyncThrowingStream.makeStream(of: RPCResponsePart<[UInt8]>.self)
+        let credit = CreditLedger(streamID: streamID)
         let channel = StreamChannel<RPCResponsePart<[UInt8]>>(
-            streamID: streamID, isServer: false, continuation: continuation
+            streamID: streamID, isServer: false, credit: credit, continuation: continuation
         ) { event in
             switch event {
             case .metadata(let metadata): .metadata(metadata)
@@ -151,6 +173,9 @@ extension StreamChannel {
             case .status(let status, let trailers): .status(status, trailers)
             }
         }
-        return (channel, RPCAsyncSequence(wrapping: stream))
+        let credited = CreditedInbound(base: stream, ledger: credit) { part in
+            if case .message = part { return true } else { return false }
+        }
+        return (channel, RPCAsyncSequence(wrapping: credited))
     }
 }

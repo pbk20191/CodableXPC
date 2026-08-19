@@ -51,15 +51,42 @@ final class XPCConnection: Sendable {
     let queue: DispatchSerialQueue
     private let nextStreamID = Atomic<UInt64>(1)
 
+    /// Initial per-stream credit allowance handed to every ``XPCOutboundWriter`` this connection
+    /// creates -- see ``XPCBackpressure/defaultCreditWindow`` for why it must exceed one.
+    let creditWindow: Int
+
+    /// Identifies an outstanding credit-bearing send, so its reply (or the connection's death) can
+    /// resolve exactly one waiting writer.
+    private let nextCreditToken = Atomic<UInt64>(1)
+
+    /// The coarse, connection-wide delivery valve (design section 6). Deliberately inert here:
+    /// nothing in this transport ever closes it -- it exists for an owner that needs to pause a
+    /// whole connection (memory pressure). See ``ConnectionValve`` for the C1/C2 reasoning, and in
+    /// particular why the caller must not be running on ``queue``.
+    let deliveryValve: ConnectionValve
+
     /// Tracks whether `session.activate()` has *succeeded*. Seeded `true` for `.server` (an
     /// accepted session is already live); for `.client` it flips to `true` only inside
     /// ``activate()``, after `session.activate()` returns without throwing. Gates `deinit`'s
     /// cancel -- see the comment there for why.
     private let isActivated: Atomic<Bool>
 
+    /// One credit-bearing send that has not been answered yet.
+    ///
+    /// Tracked because libxpc will *not* resolve a reply handler whose session has been cancelled
+    /// (verified by probe: cancelling a session with an outstanding reply never calls its handler at
+    /// all). Without this table, a writer suspended for credit when the connection dies would hang
+    /// forever instead of failing -- see ``failAll(_:)`` and
+    /// `BackpressureTests.testASuspendedWriterFailsRatherThanHangingWhenTheConnectionGoesAway`.
+    private struct PendingCredit {
+        let streamID: StreamID
+        let complete: @Sendable (Result<Int, any Error>) -> Void
+    }
+
     private struct Registry: Sendable {
         var clientChannels: [StreamID: StreamChannel<RPCResponsePart<[UInt8]>>] = [:]
         var serverChannels: [StreamID: StreamChannel<RPCRequestPart<[UInt8]>>] = [:]
+        var pendingCredits: [UInt64: PendingCredit] = [:]
     }
     private let registry = Mutex(Registry())
 
@@ -84,12 +111,21 @@ final class XPCConnection: Sendable {
     ///   `XPCListener.IncomingSessionRequest.accept`. This still (re-)installs the handlers and
     ///   target queue -- which is safe to call on a live session -- but the session must never be
     ///   passed to ``activate()``.
-    init(session: XPCSession, role: Role, queue: DispatchSerialQueue) {
+    init(session: XPCSession,
+         role: Role,
+         queue: DispatchSerialQueue,
+         creditWindow: Int = XPCBackpressure.defaultCreditWindow) {
         self.session = session
         self.role = role
         self.queue = queue
+        self.creditWindow = creditWindow
+        self.deliveryValve = ConnectionValve(queue: queue)
         self.isActivated = Atomic<Bool>(role == .server)
         (acceptedStreams, acceptedContinuation) = AsyncStream.makeStream()
+        // Returning `nil` here does **not** make libxpc synthesize a reply (verified by probe), so
+        // a `.message` frame's reply stays ours to send later -- which is exactly what
+        // reply-as-credit needs: `route` hands the received message to the target stream's
+        // `CreditLedger`, which replies only once a consumer pulls the element it carried.
         session.setIncomingMessageHandler { [weak self] (message: XPCDictionary) -> XPCDictionary? in
             self?.handleInbound(message)
             return nil
@@ -108,9 +144,12 @@ final class XPCConnection: Sendable {
     /// before ever calling ``activate()`` (or after it throws) -- harmless with the
     /// ``isActivated`` gate below, but this factory removes the window entirely for the common
     /// endpoint-dialling case.
-    static func connecting(to endpoint: XPCEndpoint, queue: DispatchSerialQueue) throws -> XPCConnection {
+    static func connecting(to endpoint: XPCEndpoint,
+                           queue: DispatchSerialQueue,
+                           creditWindow: Int = XPCBackpressure.defaultCreditWindow) throws -> XPCConnection {
         let session = try XPCSession(endpoint: endpoint, options: .inactive)
-        let connection = XPCConnection(session: session, role: .client, queue: queue)
+        let connection = XPCConnection(session: session, role: .client, queue: queue,
+                                       creditWindow: creditWindow)
         try connection.activate()
         return connection
     }
@@ -149,11 +188,59 @@ final class XPCConnection: Sendable {
         failAll(RPCError(code: .unavailable, message: "the XPC connection was deinitialized"))
     }
 
-    /// Serializes `frame` and sends it one-way over the session. (Credit-bearing sends with a
-    /// reply arrive in Task 9.)
+    /// Serializes `frame` and sends it one-way over the session -- no reply, no flow control.
+    ///
+    /// This is the path for every frame kind *except* `.message`: `openStream`, `metadata`,
+    /// `halfClose`, `status` and `cancel`. Keeping the terminals here is load-bearing -- see
+    /// ``XPCBackpressure`` -- because a stream must be closable by a writer that is already starved
+    /// of credit. `.message` frames go through ``sendAwaitingCredit(_:onCredit:)``.
     func send(_ frame: XPCFrame) throws {
         let object = try frame.encodeToXPC()
         try session.send(message: XPCDictionary(object))
+    }
+
+    /// Sends a credit-bearing `.message` frame: an XPC message *expecting a reply*, where the reply
+    /// is the flow-control credit (design section 6). `onCredit` is called exactly once -- with the
+    /// number of permits the peer granted, or with a failure if the reply failed or the connection
+    /// died first.
+    ///
+    /// This does not itself suspend. The suspension lives in the caller's ``CreditWindow``, which
+    /// admits a *window* of unacknowledged messages rather than one at a time: awaiting each reply
+    /// inline here would deadlock any pair of handlers that both burst before reading (see
+    /// ``XPCBackpressure/defaultCreditWindow``).
+    func sendAwaitingCredit(_ frame: XPCFrame,
+                            onCredit: @escaping @Sendable (Result<Int, any Error>) -> Void) throws {
+        let streamID = frame.streamID
+        let object = try frame.encodeToXPC()   // before registering: a throw here owes no credit
+        let token = nextCreditToken.wrappingAdd(1, ordering: .relaxed).oldValue
+        registry.withLock { $0.pendingCredits[token] = PendingCredit(streamID: streamID, complete: onCredit) }
+        session.send(message: XPCDictionary(object)) { [weak self] result in
+            // Nothing to do if the connection is already gone: its `deinit` ran `failAll`, which
+            // completed this very pending credit with `.unavailable` and took it out of the table.
+            guard let pending = self?.takePendingCredit(token) else { return }
+            switch result {
+            case .success(let reply):
+                pending.complete(.success(Self.permits(inCreditReply: reply)))
+            case .failure(let error):
+                pending.complete(.failure(RPCError(
+                    code: .unavailable,
+                    message: "stream \(streamID): the flow-control reply failed: \(error)")))
+            }
+        }
+    }
+
+    private func takePendingCredit(_ token: UInt64) -> PendingCredit? {
+        registry.withLock { $0.pendingCredits.removeValue(forKey: token) }
+    }
+
+    /// How many permits a credit reply grants. The reply is a `.credit` frame (see
+    /// ``CreditLedger``), but a reply that is anything else -- an empty dictionary, a frame from a
+    /// peer speaking a later version of this protocol -- still counts as one permit: mis-reading a
+    /// reply must never *stall* a writer, since a lost permit is a permanent, silent loss of window.
+    private static func permits(inCreditReply reply: XPCDictionary) -> Int {
+        guard let frame = try? reply.withUnsafeUnderlyingDictionary({ try XPCFrame.decode(from: $0) }),
+              case .credit(_, let n) = frame else { return 1 }
+        return max(1, Int(n))
     }
 
     private func handleInbound(_ message: XPCDictionary) {
@@ -164,11 +251,17 @@ final class XPCConnection: Sendable {
             // better addressed by Task 9's peer-death/misbehavior handling than by this layer.)
             return
         }
-        route(frame)
+        route(frame, received: message)
     }
 
     /// Always dispatched on `queue` -- see the type's doc comment.
-    private func route(_ frame: XPCFrame) {
+    ///
+    /// `message` is the raw received dictionary the frame was decoded from, carried through because
+    /// a `.message` frame's *reply* is this transport's flow-control credit and has to be withheld
+    /// (held in the target stream's `CreditLedger`) rather than produced here. It is not `Sendable`
+    /// and must not escape this synchronous call except into a `CreditLedger`, which is built for
+    /// exactly that (see ``CreditLedger``).
+    private func route(_ frame: XPCFrame, received message: XPCDictionary) {
         switch frame {
         case .openStream(let id, let method, _):
             guard let descriptor = Self.methodDescriptor(from: method) else {
@@ -191,7 +284,7 @@ final class XPCConnection: Sendable {
             let (channel, inbound) = StreamChannel<RPCRequestPart<[UInt8]>>.serverInbound(streamID: id)
             registry.withLock { $0.serverChannels[id] = channel }
             let outbound = RPCWriter.Closable(wrapping: XPCOutboundWriter<RPCResponsePart<[UInt8]>>(
-                streamID: id, connection: self))
+                streamID: id, connection: self, creditWindow: creditWindow))
             let stream = RPCStream(descriptor: descriptor, inbound: inbound, outbound: outbound)
             acceptedContinuation.yield(AcceptedStream(id: id, descriptor: descriptor, stream: stream))
         case .cancel(let id, let reason):
@@ -199,11 +292,23 @@ final class XPCConnection: Sendable {
         case .goAway:
             break   // Task 10
         case .credit:
-            break   // Task 9
+            // Credit travels on the XPC *reply* channel, not as a standalone frame (design section
+            // 6 / deviation D1): a `.credit` frame is only ever the *payload of a reply* to a
+            // `.message`, decoded by `permits(inCreditReply:)` on the sending side and never routed
+            // here. Arriving as a top-level message it is an inert nudge -- which is precisely what
+            // `XPCPairHarness` uses `.credit(0, n: 0)` for, to make a listener accept a session.
+            break
         default:
             let id = frame.streamID
+            let isCreditBearing: Bool = { if case .message = frame { return true } else { return false } }()
+            var wasRouted = true
             registry.withLock { reg in
                 if let c = reg.clientChannels[id] {
+                    // Withheld *before* `accept` yields the part: `accept`'s yield can be picked up
+                    // by a consumer on another thread immediately, and that consumer's pull is what
+                    // grants the credit -- so the reply has to already be in the ledger by then, or
+                    // the grant would find it empty and the peer's writer would lose a permit.
+                    if isCreditBearing { c.credit.hold(message) }
                     do {
                         try c.accept(frame)
                         // `.status` is the response direction's sole terminator (see
@@ -218,6 +323,7 @@ final class XPCConnection: Sendable {
                         c.failInbound(error)
                     }
                 } else if let s = reg.serverChannels[id] {
+                    if isCreditBearing { s.credit.hold(message) }
                     do {
                         try s.accept(frame)
                         // `.halfClose` is the request direction's sole terminator.
@@ -231,7 +337,13 @@ final class XPCConnection: Sendable {
                 // e.g. it arrived after that stream's entry was already removed above (a
                 // straggler after a terminal), or the peer referenced an id this side never
                 // opened/accepted. Dropped; there is no local stream left to fail.
+                else { wasRouted = false }
             }
+            // A credit-bearing frame that reached no stream must still be credited, immediately:
+            // there is no ledger holding its reply and no consumer that will ever pull for it, so
+            // withholding it would silently shrink the peer's window by one permit per straggler
+            // until its writer stalled for good.
+            if isCreditBearing && !wasRouted { CreditLedger(streamID: id).hold(message) }
         }
     }
 
@@ -261,15 +373,22 @@ final class XPCConnection: Sendable {
         let (channel, inbound) = StreamChannel<RPCResponsePart<[UInt8]>>.clientInbound(streamID: id)
         registry.withLock { $0.clientChannels[id] = channel }
         let outbound = RPCWriter.Closable(wrapping: XPCOutboundWriter<RPCRequestPart<[UInt8]>>(
-            streamID: id, connection: self))
+            streamID: id, connection: self, creditWindow: creditWindow))
         return (id, RPCStream(descriptor: descriptor, inbound: inbound, outbound: outbound))
     }
 
     private func failStream(_ id: StreamID, _ error: any Error) {
-        registry.withLock { reg in
+        let orphaned: [PendingCredit] = registry.withLock { reg in
             reg.clientChannels[id]?.failInbound(error); reg.clientChannels[id] = nil
             reg.serverChannels[id]?.failInbound(error); reg.serverChannels[id] = nil
+            // A writer on this stream suspended for credit has to be released too, or cancelling an
+            // RPC would leave it parked on a reply that is never coming.
+            let doomed = reg.pendingCredits.filter { $0.value.streamID == id }
+            doomed.keys.forEach { reg.pendingCredits[$0] = nil }
+            return Array(doomed.values)
         }
+        // Completed outside the lock: `complete` resumes a writer's continuation.
+        orphaned.forEach { $0.complete(.failure(error)) }
     }
 
     /// On peer death / shutdown: fails every live stream's inbound sequence and finishes
@@ -277,11 +396,18 @@ final class XPCConnection: Sendable {
     /// `deinit` separately finishes the accepted-streams continuation (see there) since by then
     /// there may be no error to report and no streams left to fail.
     func failAll(_ error: any Error) {
-        registry.withLock { reg in
+        let orphaned: [PendingCredit] = registry.withLock { reg in
             reg.clientChannels.values.forEach { $0.failInbound(error) }
             reg.serverChannels.values.forEach { $0.failInbound(error) }
+            let doomed = Array(reg.pendingCredits.values)
             reg = Registry()
+            return doomed
         }
+        // Every writer suspended for credit fails here rather than hanging. This is the *only*
+        // thing that releases them: libxpc silently drops the reply handlers of a cancelled
+        // session (verified by probe), so a dead connection produces no reply, no error, nothing.
+        // Completed outside the lock because `complete` resumes a writer's continuation.
+        orphaned.forEach { $0.complete(.failure(error)) }
         acceptedContinuation.finish()
     }
 }

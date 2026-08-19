@@ -23,8 +23,15 @@ private struct WeakConnection: Sendable {
     weak var connection: XPCConnection?
 }
 
-/// Bridges a gRPC outbound `RPCWriter` to `XPCConnection.send`. `write` does not yet suspend for
-/// credit (unbounded); Task 9 adds reply-as-credit backpressure.
+/// Bridges a gRPC outbound `RPCWriter` to `XPCConnection`'s send paths, applying reply-as-credit
+/// flow control (Task 8) to message parts.
+///
+/// `write` honours `RPCWriter`'s "suspend until the element is accepted" contract by taking a permit
+/// from ``credit`` before each `.message` goes out, and returning it when the peer's credit reply
+/// arrives -- which the peer produces only once *its* consumer pulls that message. A writer with a
+/// full window of unacknowledged messages therefore suspends. Metadata and the terminals
+/// (`halfClose`, `.status`, `cancel`) are sent one-way and consume no credit, so a stream can always
+/// be closed even by a writer that is starved (see ``XPCBackpressure``).
 ///
 /// Holds its connection **weakly** -- see ``WeakConnection`` for why that is load-bearing rather
 /// than a micro-optimisation. Once the connection is gone, `write` fails deterministically with
@@ -42,15 +49,21 @@ final class XPCOutboundWriter<Part: Sendable>: ClosableRPCWriterProtocol {
     let streamID: StreamID
     private let weakConnection: Mutex<WeakConnection>
 
+    /// This direction's flow-control window. Owned here, not by the connection: its lifetime is the
+    /// writer's, and the connection reaches suspended writers through its own pending-credit table
+    /// instead (see `XPCConnection.failAll`), which needs no reference to this object at all.
+    private let credit: CreditWindow
+
     /// Per-writer message sequence. Only `.message` parts consume one -- mirrors
     /// `StreamChannel`'s seq guard, which advances only on `.message` (metadata/status/halfClose
     /// carry no seq). Bumping this on every `write` (metadata included, as an earlier sketch did)
     /// would desynchronize it from that guard.
     private let seq = Atomic<UInt64>(0)
 
-    init(streamID: StreamID, connection: XPCConnection) {
+    init(streamID: StreamID, connection: XPCConnection, creditWindow: Int) {
         self.streamID = streamID
         self.weakConnection = Mutex(WeakConnection(connection: connection))
+        self.credit = CreditWindow(capacity: creditWindow)
     }
 
     /// The connection, or `nil` if it has been deinitialized. Deliberately returns the strong
@@ -68,7 +81,33 @@ final class XPCOutboundWriter<Part: Sendable>: ClosableRPCWriterProtocol {
 
     func write(_ element: Part) async throws {
         guard let connection else { throw connectionGone() }
-        try connection.send(frame(for: element))
+        guard isMessage(element) else {
+            // Metadata and terminals: one-way, no credit, never suspends.
+            try connection.send(frame(for: element))
+            return
+        }
+        // Credit *first*, then build the frame. `frame(for:)` consumes a `seq`, and a write that
+        // fails must not consume one -- so a starved or broken window has to throw before the
+        // counter moves, exactly as the gone-connection check above does.
+        try await credit.acquire()
+        let messageFrame = frame(for: element)
+        do {
+            try connection.sendAwaitingCredit(messageFrame) { [credit] result in
+                switch result {
+                case .success(let permits):
+                    credit.release(permits)
+                case .failure(let error):
+                    // The reply channel for this stream is broken (dead connection, XPC error), so
+                    // the window can never refill: fail it rather than let later writes park
+                    // forever on credit that is not coming.
+                    credit.fail(error)
+                }
+            }
+        } catch {
+            // Nothing was sent, so no reply will ever come back to return this permit.
+            credit.release(1)
+            throw error
+        }
     }
 
     func write(contentsOf elements: some Sequence<Part>) async throws {
@@ -92,6 +131,24 @@ final class XPCOutboundWriter<Part: Sendable>: ClosableRPCWriterProtocol {
 
     func finish(throwing error: any Error) async {
         try? connection?.send(.cancel(streamID, reason: "\(error)"))
+    }
+
+    /// Whether `element` is a message part -- the only part kind that is flow-controlled.
+    ///
+    /// Separate from ``frame(for:)`` rather than folded into it because credit must be acquired
+    /// *before* a frame is built: building one consumes a `seq`, and a write that never reaches the
+    /// wire must not consume a seq (the peer's `StreamChannel` treats a gap as a protocol violation).
+    private func isMessage(_ element: Part) -> Bool {
+        switch element {
+        case let request as RPCRequestPart<[UInt8]>:
+            if case .message = request { return true }
+            return false
+        case let response as RPCResponsePart<[UInt8]>:
+            if case .message = response { return true }
+            return false
+        default:
+            return false
+        }
     }
 
     private func frame(for element: Part) -> XPCFrame {

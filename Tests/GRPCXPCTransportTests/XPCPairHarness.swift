@@ -14,13 +14,18 @@ import Dispatch
 /// 1. The listener's `incomingSessionHandler` runs asynchronously and only once the peer's
 ///    *first message* arrives -- dialling and even activating the client session is not enough
 ///    to establish the session server-side. A one-shot inert nudge frame (`.credit(0, n: 0)`,
-///    a no-op on the receiving end per Task 4/9) triggers it.
+///    inert as a *top-level* frame -- credit travels on the XPC reply channel, see
+///    `XPCConnection.route`'s `.credit` arm) triggers it.
 /// 2. The listener's closure builds the server `XPCConnection` off the calling test's task, so
 ///    the test must wait for it to be published -- done here with a small lock-protected box,
 ///    polled the same way `RealXPCEndToEndTests`' `Ready`/`waitUntil` do.
 @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
 struct XPCPairHarness {
-    func connectPair() async throws -> (XPCConnection, XPCConnection) {
+    /// - Parameter creditWindow: the per-stream flow-control window both connections are built
+    ///   with. Defaults to the production value; `BackpressureTests` overrides it to make the
+    ///   window's effect (and its lower bound) observable at small, exact numbers.
+    func connectPair(creditWindow: Int = XPCBackpressure.defaultCreditWindow)
+    async throws -> (XPCConnection, XPCConnection) {
         let box = ServerBox()
         // Not `defer { listener.cancel() }`-ed: unlike an `XPCSession` (which traps on release
         // without a prior `cancel`, see `XPCConnection.deinit`), letting the listener itself
@@ -34,14 +39,16 @@ struct XPCPairHarness {
             let serverQueue = DispatchSerialQueue(label: "XPCPairHarness.server")
             // `XPCConnection.init` installs its own (real) incoming-message handler and target
             // queue on `session`, replacing the placeholder passed to `accept` above.
-            let connection = XPCConnection(session: session, role: .server, queue: serverQueue)
+            let connection = XPCConnection(session: session, role: .server, queue: serverQueue,
+                                           creditWindow: creditWindow)
             box.connection = connection
             return decision
         }
         try listener.activate()
 
         let clientQueue = DispatchSerialQueue(label: "XPCPairHarness.client")
-        let clientConnection = try XPCConnection.connecting(to: listener.endpoint, queue: clientQueue)
+        let clientConnection = try XPCConnection.connecting(to: listener.endpoint, queue: clientQueue,
+                                                            creditWindow: creditWindow)
 
         // See hazard (1) above.
         try clientConnection.send(.credit(0, n: 0))
