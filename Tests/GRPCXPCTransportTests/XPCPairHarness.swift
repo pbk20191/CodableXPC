@@ -41,9 +41,7 @@ struct XPCPairHarness {
         try listener.activate()
 
         let clientQueue = DispatchSerialQueue(label: "XPCPairHarness.client")
-        let clientSession = try XPCSession(endpoint: listener.endpoint, options: .inactive)
-        let clientConnection = XPCConnection(session: clientSession, role: .client, queue: clientQueue)
-        try clientConnection.activate()
+        let clientConnection = try XPCConnection.connecting(to: listener.endpoint, queue: clientQueue)
 
         // See hazard (1) above.
         try clientConnection.send(.credit(0, n: 0))

@@ -19,9 +19,21 @@ final class XPCConnection: Sendable {
     let queue: DispatchSerialQueue
     private let nextStreamID = Atomic<UInt64>(1)
 
+    /// Tracks whether `session.activate()` has *succeeded*. Seeded `true` for `.server` (an
+    /// accepted session is already live); for `.client` it flips to `true` only inside
+    /// ``activate()``, after `session.activate()` returns without throwing. Gates `deinit`'s
+    /// cancel -- see the comment there for why.
+    private let isActivated: Atomic<Bool>
+
     private struct Registry: Sendable {
         var clientChannels: [StreamID: StreamChannel<RPCResponsePart<[UInt8]>>] = [:]
         var serverChannels: [StreamID: StreamChannel<RPCRequestPart<[UInt8]>>] = [:]
+        /// A server-side `StreamChannel`'s inbound sequence, registered eagerly the moment an
+        /// `.openStream` frame is routed and claimed later by `registerServerStream`. Without
+        /// this, frames arriving between accept and `registerServerStream` (metadata, the first
+        /// message -- exactly what a real client sends immediately) would find no channel yet
+        /// and be silently dropped; see the type's doc comment.
+        var pendingServerInbound: [StreamID: RPCAsyncSequence<RPCRequestPart<[UInt8]>, any Error>] = [:]
     }
     private let registry = Mutex(Registry())
 
@@ -31,38 +43,67 @@ final class XPCConnection: Sendable {
     /// Wraps `session`.
     ///
     /// - For `.client`: `session` must be inactive (freshly dialled). This installs the
-    ///   incoming-message handler and target queue but does **not** activate it -- call
-    ///   ``activate()`` before use.
+    ///   incoming-message handler, cancellation handler, and target queue but does **not**
+    ///   activate it -- call ``activate()`` before use, or prefer ``connecting(to:queue:)``,
+    ///   which does both atomically. Prefer this initializer directly only when dialling by a
+    ///   means other than an `XPCEndpoint` (e.g. a mach or XPC service name).
     /// - For `.server`: `session` is an already-live session handed back by
-    ///   `XPCListener.IncomingSessionRequest.accept`. This still (re-)installs the handler and
+    ///   `XPCListener.IncomingSessionRequest.accept`. This still (re-)installs the handlers and
     ///   target queue -- which is safe to call on a live session -- but the session must never be
     ///   passed to ``activate()``.
     init(session: XPCSession, role: Role, queue: DispatchSerialQueue) {
         self.session = session
         self.role = role
         self.queue = queue
+        self.isActivated = Atomic<Bool>(role == .server)
         (acceptedStreams, acceptedContinuation) = AsyncStream.makeStream()
         session.setIncomingMessageHandler { [weak self] (message: XPCDictionary) -> XPCDictionary? in
             self?.handleInbound(message)
             return nil
         }
+        // Peer death (session cancellation, e.g. the other process exiting) fails every live
+        // stream locally rather than leaving them hung forever. Deadlines, `.goAway`, and
+        // graceful-shutdown *sequencing* stay Task 9/10's job -- this only makes the hook exist.
+        session.setCancellationHandler { [weak self] error in
+            self?.failAll(RPCError(code: .unavailable, message: "XPC peer session cancelled: \(error)"))
+        }
         session.setTargetQueue(queue)
     }
 
-    /// Activates the underlying session. The *client* side calls this after construction -- the
-    /// harness today, `XPCClientTransport.connect()` in Task 5. An accepted (server) session
-    /// handed back from `IncomingSessionRequest.accept` is already live and must **not** be
-    /// activated again.
-    func activate() throws {
-        try session.activate()
+    /// Dials `endpoint` and returns an *activated* client connection in one step. Constructing
+    /// and activating separately leaves a window where a caller could drop the `XPCConnection`
+    /// before ever calling ``activate()`` (or after it throws) -- harmless with the
+    /// ``isActivated`` gate below, but this factory removes the window entirely for the common
+    /// endpoint-dialling case.
+    static func connecting(to endpoint: XPCEndpoint, queue: DispatchSerialQueue) throws -> XPCConnection {
+        let session = try XPCSession(endpoint: endpoint, options: .inactive)
+        let connection = XPCConnection(session: session, role: .client, queue: queue)
+        try connection.activate()
+        return connection
     }
 
-    /// libxpc traps (`_xpc_api_misuse`, `EXC_BREAKPOINT`) if an `XPCSession` is released without
-    /// ever being cancelled, whether or not it was ever activated -- so every `XPCConnection`
-    /// must cancel its session on the way out. Full graceful-shutdown sequencing (draining,
-    /// `.goAway`) is Task 9/10's job; this is just the RAII teardown of the native resource.
+    /// Activates the underlying session. The *client* side calls this after construction -- the
+    /// harness today (or, more simply, ``connecting(to:queue:)``); `XPCClientTransport.connect()`
+    /// in Task 5. An accepted (server) session handed back from `IncomingSessionRequest.accept`
+    /// is already live and must **not** be activated again.
+    func activate() throws {
+        try session.activate()
+        isActivated.store(true, ordering: .relaxed)
+    }
+
+    /// libxpc traps (`_xpc_api_misuse`, `EXC_BREAKPOINT`) on `xpc_session_cancel` if the session
+    /// was never successfully activated -- so an inactive client session whose `activate()` threw
+    /// (Task 5's `connect()`-failure path) must **not** be cancelled here, only released. An
+    /// activated-but-never-cancelled session traps on release the same way, so every session that
+    /// *did* activate (every `.server` session, and every `.client` session past a successful
+    /// `activate()`) still must be cancelled. `isActivated` is exactly that distinction. Full
+    /// graceful-shutdown sequencing (draining, `.goAway`) is Task 9/10's job; this is just the
+    /// RAII teardown of the native resource.
     deinit {
-        session.cancel(reason: "XPCConnection deinitialized")
+        if isActivated.load(ordering: .relaxed) {
+            session.cancel(reason: "XPCConnection deinitialized")
+        }
+        acceptedContinuation.finish()
     }
 
     /// Serializes `frame` and sends it one-way over the session. (Credit-bearing sends with a
@@ -74,7 +115,12 @@ final class XPCConnection: Sendable {
 
     private func handleInbound(_ message: XPCDictionary) {
         guard let frame = try? message.withUnsafeUnderlyingDictionary({ try XPCFrame.decode(from: $0) })
-        else { return }
+        else {
+            // Undecodable message: not a well-formed `XPCFrame` at all, so there is no `StreamID`
+            // to fail against -- drop it. (A peer sending garbage is itself a protocol violation
+            // better addressed by Task 9's peer-death/misbehavior handling than by this layer.)
+            return
+        }
         route(frame)
     }
 
@@ -87,6 +133,17 @@ final class XPCConnection: Sendable {
                 // (this frame is what would create one), so there is nothing to fail -- drop it.
                 return
             }
+            // Register the server-side channel *now*, not when `registerServerStream` is later
+            // called for this `id` -- a real client writes metadata/the first message right
+            // after `openStream`, and those frames can arrive before whatever task is consuming
+            // `acceptedStreams` gets around to calling `registerServerStream`. Registering eagerly
+            // here (on the same serial `queue` that routes every subsequent frame for `id`)
+            // closes that window structurally.
+            let (channel, inbound) = StreamChannel<RPCRequestPart<[UInt8]>>.serverInbound(streamID: id)
+            registry.withLock { reg in
+                reg.serverChannels[id] = channel
+                reg.pendingServerInbound[id] = inbound
+            }
             acceptedContinuation.yield((id, descriptor))
         case .cancel(let id, let reason):
             failStream(id, RPCError(code: .cancelled, message: reason))
@@ -97,8 +154,34 @@ final class XPCConnection: Sendable {
         default:
             let id = frame.streamID
             registry.withLock { reg in
-                if let c = reg.clientChannels[id] { try? c.accept(frame) }
-                else if let s = reg.serverChannels[id] { try? s.accept(frame) }
+                if let c = reg.clientChannels[id] {
+                    do {
+                        try c.accept(frame)
+                        // `.status` is the response direction's sole terminator (see
+                        // StreamChannel.swift) -- drop the entry so a long-lived connection
+                        // doesn't grow one registry entry per completed RPC forever.
+                        if case .status = frame { reg.clientChannels[id] = nil }
+                    } catch {
+                        // A grammar violation (out-of-order seq, frame after terminal, ...):
+                        // the channel is already desynced, so fail it locally and stop routing
+                        // to it rather than leaving a live-but-broken stream in the registry.
+                        reg.clientChannels[id] = nil
+                        c.failInbound(error)
+                    }
+                } else if let s = reg.serverChannels[id] {
+                    do {
+                        try s.accept(frame)
+                        // `.halfClose` is the request direction's sole terminator.
+                        if case .halfClose = frame { reg.serverChannels[id] = nil }
+                    } catch {
+                        reg.serverChannels[id] = nil
+                        s.failInbound(error)
+                    }
+                }
+                // Else: a frame for a `StreamID` with no registered channel in either table --
+                // e.g. it arrived after that stream's entry was already removed above (a
+                // straggler after a terminal), or the peer referenced an id this side never
+                // opened/accepted. Dropped; there is no local stream left to fail.
             }
         }
     }
@@ -129,12 +212,23 @@ final class XPCConnection: Sendable {
     }
 
     /// Server builds its side of an already-accepted stream (its `StreamID` came from an
-    /// `.openStream` frame delivered on ``acceptedStreams``).
+    /// `.openStream` frame delivered on ``acceptedStreams``). Hands back the same channel/inbound
+    /// pair `route`'s `.openStream` arm already registered -- see Critical-1 -- rather than
+    /// creating a fresh one, so frames that arrived in the meantime are not lost.
     func registerServerStream(_ id: StreamID, descriptor: MethodDescriptor)
     -> RPCStream<RPCAsyncSequence<RPCRequestPart<[UInt8]>, any Error>,
                  RPCWriter<RPCResponsePart<[UInt8]>>.Closable> {
-        let (channel, inbound) = StreamChannel<RPCRequestPart<[UInt8]>>.serverInbound(streamID: id)
-        registry.withLock { $0.serverChannels[id] = channel }
+        let inbound: RPCAsyncSequence<RPCRequestPart<[UInt8]>, any Error> = registry.withLock { reg in
+            if let pending = reg.pendingServerInbound.removeValue(forKey: id) {
+                return pending
+            }
+            // No `.openStream` frame registered `id` first -- this id didn't come from
+            // `acceptedStreams` (a caller error). Register fresh so the call still returns a
+            // usable (if immediately empty) stream rather than crashing.
+            let (channel, inbound) = StreamChannel<RPCRequestPart<[UInt8]>>.serverInbound(streamID: id)
+            reg.serverChannels[id] = channel
+            return inbound
+        }
         let outbound = RPCWriter.Closable(wrapping: XPCOutboundWriter<RPCResponsePart<[UInt8]>>(
             streamID: id, connection: self))
         return RPCStream(descriptor: descriptor, inbound: inbound, outbound: outbound)
@@ -144,11 +238,14 @@ final class XPCConnection: Sendable {
         registry.withLock { reg in
             reg.clientChannels[id]?.failInbound(error); reg.clientChannels[id] = nil
             reg.serverChannels[id]?.failInbound(error); reg.serverChannels[id] = nil
+            reg.pendingServerInbound[id] = nil
         }
     }
 
     /// On peer death / shutdown: fails every live stream's inbound sequence and finishes
-    /// ``acceptedStreams``.
+    /// ``acceptedStreams``. Wired to the session's cancellation handler in `init` (peer death);
+    /// `deinit` separately finishes the accepted-streams continuation (see there) since by then
+    /// there may be no error to report and no streams left to fail.
     func failAll(_ error: any Error) {
         registry.withLock { reg in
             reg.clientChannels.values.forEach { $0.failInbound(error) }
