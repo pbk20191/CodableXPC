@@ -35,7 +35,7 @@ extension Session {
     // =======================================================================================
 
     /// What this side offers the peer.
-    public struct LocalInterface {
+    public struct LocalInterface: Sendable {
 
         let session: Session
 
@@ -244,7 +244,7 @@ extension Session {
     // =======================================================================================
 
     /// What the peer offers this side.
-    public struct RemoteInterface {
+    public struct RemoteInterface: Sendable {
 
         let session: Session
 

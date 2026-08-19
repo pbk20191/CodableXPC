@@ -49,7 +49,7 @@ extension XPCActorSystem {
 
     /// Apple's `XPCSystem.InProcessService` -- a named, in-process-only service. [sym] a class:
     /// `init(String)`, `connect(using:) -> Transport`.
-    public final class InProcessService {
+    public final class InProcessService: Sendable {
 
         public let name: String
 

@@ -87,7 +87,7 @@ extension Transport {
         /// Hop onto **this** end's transport queue and hand `self` to the closure. That is why
         /// ``cancel()`` calls it on both ends: each end wakes up on its own queue. Delivering
         /// inline would let a handler that replies recurse into the sender's stack.
-        private func receive(_ body: @escaping (InProcessRawTransport) -> Void) {
+        private func receive(_ body: @escaping @Sendable (InProcessRawTransport) -> Void) {
             guard let parent = parentTransport else { return }
             parent.queue.async { body(self) }
         }

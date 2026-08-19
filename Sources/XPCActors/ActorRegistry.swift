@@ -13,7 +13,11 @@ import Synchronization
 @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
 final class ActorRegistry<Thunk>: @unchecked Sendable {
 
-    private struct Entry {
+    /// `@unchecked Sendable`: `Entry` is only ever read or written under ``entries``' `Mutex`,
+    /// which *is* the synchronization. Stating that here (rather than fighting the region checker
+    /// at every `withLock` store) makes the `Mutex`'s value Sendable, which is what it already is
+    /// in practice -- the lock guarantees exclusive access.
+    private struct Entry: @unchecked Sendable {
         weak var instance: AnyObject?
         let thunk: Thunk
     }

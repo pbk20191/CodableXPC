@@ -53,7 +53,7 @@ public extension ActorBackedByDispatchSerialQueue {
     /// deadlock; Apple relies on that non-reentrancy without a guard, and so does this -- the
     /// caller invokes it from the transport's own context, never from within the actor.
     nonisolated func syncToActor<T: Sendable>(
-        _ body: (isolated Self) throws -> T,
+        _ body: @Sendable (isolated Self) throws -> T,
         file: StaticString = #fileID, line: UInt = #line
     ) rethrows -> T {
         try queue.sync {

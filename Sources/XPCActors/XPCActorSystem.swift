@@ -444,7 +444,9 @@ public struct EncodedInvocationDecoder: DistributedTargetInvocationDecoder, Deco
     /// The resolved `errorType`, or `nil` for a name that does not resolve -- which is not the
     /// same as "the target cannot throw". The field whose *presence* signals throwing is read
     /// by ``Session`` directly, off the decoder, before it is handed to the runtime.
-    public mutating func decodeErrorType() throws -> Any.Type? { errorType?.type }
+    public mutating func decodeErrorType() throws -> Any.Type? {
+        errorType?.type
+    }
 
     public mutating func decodeReturnType() throws -> Any.Type? { returnType?.type }
 }
@@ -688,24 +690,31 @@ final class DirectResultHandler: DistributedTargetInvocationResultHandler, @unch
 
     typealias SerializationRequirement = any Codable
 
-    private let _captured = Mutex<Result<any Codable, any Error>?>(nil)
+    /// `@unchecked Sendable` box so the `Mutex`'s value is Sendable. `Result<any Codable, any
+    /// Error>` cannot be annotated (it is stdlib) and its `onReturn`/`onThrow` witnesses are fixed
+    /// by `DistributedTargetInvocationResultHandler`, so the non-Sendable payload cannot be made
+    /// `sending` at the source; the lock is the synchronization, which is what this asserts.
+    private struct Captured: @unchecked Sendable {
+        let result: Result<any Codable, any Error>
+    }
+    private let _captured = Mutex<Captured?>(nil)
 
     /// The captured outcome, or `nil` if the target produced none. Apple's
     /// `DirectResultHandler.capturedResult`.
-    var capturedResult: Result<any Codable, any Error>? { _captured.withLock { $0 } }
+    var capturedResult: Result<any Codable, any Error>? { _captured.withLock { $0?.result } }
 
     init() {}
 
     func onReturn<Success: Codable>(value: Success) async throws {
-        _captured.withLock { $0 = .success(value) }
+        _captured.withLock { $0 = Captured(result: .success(value)) }
     }
 
     func onReturnVoid() async throws {
-        _captured.withLock { $0 = .success(Ack()) }
+        _captured.withLock { $0 = Captured(result: .success(Ack())) }
     }
 
     func onThrow<Err: Error>(error: Err) async throws {
-        _captured.withLock { $0 = .failure(error) }
+        _captured.withLock { $0 = Captured(result: .failure(error)) }
     }
 }
 

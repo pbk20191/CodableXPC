@@ -44,7 +44,7 @@ enum InvocationCodingKeys: String, CodingKey {
 /// `executeDistributedTarget` knows each parameter's type statically from the callee
 /// signature and asks for them in order, so a tag would be pure overhead. Labels are
 /// discarded for the same reason.
-public struct InvocationBody: Encodable {
+public struct InvocationBody: Encodable, @unchecked Sendable {
 
     /// The `_DistributedActorStub` a call goes through when it targets a distributed
     /// *protocol* rather than a concrete actor type. At most one -- Apple raises
@@ -102,7 +102,7 @@ public struct InvocationBody: Encodable {
 /// `contents` holds the invocation dictionary *directly*: this is a nesting relative to
 /// a flattened request, and a flattening relative to what the name `InvocationContents`
 /// suggests.
-public struct RemoteInvocationRequest: Encodable {
+public struct RemoteInvocationRequest: Encodable, @unchecked Sendable {
 
     /// The correlation id. Coded through `ID64`'s own single-value conformance, so it
     /// lands as a bare `UInt64` under the key -- not a nested one-field dictionary.

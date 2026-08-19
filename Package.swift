@@ -1,8 +1,10 @@
 // swift-tools-version: 6.1
-// `swiftLanguageModes: [.v5]` (below) requires tools-version 6.0+, and the pin is not
-// tidiness: from tools-version 6.0 the default language mode becomes v6, so a build-system
-// version bump would otherwise switch every target to strict concurrency checking. Pinned so
-// the toolchain version does exactly one thing. The deployment floor below is untouched by it.
+// The package default is the Swift 5 language mode; only the `XPCActors` target opts in to
+// the Swift 6 language mode (its own `swiftSettings: [.swiftLanguageMode(.v6)]`). XPCActors is
+// clean under complete concurrency checking: non-Sendable state living under a
+// `Synchronization.Mutex` is `@unchecked Sendable` at the value type (the lock is the
+// synchronization), and the immutable wire structs are `@unchecked Sendable` snapshots. The
+// pin keeps a tools-version bump from switching the *other* targets to v6 as a side effect.
 
 import PackageDescription
 
@@ -70,7 +72,11 @@ let package = Package(
         // `libswiftXPC` symbols with `@_silgen_name`), so it needs no coder dependency of its own.
         .target(
             name: "XPCActors",
-            dependencies: []),
+            dependencies: [],
+            swiftSettings: [
+                .swiftLanguageMode(.v6)
+            ]
+        ),
         // Reproduces every wire format Apple's XPC Swift overlay has used for
         // Codable -- the iOS 17/18 byte stream and the iOS 26+ encoding graph.
         // They share no tag values, no framing and no envelope, only a lineage, so
@@ -98,7 +104,5 @@ let package = Package(
             name: "XPCOverlayCoderTests",
             dependencies: ["XPCOverlayCoder", "CodableXPC"]),
     ],
-    // See the tools-version note at the top: pinned so the toolchain version does not also
-    // switch every target to the Swift 6 language mode.
     swiftLanguageModes: [.v5]
 )

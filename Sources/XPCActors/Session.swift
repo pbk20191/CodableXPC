@@ -184,7 +184,10 @@ public final class Session: SessionCoding, OutboundSession, InboundSession, @unc
     /// queue). `isCancelled` lives here rather than in a separate atomic because a share
     /// must observe "not cancelled" **and** register in the same critical section -- see
     /// ``shareDynamically(_:)``.
-    private struct SharedActorState {
+    /// `@unchecked Sendable`: this state is only ever touched under ``sharedActors``' `Mutex`,
+    /// which is the synchronization. Declaring it makes the `Mutex`'s value Sendable -- what it
+    /// already is in practice -- so the region checker stops flagging the (correct) stores.
+    private struct SharedActorState: @unchecked Sendable {
         /// key -> actor. The direction the decode path reads, so it is a direct lookup.
         var byKey: [SharedActorKey: SharedActor] = [:]
 

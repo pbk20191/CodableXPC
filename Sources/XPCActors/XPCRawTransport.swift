@@ -51,7 +51,10 @@ extension Transport {
         private let session: XPCSession
         private let role: Role
 
-        private struct State {
+        /// `@unchecked Sendable`: only ever touched under ``state``' `Mutex`. Also, `xpc_object_t`
+        /// is not `Sendable` in the overlay though libxpc objects are thread-safe; the lock is the
+        /// synchronization either way.
+        private struct State: @unchecked Sendable {
             /// The most recent message the peer sent, retained so the peer gates have something
             /// to interrogate. Message-scoped at capture, peer-scoped in meaning: every message
             /// on one session comes from the same peer. This is the deliberate deviation the
