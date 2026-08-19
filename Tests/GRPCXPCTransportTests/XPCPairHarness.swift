@@ -46,10 +46,17 @@ struct XPCPairHarness {
         // See hazard (1) above.
         try clientConnection.send(.credit(0, n: 0))
 
-        guard await waitUntilTrue({ box.connection != nil }) else {
+        guard await waitUntilTrue({ box.connection != nil }),
+              let serverConnection = box.connection else {
             throw HarnessError("the listener never accepted the client session")
         }
-        return (clientConnection, box.connection!)
+        // Hand the server connection's *sole* ownership to the caller. The listener's incoming-
+        // session closure captures `box` strongly and the listener itself may outlive this
+        // function (libxpc keeps an activated listener alive), so a strong reference left behind
+        // in the box would keep the server `XPCConnection` alive for the whole process -- which
+        // would both leak its `XPCSession` and make any test of `deinit` reachability vacuous.
+        box.connection = nil
+        return (clientConnection, serverConnection)
     }
 
     /// See hazard (2) above.
@@ -68,7 +75,10 @@ struct HarnessError: Error, CustomStringConvertible {
     init(_ description: String) { self.description = description }
 }
 
-private func waitUntilTrue(timeout seconds: Double = 5, _ condition: () -> Bool) async -> Bool {
+/// Polls `condition` until it holds or `seconds` elapse. Shared with `XPCConnectionTests`, which
+/// uses it to wait out the transient strong references (an in-flight routing block on the
+/// connection's queue) that can briefly outlive the test's own release of a connection.
+func waitUntilTrue(timeout seconds: Double = 5, _ condition: () -> Bool) async -> Bool {
     let deadline = Date().addingTimeInterval(seconds)
     while Date() < deadline {
         if condition() { return true }

@@ -1,3 +1,4 @@
+import Foundation
 import XCTest
 import GRPCCore
 import XPC
@@ -91,4 +92,145 @@ final class XPCConnectionTests: XCTestCase {
         default: XCTFail("expected message second, got \(String(describing: parts.last))")
         }
     }
+
+    /// Ownership pin. `route`'s `.openStream` arm builds the whole server-side `RPCStream` and
+    /// yields it on `acceptedStreams`, whose continuation buffers that payload *inside the
+    /// connection*. If anything reachable from the payload owned the connection back -- as a
+    /// strong `XPCOutboundWriter.connection` did -- then a consumer that lags or never drains
+    /// `acceptedStreams` would make the connection retain itself, `deinit` would never run, its
+    /// `session.cancel(reason:)` would never fire, and the native `XPCSession` would leak.
+    ///
+    /// So: open a stream, let the server buffer the accept, never read `acceptedStreams` at all,
+    /// drop the only outside references, and require both connections to deinitialize.
+    func testConnectionDeinitsWithAnAcceptedStreamBufferedButNeverDrained() async throws {
+        weak var weakClient: XPCConnection?
+        weak var weakServer: XPCConnection?
+
+        // A single optional holding the pair, niled explicitly below: binding the connections to
+        // ordinary `let`s would keep them alive to the end of the function and make the
+        // assertions untestable regardless of the fix.
+        var pair: (XPCConnection, XPCConnection)? = try await XPCPairHarness().connectPair()
+        weakClient = pair?.0
+        weakServer = pair?.1
+        XCTAssertNotNil(weakClient)
+        XCTAssertNotNil(weakServer)
+
+        let (sid, _) = pair!.0.openClientStream(
+            descriptor: MethodDescriptor(fullyQualifiedService: "pkg.S", method: "M"))
+        try pair!.0.send(.openStream(sid, method: "pkg.S/M", deadlineNanos: nil))
+
+        // Give the server's serial queue time to route `.openStream` and yield the `AcceptedStream`
+        // into `acceptedContinuation`'s buffer, then barrier on that queue so no routing block is
+        // still on the stack (each one holds a transient strong `self`). Nothing here ever
+        // iterates `acceptedStreams`, so that payload -- writer included -- is still sitting in
+        // the connection's own buffer when the references are dropped below: precisely the
+        // leaking configuration. (Delivery of an in-process XPC message is not something this
+        // layer can synchronise on without draining the accept, which the scenario forbids; the
+        // deterministic form of the same ownership proof, with the accepted stream definitely
+        // drained and definitely still alive, is
+        // `testWritingToAnAcceptedStreamAfterTheConnectionIsGoneFailsUnavailable` below.)
+        try await Task.sleep(nanoseconds: 100_000_000)
+        pair!.1.queue.sync { }
+
+        pair = nil
+
+        // Polled rather than asserted instantly: the last release can race a routing block that
+        // still holds a transient strong `self`, so "not yet nil at this instant" is a scheduling
+        // artifact, while "never nil" is the leak. With the retain cycle present this waits out
+        // the full timeout and then fails, as verified by reverting the fix.
+        let serverReleased = await waitUntilTrue { weakServer == nil }
+        XCTAssertTrue(serverReleased,
+                      "the server connection must deinit with an undrained accepted stream buffered "
+                      + "-- otherwise deinit's session.cancel(reason:) never runs and the XPCSession leaks")
+        let clientReleased = await waitUntilTrue { weakClient == nil }
+        XCTAssertTrue(clientReleased, "the client connection must deinit once nobody outside holds it")
+    }
+
+    /// The other half of the ownership contract: a write attempted through a stream whose
+    /// connection is gone must fail deterministically -- not crash (which `unowned` would) and not
+    /// silently succeed (which dropping the frame would). Doubles as the strongest form of the
+    /// deinit pin: here the accepted stream is *drained and still held alive*, so the only thing
+    /// that can be keeping the connection alive is the writer inside it.
+    func testWritingToAnAcceptedStreamAfterTheConnectionIsGoneFailsUnavailable() async throws {
+        weak var weakServer: XPCConnection?
+
+        var pair: (XPCConnection, XPCConnection)? = try await XPCPairHarness().connectPair()
+        weakServer = pair?.1
+
+        let (sid, _) = pair!.0.openClientStream(
+            descriptor: MethodDescriptor(fullyQualifiedService: "pkg.S", method: "M"))
+        try pair!.0.send(.openStream(sid, method: "pkg.S/M", deadlineNanos: nil))
+
+        var iterator = pair!.1.acceptedStreams.makeAsyncIterator()
+        let next = await iterator.next()
+        let accepted = try XCTUnwrap(next)
+        XCTAssertEqual(accepted.id, sid)
+        // Keep only the built `RPCStream` (and hence its outbound writer) past the connections'
+        // lifetime; `accepted` itself is a value, so `stream` is the sole survivor.
+        let stream = accepted.stream
+        // Barrier: `await iterator.next()` can resume while the routing block that yielded the
+        // accept is still on the server queue's stack, holding a transient strong `self`.
+        pair!.1.queue.sync { }
+
+        pair = nil
+        let serverReleased = await waitUntilTrue { weakServer == nil }
+        XCTAssertTrue(serverReleased,
+                      "a live, drained accepted stream must not keep its connection alive either")
+
+        do {
+            try await stream.outbound.write(.metadata(Metadata()))
+            XCTFail("a write after the connection is gone must throw, not silently succeed")
+        } catch let error as RPCError {
+            XCTAssertEqual(error.code, .unavailable)
+        }
+    }
+
+    /// The read direction of the same contract: a stream that outlives its connection must have
+    /// its inbound sequence *failed*, not left awaiting a frame that can never arrive. (Without
+    /// `deinit -> failAll`, the drain below would hang forever rather than fail.)
+    func testAnAcceptedStreamsInboundFailsWhenItsConnectionGoesAway() async throws {
+        var pair: (XPCConnection, XPCConnection)? = try await XPCPairHarness().connectPair()
+
+        let (sid, _) = pair!.0.openClientStream(
+            descriptor: MethodDescriptor(fullyQualifiedService: "pkg.S", method: "M"))
+        try pair!.0.send(.openStream(sid, method: "pkg.S/M", deadlineNanos: nil))
+
+        var iterator = pair!.1.acceptedStreams.makeAsyncIterator()
+        let next = await iterator.next()
+        let stream = try XCTUnwrap(next).stream
+
+        pair = nil
+
+        // Bounded deliberately: the regression this pins does not *fail* the drain, it **hangs**
+        // it -- without `deinit -> failAll` the channel's continuation is never finished, so
+        // `for try await` waits forever (verified: the test wedges rather than failing). Racing
+        // the drain against a fulfillment timeout turns that into a fast, legible failure instead
+        // of a stuck test process.
+        let terminated = expectation(description: "the inbound sequence terminated")
+        let complaint = FirstComplaint()
+        Task {
+            do {
+                for try await part in stream.inbound {
+                    complaint.note("no request part was ever sent, yet got \(part)")
+                }
+                complaint.note("the inbound sequence finished cleanly instead of failing")
+            } catch let error as RPCError {
+                if error.code != .unavailable { complaint.note("wrong RPCError code \(error.code)") }
+            } catch {
+                complaint.note("expected an RPCError, got \(error)")
+            }
+            terminated.fulfill()
+        }
+        await fulfillment(of: [terminated], timeout: 5)
+        XCTAssertNil(complaint.message, complaint.message ?? "")
+    }
+}
+
+/// Records the first thing that went wrong inside a detached task, for the test body to assert on
+/// once that task reports in.
+private final class FirstComplaint: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _message: String?
+    var message: String? { lock.withLock { _message } }
+    func note(_ message: String) { lock.withLock { if _message == nil { _message = message } } }
 }

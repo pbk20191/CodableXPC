@@ -16,6 +16,12 @@ import CodableXPC
 /// claim needed. Handing over the already-built `RPCStream` at accept time removes the second
 /// call, and with it every one of those failure modes at once -- there is nothing left pending to
 /// leak, lose, or race.
+///
+/// - Important: this payload is buffered *by the connection* (in `acceptedContinuation`) until a
+///   consumer drains it, so nothing reachable from it may own the connection back. That is why
+///   `stream.outbound`'s `XPCOutboundWriter` holds its connection weakly -- see that type's doc
+///   comment. Writes through a stream whose connection has gone away fail with
+///   `RPCError(code: .unavailable)`.
 @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
 struct AcceptedStream: Sendable {
     let id: StreamID
@@ -120,7 +126,17 @@ final class XPCConnection: Sendable {
         if isActivated.load(ordering: .relaxed) {
             session.cancel(reason: "XPCConnection deinitialized")
         }
-        acceptedContinuation.finish()
+        // Reaching here at all is only possible because nothing the connection owns owns it back
+        // -- in particular the `AcceptedStream`s buffered in `acceptedContinuation` hold their
+        // outbound writer, which holds this connection *weakly* (see `XPCOutboundWriter`).
+        //
+        // Fail (rather than merely finish) so that a stream handed out earlier and still held by
+        // someone -- an `AcceptedStream` a consumer took, or a client stream from
+        // `openClientStream` -- terminates its inbound sequence deterministically instead of
+        // awaiting a frame that can no longer arrive. Outbound writes on such a stream
+        // symmetrically fail with `.unavailable` from the writer itself. `failAll` also finishes
+        // `acceptedContinuation`, so an accept loop iterating `acceptedStreams` still ends.
+        failAll(RPCError(code: .unavailable, message: "the XPC connection was deinitialized"))
     }
 
     /// Serializes `frame` and sends it one-way over the session. (Credit-bearing sends with a
