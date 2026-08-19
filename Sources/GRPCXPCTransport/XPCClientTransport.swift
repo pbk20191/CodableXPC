@@ -13,7 +13,7 @@ import Synchronization
 /// Pinned against grpc-swift-2 2.4.2: `ClientContext.init(descriptor:remotePeer:localPeer:)` and
 /// `MethodDescriptor.fullyQualifiedMethod` matched the plan verbatim.
 ///
-/// A `final class`, not a struct: `shutdown`'s `Synchronization.Mutex` is `~Copyable`, and a
+/// A `final class`, not a struct: `state`'s `Synchronization.Mutex` is `~Copyable`, and a
 /// `Copyable`-conforming struct cannot hold a `~Copyable` stored property -- the same reason
 /// `XPCOutboundWriter` (which stores an `Atomic`) is a class rather than a struct.
 @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
@@ -22,11 +22,21 @@ public final class XPCClientTransport: ClientTransport {
 
     private let connection: XPCConnection
 
-    /// Resumed by `beginGracefulShutdown()`; parked on by `connect()`. `nil` once shutdown has
-    /// already been signalled (or before `connect()` has stored anything to resume), so a
-    /// `beginGracefulShutdown()` that arrives before -- or a second one after -- `connect()`
-    /// parks is a harmless no-op rather than a double-resume trap.
-    private let shutdown = Mutex<CheckedContinuation<Void, Never>?>(nil)
+    /// `connect()`'s state, made explicit rather than "one optional continuation slot": that
+    /// earlier shape let a second concurrent `connect()` silently overwrite the first's
+    /// continuation, leaking it (the runtime reports this as "SWIFT TASK CONTINUATION MISUSE")
+    /// and stranding the first caller parked forever. With this enum every transition is
+    /// explicit: `.idle -> .connected` (first `connect()` parks), `.connected -> .shutDown`
+    /// (`beginGracefulShutdown()`, or cancellation of `connect()`'s own task, resumes the parked
+    /// caller and retires the slot), and `.idle -> .shutDown` (either of those arriving before
+    /// any `connect()` call, so a *later* `connect()` returns immediately instead of parking on
+    /// a shutdown that already happened).
+    private enum ConnectState {
+        case idle
+        case connected(CheckedContinuation<Void, any Error>)
+        case shutDown
+    }
+    private let state = Mutex<ConnectState>(.idle)
 
     init(connection: XPCConnection) {
         self.connection = connection
@@ -34,21 +44,68 @@ public final class XPCClientTransport: ClientTransport {
 
     public var retryThrottle: RetryThrottle? { nil }
 
-    /// Blocks until `beginGracefulShutdown()` is called -- mirroring `GRPCInProcessTransport`'s
-    /// reference client, which likewise just parks until told to stop. Deadlines, retries, and
-    /// draining semantics beyond that are later tasks' concern; the underlying `XPCConnection` is
-    /// already activated by the time it is handed to this transport, so there is no connecting
-    /// work left for this method to do.
+    /// Blocks until `beginGracefulShutdown()` is called, or until this call's own task is
+    /// cancelled -- mirroring `GRPCInProcessTransport`'s reference client, which parks the same
+    /// way and also returns (rather than throwing) once its task is cancelled. Returning
+    /// normally on cancellation, not throwing `CancellationError`, matters beyond style here:
+    /// `GRPCClient.runConnections()` calls `transport.connect()` and wraps *any* thrown error --
+    /// cancellation included -- in a `RuntimeError(code: .transportError, ...)`, which would
+    /// misreport an ordinary cancelled shutdown as a transport failure. Deadlines, retries, and
+    /// draining semantics beyond parking/unparking are later tasks' concern; the underlying
+    /// `XPCConnection` is already activated by the time it is handed to this transport, so there
+    /// is no connecting work left for this method to do.
+    ///
+    /// A second, concurrent call while one `connect()` is already parked is refused with a
+    /// thrown `RPCError(code: .failedPrecondition)` rather than silently clobbering the first --
+    /// gRPC's own client already throws (`RuntimeError`) rather than traps when its analogous
+    /// `runConnections()` is misused this way, so a thrown error is the precedent this follows;
+    /// a caller that never calls `connect()` twice concurrently (the documented, correct usage)
+    /// never sees it.
     public func connect() async throws {
-        await withCheckedContinuation { continuation in
-            shutdown.withLock { $0 = continuation }
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
+                let immediate: Result<Void, any Error>? = state.withLock { current in
+                    switch current {
+                    case .idle:
+                        current = .connected(continuation)
+                        return nil   // parked; resumed later by shutdown or cancellation
+                    case .connected:
+                        return .failure(RPCError(
+                            code: .failedPrecondition,
+                            message: "XPCClientTransport.connect() is already running "
+                                + "-- it must not be called more than once concurrently"))
+                    case .shutDown:
+                        return .success(())
+                    }
+                }
+                switch immediate {
+                case .success: continuation.resume()
+                case .failure(let error): continuation.resume(throwing: error)
+                case nil: break   // parked above; nothing to resume yet
+                }
+            }
+        } onCancel: {
+            self.shutDownAndTakePending()?.resume()
         }
     }
 
     public func beginGracefulShutdown() {
-        shutdown.withLock { pending in
-            pending?.resume()
-            pending = nil
+        shutDownAndTakePending()?.resume()
+    }
+
+    /// Moves to `.shutDown` and hands back whatever `connect()` call was parked, if any -- the
+    /// one piece of logic `beginGracefulShutdown()` and cancellation of `connect()`'s task share,
+    /// since both end `connect()` the same way (resume it to return normally). Called at most
+    /// once per parked continuation because the state leaves `.connected` the moment it is taken,
+    /// so a second caller (a duplicate `beginGracefulShutdown()`, or shutdown racing cancellation)
+    /// finds `.shutDown` and gets `nil` back -- never a second resume of the same continuation,
+    /// which would trap.
+    private func shutDownAndTakePending() -> CheckedContinuation<Void, any Error>? {
+        state.withLock { current in
+            let pending: CheckedContinuation<Void, any Error>?
+            if case .connected(let continuation) = current { pending = continuation } else { pending = nil }
+            current = .shutDown
+            return pending
         }
     }
 
