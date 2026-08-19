@@ -42,6 +42,14 @@ let package = Package(
         .library(
             name: "XPCOverlayCoder",
             targets: ["XPCOverlayCoder"]),
+        .library(
+            name: "GRPCXPCTransport",
+            targets: ["GRPCXPCTransport"]),
+    ],
+    dependencies: [
+        // Only `GRPCXPCTransport` (and its tests) depend on this; every other target
+        // stays dependency-free.
+        .package(url: "https://github.com/grpc/grpc-swift-2.git", from: "2.4.1"),
     ],
     targets: [
         // One helper, shared by the two coders that both hand a Data to libxpc.
@@ -85,6 +93,19 @@ let package = Package(
         .target(
             name: "XPCOverlayCoder",
             dependencies: ["XPCDispatchDataBridge"]),
+        // gRPC transport over XPC. The only target in this package that depends on
+        // grpc-swift-2 (GRPCCore) -- everything else stays dependency-free. Adopts
+        // the Swift 6 language mode locally; the package-level default stays .v5.
+        .target(
+            name: "GRPCXPCTransport",
+            dependencies: [
+                .product(name: "GRPCCore", package: "grpc-swift-2"),
+                "CodableXPC",
+            ],
+            swiftSettings: [
+                .swiftLanguageMode(.v6)
+            ]
+        ),
         .testTarget(
             name: "CodableXPCTests",
             dependencies: ["CodableXPC"]),
@@ -103,6 +124,16 @@ let package = Package(
         .testTarget(
             name: "XPCOverlayCoderTests",
             dependencies: ["XPCOverlayCoder", "CodableXPC"]),
+        // No GRPCInProcessTransport dependency: nothing in this task's tests uses it (YAGNI).
+        .testTarget(
+            name: "GRPCXPCTransportTests",
+            dependencies: [
+                "GRPCXPCTransport",
+            ],
+            swiftSettings: [
+                .swiftLanguageMode(.v6)
+            ]
+        ),
     ],
     swiftLanguageModes: [.v5]
 )
