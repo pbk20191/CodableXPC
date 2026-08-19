@@ -1464,3 +1464,215 @@ payloads end to end, which is the real proof this landed.
 git add Sources/GRPCXPCTransport Tests/GRPCXPCTransportTests
 git commit -m "feat(GRPCXPCTransport): standard gRPC framing for payloads, metadata and status"
 ```
+
+---
+
+### Task 13: HTTP/2-shaped envelope encoding
+
+**Inserted 2026-08-19 by user decision** — the payload and metadata/status vocabulary were standardized
+in Task 12, but the *envelope* was still Swift's synthesized `Codable` enum shape
+(`{"message": {"_0": 3, "seq": 7, "bytes": …}}`), which is a compiler artifact, not a protocol.
+There is no gRPC standard for an envelope over a message bus — gRPC's framing *is* HTTP/2 — so
+"standard" here means mirroring HTTP/2's semantics. The user chose semantics-mirroring over real
+binary framing + HPACK (which would tunnel HTTP/2 through XPC and discard the typed dictionary).
+
+**Key constraint: do not touch the reviewed state machine.** `XPCFrame` stays the *internal*
+representation and `StreamChannel`'s grammar, `seq` accounting and terminal rules stay byte-identical.
+All the change lives at the encode/decode boundary.
+
+**Files:**
+- Create: `Sources/GRPCXPCTransport/HTTP2Envelope.swift`
+- Modify: `Sources/GRPCXPCTransport/XPCFrame.swift` (replace synthesized `Codable` with the explicit codec)
+- Test: `Tests/GRPCXPCTransportTests/HTTP2EnvelopeTests.swift`
+
+**Interfaces:**
+- Consumes: `XPCFrame`, `WireMetadata`, `GRPCMessageFraming`.
+- Produces: `XPCFrame.encodeToXPC()` / `XPCFrame.decode(from:)` keep their signatures — only the
+  bytes between them change. New `enum HTTP2Envelope` holding the frame-type and flag constants and
+  the key names.
+
+**The mapping (HTTP/2 frame type codes and flags, as in RFC 9113 §6, and gRPC's HTTP/2 header names):**
+
+| internal `XPCFrame` case | `type` | `flags` | carries |
+|---|---|---|---|
+| `openStream(id, method, deadline)` | `0x1` HEADERS | — | `:path` = `/service/method`, `content-type: application/grpc`, `grpc-timeout` when a deadline is set |
+| `metadata(id, md)` | `0x1` HEADERS | — | the metadata entries |
+| `message(id, seq, bytes)` | `0x0` DATA | — | the already-length-prefixed payload (Task 12) + `seq` |
+| `halfClose(id)` | `0x0` DATA | `0x1` END_STREAM | empty payload — HTTP/2 half-closes with a flag, not a frame |
+| `status(id, code, msg, trailers)` | `0x1` HEADERS | `0x1` END_STREAM | trailers plus `grpc-status` and `grpc-message` |
+| `cancel(id, reason)` | `0x3` RST_STREAM | — | `reason` (HTTP/2 carries a numeric error code; the string is ours, see deviations) |
+| `credit(id, n)` | `0x8` WINDOW_UPDATE | — | `n` as the window-size increment |
+| `goAway` | `0x7` GOAWAY | — | stream id 0, as HTTP/2 requires for connection-level frames |
+
+**Deliberate deviations to document in the file:** stream ids are `UInt64` (HTTP/2 uses 31 bits);
+`seq` is ours and has no HTTP/2 counterpart (HTTP/2 relies on stream ordering, which an XPC message
+bus does not guarantee); `RST_STREAM` carries a human-readable reason instead of a 32-bit error code;
+no HPACK — header names and values are carried natively, since a local IPC link has no
+header-compression pressure and base64/percent-encoding would only cost size (spec D5).
+
+- [ ] **Step 1: Write the failing envelope tests**
+
+`Tests/GRPCXPCTransportTests/HTTP2EnvelopeTests.swift`:
+```swift
+import XCTest
+import GRPCCore
+import XPC
+@testable import GRPCXPCTransport
+
+@available(macOS 15.0, *)
+final class HTTP2EnvelopeTests: XCTestCase {
+
+    /// The envelope must carry HTTP/2's own type codes and flags, not Swift's synthesized case names.
+    func testAMessageFrameEncodesAsDATA() throws {
+        let frame = XPCFrame.message(7, seq: 3, bytes: GRPCMessageFraming.frame([0xAB]))
+        let dict = XPCDictionary(try frame.encodeToXPC())
+        XCTAssertEqual(try dict.decodeUInt8(HTTP2Envelope.Key.type), HTTP2Envelope.FrameType.data)
+        XCTAssertEqual(try dict.decodeUInt64(HTTP2Envelope.Key.streamID), 7)
+        XCTAssertEqual(try dict.decodeUInt8(HTTP2Envelope.Key.flags), 0)
+    }
+
+    /// Half-close is HTTP/2's END_STREAM flag, not a frame kind of its own.
+    func testHalfCloseEncodesAsDATAWithEndStream() throws {
+        let dict = XPCDictionary(try XPCFrame.halfClose(9).encodeToXPC())
+        XCTAssertEqual(try dict.decodeUInt8(HTTP2Envelope.Key.type), HTTP2Envelope.FrameType.data)
+        XCTAssertEqual(try dict.decodeUInt8(HTTP2Envelope.Key.flags) & HTTP2Envelope.Flags.endStream,
+                       HTTP2Envelope.Flags.endStream)
+    }
+
+    /// A terminal status is trailing HEADERS with END_STREAM, carrying gRPC's own trailer names.
+    func testStatusEncodesAsTrailingHeadersWithGRPCStatus() throws {
+        var trailers = Metadata(); trailers.addString("x", forKey: "k")
+        let frame = XPCFrame.status(4, code: 0, message: "ok", trailers: WireMetadata(trailers))
+        let dict = XPCDictionary(try frame.encodeToXPC())
+        XCTAssertEqual(try dict.decodeUInt8(HTTP2Envelope.Key.type), HTTP2Envelope.FrameType.headers)
+        XCTAssertEqual(try dict.decodeUInt8(HTTP2Envelope.Key.flags) & HTTP2Envelope.Flags.endStream,
+                       HTTP2Envelope.Flags.endStream)
+        let names = try dict.decodeHeaderNames()
+        XCTAssertTrue(names.contains("grpc-status"))
+        XCTAssertTrue(names.contains("grpc-message"))
+    }
+
+    /// An opening HEADERS frame carries gRPC's request pseudo-headers.
+    func testOpenStreamCarriesPathAndContentType() throws {
+        let frame = XPCFrame.openStream(1, method: "pkg.S/M", deadlineNanos: nil)
+        let dict = XPCDictionary(try frame.encodeToXPC())
+        let names = try dict.decodeHeaderNames()
+        XCTAssertTrue(names.contains(":path"))
+        XCTAssertTrue(names.contains("content-type"))
+    }
+
+    func testCreditEncodesAsWindowUpdateAndGoAwayUsesStreamZero() throws {
+        let credit = XPCDictionary(try XPCFrame.credit(2, n: 5).encodeToXPC())
+        XCTAssertEqual(try credit.decodeUInt8(HTTP2Envelope.Key.type),
+                       HTTP2Envelope.FrameType.windowUpdate)
+        let goAway = XPCDictionary(try XPCFrame.goAway.encodeToXPC())
+        XCTAssertEqual(try goAway.decodeUInt8(HTTP2Envelope.Key.type), HTTP2Envelope.FrameType.goAway)
+        XCTAssertEqual(try goAway.decodeUInt64(HTTP2Envelope.Key.streamID), 0)
+    }
+
+    /// The whole point: no Swift-synthesized case-name key survives anywhere.
+    func testNoSwiftSynthesizedCaseNamesOnTheWire() throws {
+        for frame in XPCFrameTests.everyKind {
+            let names = try XPCDictionary(frame.encodeToXPC()).topLevelKeys()
+            for forbidden in ["openStream", "metadata", "message", "halfClose",
+                              "status", "cancel", "credit", "goAway", "_0"] {
+                XCTAssertFalse(names.contains(forbidden),
+                               "\(forbidden) leaked onto the wire for \(frame)")
+            }
+        }
+    }
+
+    /// Every kind still round-trips through the new codec.
+    func testEveryKindRoundTrips() throws {
+        for frame in XPCFrameTests.everyKind {
+            XCTAssertEqual(try XPCFrame.decode(from: frame.encodeToXPC()), frame)
+        }
+    }
+}
+```
+The three `XPCDictionary` helpers (`decodeUInt8`, `decodeUInt64`, `decodeHeaderNames`, `topLevelKeys`)
+and `XPCFrameTests.everyKind` do not exist yet — add them as small test-only helpers, reusing the
+existing `everyFrameKindRoundTrips` fixture list rather than duplicating it.
+
+- [ ] **Step 2: Run to verify it fails**
+
+Run: `swift test --filter HTTP2EnvelopeTests --scratch-path <scratch>/build`
+Expected: FAIL — `HTTP2Envelope` undefined.
+
+- [ ] **Step 3: Implement `HTTP2Envelope` and the explicit codec**
+
+`Sources/GRPCXPCTransport/HTTP2Envelope.swift` holds the constants and nothing else:
+```swift
+import Foundation
+
+/// HTTP/2's frame vocabulary (RFC 9113 §6) plus gRPC's HTTP/2 header names, which together are the
+/// only standard framing gRPC has. This transport carries these fields natively in an xpc dictionary
+/// rather than as HTTP/2's binary frames: the semantics are HTTP/2's, the container is XPC's.
+@available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
+enum HTTP2Envelope {
+
+    /// Dictionary keys. Short and fixed — these are the envelope, not user data.
+    enum Key {
+        static let type = "type"
+        static let streamID = "stream-id"
+        static let flags = "flags"
+        static let headers = "headers"
+        static let payload = "payload"
+        static let seq = "seq"
+        static let windowIncrement = "window-increment"
+        static let reason = "reason"
+    }
+
+    /// RFC 9113 §6 frame type codes. Only the five this transport needs are defined.
+    enum FrameType {
+        static let data: UInt8 = 0x0
+        static let headers: UInt8 = 0x1
+        static let rstStream: UInt8 = 0x3
+        static let goAway: UInt8 = 0x7
+        static let windowUpdate: UInt8 = 0x8
+    }
+
+    /// RFC 9113 §6.1/§6.2 flags. END_STREAM is the only one with meaning here — HTTP/2 half-closes
+    /// a direction with this flag rather than with a frame of its own, so `halfClose` and `status`
+    /// both set it.
+    enum Flags {
+        static let none: UInt8 = 0x0
+        static let endStream: UInt8 = 0x1
+    }
+
+    /// gRPC's own HTTP/2 header and trailer names (gRPC over HTTP/2 spec).
+    enum Header {
+        static let path = ":path"
+        static let contentType = "content-type"
+        static let contentTypeGRPC = "application/grpc"
+        static let timeout = "grpc-timeout"
+        static let status = "grpc-status"
+        static let message = "grpc-message"
+    }
+}
+```
+Then replace `XPCFrame`'s synthesized conformance with an explicit `encode(to:)`/`init(from:)` (keep
+`Codable`, so `encodeToXPC`/`decode(from:)` keep working through `CodableXPC`) that writes exactly
+`type`/`stream-id`/`flags` plus the kind-specific fields per the mapping table, and reads them back by
+switching on `type` and `flags`. Decode must reject an unknown `type` and a `flags` bit it does not
+understand with a clear error rather than silently mapping to a default — an unknown frame is a
+protocol violation, not a no-op.
+
+- [ ] **Step 4: Run to verify the envelope tests pass**
+
+Run: `swift test --filter HTTP2EnvelopeTests --scratch-path <scratch>/build`
+Expected: PASS.
+
+- [ ] **Step 5: Run the full suite**
+
+Run: `swift test --scratch-path <scratch>/build`
+Expected: all 618 tests still green. Nothing above the codec should notice: `StreamChannel`'s grammar,
+`seq` accounting, terminal rules, the credit machinery and every lifecycle test are untouched, and the
+end-to-end call-type tests now exercise the HTTP/2-shaped envelope over real XPC sessions — which is
+the real proof this landed.
+
+- [ ] **Step 6: Commit**
+```bash
+git add Sources/GRPCXPCTransport Tests/GRPCXPCTransportTests
+git commit -m "feat(GRPCXPCTransport): HTTP/2-shaped envelope encoding"
+```

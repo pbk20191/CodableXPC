@@ -273,6 +273,23 @@ guaranteed mutually ordered. Guards:
   making it byte-identical to gRPC over HTTP/2. Compression stays unimplemented in v1 (the flag
   is written as 0 and a non-zero flag is rejected), and message-size enforcement stays deferred —
   but the *shape* is now standard rather than bespoke.
+- **D6 — the envelope mirrors HTTP/2's semantics, not its bytes (added 2026-08-19, user decision).**
+  Sections 5 and 6 originally left the envelope as a Swift `Codable` enum, which encodes to the
+  compiler's synthesized shape (`{"message": {"_0": 3, …}}`) — a Swift artifact rather than a
+  protocol. Since gRPC's only standard framing *is* HTTP/2, the envelope now carries HTTP/2's own
+  vocabulary natively in the xpc dictionary: RFC 9113 §6 frame type codes (DATA `0x0`, HEADERS
+  `0x1`, RST_STREAM `0x3`, GOAWAY `0x7`, WINDOW_UPDATE `0x8`), the END_STREAM flag `0x1` (so
+  half-close and a terminal status are *flags*, as in HTTP/2, not frame kinds of their own), gRPC's
+  request pseudo-headers (`:path`, `content-type: application/grpc`, `grpc-timeout`) and its trailer
+  names (`grpc-status`, `grpc-message`). What is deliberately not adopted: HTTP/2's binary frame
+  header and HPACK. Those exist to multiplex and compress over a byte stream; XPC already frames and
+  types messages, so binary framing would mean tunnelling HTTP/2 through XPC and discarding the
+  typed dictionary and its zero-copy `xpc_data` for no interoperability gain on a local link.
+  Remaining honest divergences: stream ids are `UInt64` (HTTP/2 uses 31 bits); the `seq` field is
+  ours, because HTTP/2 infers message order from stream ordering that a message bus does not
+  guarantee; and RST_STREAM carries a human-readable reason rather than a 32-bit error code.
+  **The internal representation is unchanged** — `XPCFrame` and `StreamChannel`'s grammar, `seq`
+  accounting and terminal rules stay exactly as reviewed; only the encode/decode boundary moved.
 - **D5 — metadata and status use gRPC's vocabulary, carried natively.** Metadata keys are
   normalized to lowercase ASCII and the `-bin` suffix is the binary discriminator, exactly as
   gRPC defines — replacing this design's earlier private numeric tag. Status carries the standard
