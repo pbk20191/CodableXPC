@@ -1250,7 +1250,6 @@ Expected: `0`.
 ```bash
 git commit --allow-empty -m "chore(GRPCXPCTransport): milestone 1 complete (all four call types over XPC)"
 ```
-```
 
 ---
 
