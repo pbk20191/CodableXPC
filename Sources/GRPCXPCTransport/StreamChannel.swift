@@ -53,6 +53,14 @@ final class StreamChannel<Part: Sendable>: Sendable {
 
     /// Routes a frame into this stream's inbound sequence, enforcing the grammar above.
     /// Connection-level frames are ignored; everything else either yields a `Part` or throws.
+    ///
+    /// - Important: Callers must invoke `accept` serially per stream. Ordering validation (the
+    ///   `seq`/phase checks) happens under `state`'s lock, but the yield to `continuation` happens
+    ///   after the lock is released, so two concurrent `accept` calls for the *same* stream can
+    ///   each validate correctly against the state as it was under their own lock acquisition, yet
+    ///   still deliver their parts to the sequence in the wrong relative order if one thread is
+    ///   descheduled between releasing the lock and calling `continuation.yield`. Serial calls
+    ///   (e.g. one connection-level dispatch loop per stream) are required to avoid this.
     func accept(_ frame: XPCFrame) throws {
         switch frame {
         case .metadata(_, let wireMetadata):
