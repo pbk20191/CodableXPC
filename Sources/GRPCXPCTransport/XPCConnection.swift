@@ -4,6 +4,26 @@ import Synchronization
 import XPC
 import CodableXPC
 
+/// One inbound `.openStream` frame's result: the server's full side of the RPC, already built.
+///
+/// Accept is deliberately *one* phase, not two. An earlier shape yielded just `(id, descriptor)`
+/// on `acceptedStreams` and left building the `StreamChannel`/`RPCStream` to a second, later call
+/// the consumer made after reading it -- which meant either an unbounded window in which frames
+/// for `id` (metadata, the first message -- exactly what a real client sends immediately after
+/// `openStream`) had nowhere to land, or, if the channel was pre-built to close that window, a
+/// second table to hold it pending the later call: which then either leaked (never claimed) or,
+/// once cleared on the stream's terminal frame to stop leaking, discarded the very buffer a late
+/// claim needed. Handing over the already-built `RPCStream` at accept time removes the second
+/// call, and with it every one of those failure modes at once -- there is nothing left pending to
+/// leak, lose, or race.
+@available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
+struct AcceptedStream: Sendable {
+    let id: StreamID
+    let descriptor: MethodDescriptor
+    let stream: RPCStream<RPCAsyncSequence<RPCRequestPart<[UInt8]>, any Error>,
+                          RPCWriter<RPCResponsePart<[UInt8]>>.Closable>
+}
+
 /// Wraps one `XPCSession`, multiplexing many RPCs over it by `StreamID` and demultiplexing
 /// inbound frames to the right stream. Adopts `ActorBackedByDispatchSerialQueue` semantics
 /// informally: `queue` is set as the session's target queue, so every inbound message -- and
@@ -28,17 +48,14 @@ final class XPCConnection: Sendable {
     private struct Registry: Sendable {
         var clientChannels: [StreamID: StreamChannel<RPCResponsePart<[UInt8]>>] = [:]
         var serverChannels: [StreamID: StreamChannel<RPCRequestPart<[UInt8]>>] = [:]
-        /// A server-side `StreamChannel`'s inbound sequence, registered eagerly the moment an
-        /// `.openStream` frame is routed and claimed later by `registerServerStream`. Without
-        /// this, frames arriving between accept and `registerServerStream` (metadata, the first
-        /// message -- exactly what a real client sends immediately) would find no channel yet
-        /// and be silently dropped; see the type's doc comment.
-        var pendingServerInbound: [StreamID: RPCAsyncSequence<RPCRequestPart<[UInt8]>, any Error>] = [:]
     }
     private let registry = Mutex(Registry())
 
-    private let acceptedContinuation: AsyncStream<(StreamID, MethodDescriptor)>.Continuation
-    let acceptedStreams: AsyncStream<(StreamID, MethodDescriptor)>
+    private let acceptedContinuation: AsyncStream<AcceptedStream>.Continuation
+    /// Yields one `AcceptedStream` per inbound `.openStream` frame, each already carrying its
+    /// fully built server-side `RPCStream` -- see ``AcceptedStream``'s doc comment for why accept
+    /// is one phase, not two.
+    let acceptedStreams: AsyncStream<AcceptedStream>
 
     /// Wraps `session`.
     ///
@@ -133,18 +150,24 @@ final class XPCConnection: Sendable {
                 // (this frame is what would create one), so there is nothing to fail -- drop it.
                 return
             }
-            // Register the server-side channel *now*, not when `registerServerStream` is later
-            // called for this `id` -- a real client writes metadata/the first message right
-            // after `openStream`, and those frames can arrive before whatever task is consuming
-            // `acceptedStreams` gets around to calling `registerServerStream`. Registering eagerly
-            // here (on the same serial `queue` that routes every subsequent frame for `id`)
-            // closes that window structurally.
+            // Build the server-side channel and the full `RPCStream` *now*, in the same routing
+            // call as the `.openStream` frame itself -- not in a later, second call a consumer
+            // makes after reading `acceptedStreams`. A real client writes metadata/the first
+            // message right after `openStream`, and those frames must have somewhere to land the
+            // moment they route (still on this same serial `queue`); a two-phase accept (yield an
+            // id here, build the channel later) means either an unbounded window where frames
+            // for `id` have nowhere to go, or -- if the channel is pre-built to close that window
+            // -- a second table just to hold it until claimed, which itself either leaks (never
+            // claimed) or, if cleared on terminal, discards whatever it was holding out from
+            // under a still-pending claim. One phase avoids all three failure modes: `serverChannels[id]`
+            // is both the only place the channel lives and the only thing `route` ever needs to
+            // find to keep delivering frames to it.
             let (channel, inbound) = StreamChannel<RPCRequestPart<[UInt8]>>.serverInbound(streamID: id)
-            registry.withLock { reg in
-                reg.serverChannels[id] = channel
-                reg.pendingServerInbound[id] = inbound
-            }
-            acceptedContinuation.yield((id, descriptor))
+            registry.withLock { $0.serverChannels[id] = channel }
+            let outbound = RPCWriter.Closable(wrapping: XPCOutboundWriter<RPCResponsePart<[UInt8]>>(
+                streamID: id, connection: self))
+            let stream = RPCStream(descriptor: descriptor, inbound: inbound, outbound: outbound)
+            acceptedContinuation.yield(AcceptedStream(id: id, descriptor: descriptor, stream: stream))
         case .cancel(let id, let reason):
             failStream(id, RPCError(code: .cancelled, message: reason))
         case .goAway:
@@ -171,20 +194,10 @@ final class XPCConnection: Sendable {
                 } else if let s = reg.serverChannels[id] {
                     do {
                         try s.accept(frame)
-                        // `.halfClose` is the request direction's sole terminator. Clear
-                        // `pendingServerInbound[id]` here too, not just `serverChannels[id]` --
-                        // otherwise a stream the consumer never calls `registerServerStream` for
-                        // (ignores/rejects the RPC while still receiving its `halfClose`) leaks
-                        // one `pendingServerInbound` entry forever, unbounded in a peer-controlled
-                        // `StreamID`. `registerServerStream`'s fallback (see there) still answers
-                        // correctly for a *late* registration after this point.
-                        if case .halfClose = frame {
-                            reg.serverChannels[id] = nil
-                            reg.pendingServerInbound[id] = nil
-                        }
+                        // `.halfClose` is the request direction's sole terminator.
+                        if case .halfClose = frame { reg.serverChannels[id] = nil }
                     } catch {
                         reg.serverChannels[id] = nil
-                        reg.pendingServerInbound[id] = nil
                         s.failInbound(error)
                     }
                 }
@@ -221,42 +234,10 @@ final class XPCConnection: Sendable {
         return (id, RPCStream(descriptor: descriptor, inbound: inbound, outbound: outbound))
     }
 
-    /// Server builds its side of an already-accepted stream (its `StreamID` came from an
-    /// `.openStream` frame delivered on ``acceptedStreams``). Hands back the same channel/inbound
-    /// pair `route`'s `.openStream` arm already registered -- see Critical-1 -- rather than
-    /// creating a fresh one, so frames that arrived in the meantime are not lost.
-    func registerServerStream(_ id: StreamID, descriptor: MethodDescriptor)
-    -> RPCStream<RPCAsyncSequence<RPCRequestPart<[UInt8]>, any Error>,
-                 RPCWriter<RPCResponsePart<[UInt8]>>.Closable> {
-        let inbound: RPCAsyncSequence<RPCRequestPart<[UInt8]>, any Error> = registry.withLock { reg in
-            if let pending = reg.pendingServerInbound.removeValue(forKey: id) {
-                return pending
-            }
-            // No pending inbound for `id`. Two ways to get here, and neither can be told apart
-            // from the other at this point (nor does it matter): either `id` never went through
-            // `.openStream` on this connection at all (a caller error -- `registerServerStream`
-            // is documented to be called only with an id delivered on `acceptedStreams`), or it
-            // did, ran to its terminal `.halfClose`, and was cleared right there (see `route`)
-            // because this call is a *late* registration of an RPC the consumer had ignored.
-            // Either way, this connection will never route another frame into a fresh
-            // `StreamChannel` for `id` -- a request stream gets no legitimate frames after
-            // `.halfClose`, and one that was never opened gets none at all -- so handing back an
-            // open-but-unfed channel would just hang forever. An immediately-finished, empty
-            // sequence is the safe answer: valid, not a crash, not a hang.
-            let (stream, continuation) = AsyncThrowingStream<RPCRequestPart<[UInt8]>, any Error>.makeStream()
-            continuation.finish()
-            return RPCAsyncSequence(wrapping: stream)
-        }
-        let outbound = RPCWriter.Closable(wrapping: XPCOutboundWriter<RPCResponsePart<[UInt8]>>(
-            streamID: id, connection: self))
-        return RPCStream(descriptor: descriptor, inbound: inbound, outbound: outbound)
-    }
-
     private func failStream(_ id: StreamID, _ error: any Error) {
         registry.withLock { reg in
             reg.clientChannels[id]?.failInbound(error); reg.clientChannels[id] = nil
             reg.serverChannels[id]?.failInbound(error); reg.serverChannels[id] = nil
-            reg.pendingServerInbound[id] = nil
         }
     }
 
