@@ -233,14 +233,25 @@ final class XPCConnection: Sendable {
         registry.withLock { $0.pendingCredits.removeValue(forKey: token) }
     }
 
-    /// How many permits a credit reply grants. The reply is a `.credit` frame (see
-    /// ``CreditLedger``), but a reply that is anything else -- an empty dictionary, a frame from a
-    /// peer speaking a later version of this protocol -- still counts as one permit: mis-reading a
-    /// reply must never *stall* a writer, since a lost permit is a permanent, silent loss of window.
-    private static func permits(inCreditReply reply: XPCDictionary) -> Int {
-        guard let frame = try? reply.withUnsafeUnderlyingDictionary({ try XPCFrame.decode(from: $0) }),
-              case .credit(_, let n) = frame else { return 1 }
-        return max(1, Int(n))
+    /// How many permits a credit reply grants: **always exactly one**, whatever the reply says.
+    ///
+    /// This is the boundary the peer's untrusted credit count crosses, and one permit is not a
+    /// conservative choice but the only correct one: every credit-bearing send has its *own* XPC
+    /// reply (see ``sendAwaitingCredit(_:onCredit:)``), so a reply acknowledges exactly one message
+    /// and can only ever be worth exactly one permit. An earlier version honoured the frame's `n`
+    /// -- nominally so a future receiver could batch -- which handed an untrusted peer a lever on
+    /// this side's window: `n` is a wire `UInt32`, and a single inflated reply both broke the
+    /// in-flight bound the window exists to impose and (unclamped) spun `CreditWindow.release` for
+    /// ~450 seconds under its own lock. Batching would need the *protocol* to express one reply
+    /// covering several messages, which it does not; until it does, `n` is not a number this side
+    /// can act on. It stays on the wire (the reply is self-describing, and `n` can gain meaning
+    /// without a wire change) but is deliberately not read here.
+    ///
+    /// A reply that is anything else -- an empty dictionary, a frame from a peer speaking a later
+    /// version of this protocol -- also counts as one permit: mis-reading a reply must never
+    /// *stall* a writer, since a lost permit is a permanent, silent loss of window.
+    static func permits(inCreditReply reply: XPCDictionary) -> Int {
+        1
     }
 
     private func handleInbound(_ message: XPCDictionary) {

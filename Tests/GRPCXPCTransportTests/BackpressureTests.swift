@@ -370,6 +370,125 @@ final class BackpressureTests: XCTestCase {
                       + "XPCBackpressure.defaultCreditWindow being > 1 buys")
     }
 
+    // MARK: - A1: a cancel/release race must not lose a permit
+
+    /// A permit handed to a waiter that is cancelled in the gap before it parks must not evaporate.
+    ///
+    /// `release` resolves a waiter that has taken a token but not yet parked by setting `granted`
+    /// and dropping it from the FIFO -- the permit is now *that waiter's*. If cancellation lands in
+    /// the same gap and `acquire()`'s park body tests `cancelled` before `granted`, the waiter
+    /// throws and the permit is gone: the window shrinks by one, permanently, and enough repeats
+    /// wedge the stream at zero for good. `acquire()`'s contract is "never returns without having
+    /// taken a permit", so an already-granted permit must be honoured; the cancelled task observes
+    /// its cancellation at the next suspension point instead.
+    ///
+    /// The invariant asserted is a strict accounting one, not a timing one, so the test cannot pass
+    /// by luck: with capacity 1 and one permit already held, after the race *exactly one* of these
+    /// holds -- the racing acquirer took the permit (so nothing is free), or it did not (so the
+    /// permit is back in the window). Neither holding means the permit was lost.
+    func testACancelReleaseRaceNeverLosesAPermit() async throws {
+        let rounds = 3_000
+        var lost = 0
+
+        for _ in 0..<rounds {
+            let window = CreditWindow(capacity: 1)
+            try await window.acquire()          // the window's only permit is now held
+
+            let acquired = Mutex(false)
+            let waiter = Task.detached {
+                do { try await window.acquire(); acquired.withLock { $0 = true } }
+                catch { }
+            }
+            // The gap this is aiming at is a handful of instructions wide (between `acquire`
+            // taking its token and its park body acquiring the lock), so the release is fired from
+            // a *different* thread with a randomized stagger and the cancellation from this one.
+            let spin = Int.random(in: 0..<64)
+            let releaser = Task.detached {
+                var sink = 0
+                for i in 0..<spin { sink &+= i }
+                _ = sink
+                window.release(1)
+            }
+            waiter.cancel()
+            _ = await waiter.result
+            _ = await releaser.value
+
+            // Both racers have settled, so the window's books must balance.
+            let tookThePermit = acquired.withLock { $0 }
+            let free = window.unusedPermits
+            if tookThePermit ? free != 0 : free != 1 { lost += 1 }
+        }
+
+        XCTAssertEqual(lost, 0,
+                       "\(lost) of \(rounds) cancel/release races lost a permit outright -- a "
+                       + "window that shrinks on every such race eventually wedges at zero and "
+                       + "stalls the stream forever")
+    }
+
+    // MARK: - A2: peer-supplied credit must not inflate the window, or spin the reply thread
+
+    /// A single `release(n)` with an inflated `n` must not resume more writers than the window
+    /// permits. The `available` path was clamped to `capacity`, but the *waiter* path handed out
+    /// `n` permits unconditionally -- so at capacity 2, five parked writers and one `release(5)`
+    /// put five messages in flight where two was the bound.
+    func testInflatedCreditCannotResumeMoreWritersThanTheWindowAllows() async throws {
+        let window = CreditWindow(capacity: 2)
+        try await window.acquire()
+        try await window.acquire()          // both permits held; the window is empty
+
+        let resumed = Mutex(0)
+        let parked = 5
+        var waiters: [Task<Void, Never>] = []
+        for _ in 0..<parked {
+            waiters.append(Task { try? await window.acquire(); resumed.withLock { $0 += 1 } })
+        }
+        defer { waiters.forEach { $0.cancel() } }
+        let allParked = await waitUntilTrue { window.waiterCount == parked }
+        XCTAssertTrue(allParked, "all \(parked) writers must be parked before the race is set up")
+
+        // What an untrusted peer controls: the `n` in its credit reply.
+        window.release(parked)
+        try await Task.sleep(nanoseconds: 250_000_000)
+
+        XCTAssertEqual(resumed.withLock { $0 }, 2,
+                       "a peer's inflated credit must resume at most a window's worth of writers "
+                       + "-- more than that puts more messages in flight than the window bounds")
+        XCTAssertEqual(window.unusedPermits, 0,
+                       "over-credit must not leave phantom permits behind either")
+    }
+
+    /// The same inflated `n`, at the size an untrusted peer can actually send: a `UInt32` credit
+    /// count must not turn `release` into a multi-minute spin *inside the state lock*, which blocks
+    /// the reply-handler thread, every writer, and the connection's own failure paths.
+    func testAHugeCreditCountCannotSpinTheReplyThread() async throws {
+        let window = CreditWindow(capacity: 32)
+        try await window.acquire()
+
+        let start = ContinuousClock.now
+        window.release(Int(UInt32.max))
+        let elapsed = ContinuousClock.now - start
+
+        XCTAssertLessThan(elapsed, .milliseconds(100),
+                          "release must be bounded by the window, not by the peer's credit count "
+                          + "-- it took \(elapsed) for a single UInt32.max credit reply")
+        XCTAssertLessThanOrEqual(window.unusedPermits, window.capacity)
+    }
+
+    /// And the boundary the untrusted value actually crosses: one credit reply acknowledges exactly
+    /// one message (each credit-bearing send has its own reply), so it can only ever be worth one
+    /// permit -- whatever `n` the peer writes into it.
+    func testACreditReplyIsWorthOnePermitWhateverThePeerClaims() throws {
+        let inflated = try XPCFrame.credit(0, n: 1_000).encodeToXPC()
+        XCTAssertEqual(XPCConnection.permits(inCreditReply: XPCDictionary(inflated)), 1,
+                       "a peer must not be able to mint window out of a credit reply's `n`")
+
+        // The two degenerate replies keep their existing meaning: mis-reading a reply must never
+        // *stall* a writer, so an undecodable or empty reply is still worth one permit.
+        XCTAssertEqual(XPCConnection.permits(inCreditReply: XPCDictionary()), 1)
+        let zero = try XPCFrame.credit(0, n: 0).encodeToXPC()
+        XCTAssertEqual(XPCConnection.permits(inCreditReply: XPCDictionary(zero)), 1)
+    }
+
     // MARK: - C1: the coarse valve's suspend/resume balance
 
     /// `DispatchQueue.resume()` without a matching `suspend()` traps, so the valve is a two-state

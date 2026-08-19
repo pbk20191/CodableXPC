@@ -107,6 +107,19 @@ final class CreditWindow: Sendable {
     let capacity: Int
     private let state: Mutex<State>
 
+    /// Permits not currently held by an acquirer -- i.e. how much of the window is free right now.
+    ///
+    /// Exists for tests, and it has to: a permit *lost* (handed out by `release` but never taken by
+    /// the acquirer it was handed to) is invisible from the public surface until enough have been
+    /// lost that the window silently wedges at zero, which is exactly the failure mode
+    /// `BackpressureTests.testACancelReleaseRaceNeverLosesAPermit` exists to catch. Reading a
+    /// consistent snapshot is all this does; nothing in the transport branches on it.
+    var unusedPermits: Int { state.withLock { $0.available } }
+
+    /// How many acquirers are currently parked (or between taking a token and parking). Test-only,
+    /// for the same reason as ``unusedPermits``.
+    var waiterCount: Int { state.withLock { $0.waiters.count } }
+
     init(capacity: Int) {
         precondition(capacity >= 1,
                      "a credit window of 0 would suspend the first write forever; see "
@@ -154,8 +167,19 @@ final class CreditWindow: Sendable {
                         // resuming its stored continuation, and there is none stored yet.
                         guard var waiter = s.waiters[token] else { return .success(()) }
                         if let failure = s.failure { s.retire(token); return .failure(failure) }
-                        if waiter.cancelled { s.retire(token); return .failure(CancellationError()) }
+                        // `granted` is tested **before** `cancelled`, and the order is
+                        // load-bearing: a `release` that resolves a not-yet-parked waiter has
+                        // already handed that waiter the permit and dropped it from the FIFO, so
+                        // throwing here instead of honouring it would *destroy* the permit -- the
+                        // window would shrink by one, permanently, every time cancellation landed
+                        // in that gap, until it wedged at zero and stalled the stream for good
+                        // (measured before the fix: 10 permits lost in 3000 races). Honouring it
+                        // is also what `acquire()`'s contract requires -- "never returns without
+                        // having taken a permit" -- and costs the cancelled task nothing: it
+                        // observes its cancellation at the next suspension point. Pinned by
+                        // `BackpressureTests.testACancelReleaseRaceNeverLosesAPermit`.
                         if waiter.granted { s.retire(token); return .success(()) }
+                        if waiter.cancelled { s.retire(token); return .failure(CancellationError()) }
                         waiter.continuation = continuation
                         s.waiters[token] = waiter
                         return nil
@@ -182,12 +206,29 @@ final class CreditWindow: Sendable {
 
     /// Returns `n` permits, handing each straight to the oldest waiting writer if there is one.
     ///
-    /// Never exceeds ``capacity``: a peer that replies with more credit than it was owed cannot
-    /// inflate this side's window (and so cannot defeat the bound the window exists to impose).
+    /// `n` is clamped to ``capacity``, and both halves of that clamp are load-bearing against a
+    /// peer that over-credits (the credit count arrives on the wire as a `UInt32` a peer controls):
+    ///
+    /// - **The bound.** Only the `available` path used to be clamped (`min(capacity, ...)`); the
+    ///   *waiter* path handed out `n` permits unconditionally, so at capacity 2 a single
+    ///   `release(5)` against five parked writers resumed all five -- five messages in flight where
+    ///   two was the bound.
+    /// - **Liveness.** Unclamped, `release(UInt32.max)` spins ~450 seconds (measured) *inside*
+    ///   `state.withLock`, blocking the reply-handler thread, every writer, and this window's own
+    ///   `fail`/`failAll` paths. That is a denial of service an untrusted peer could trigger with
+    ///   one reply.
+    ///
+    /// Clamping here also hardens internal callers, but it is not the only line of defence: the
+    /// untrusted `n` is already reduced to exactly one permit at the boundary it enters through
+    /// (`XPCConnection.permits(inCreditReply:)`), because one credit reply answers exactly one
+    /// credit-bearing send and so can only ever be worth one permit. Pinned by
+    /// `BackpressureTests.testInflatedCreditCannotResumeMoreWritersThanTheWindowAllows`,
+    /// `testAHugeCreditCountCannotSpinTheReplyThread` and
+    /// `testACreditReplyIsWorthOnePermitWhateverThePeerClaims`.
     func release(_ n: Int) {
         var toResume: [CheckedContinuation<Void, any Error>] = []
         state.withLock { s in
-            for _ in 0..<max(0, n) {
+            for _ in 0..<min(max(0, n), capacity) {
                 var handed = false
                 while let token = s.order.first {
                     s.order.removeFirst()
