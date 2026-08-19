@@ -59,6 +59,20 @@ extension XPCFrameTests {
         XCTAssertEqual(Array(restored[stringValues: "mixed-case"]), ["v"])
     }
 
+    /// Regression guard for suffix-based dispatch: `Metadata.addString` carries no assertion tying
+    /// key suffix to value type (only `addBinary` asserts `-bin`), so a *string* value can legally
+    /// land under a `-bin` key. Value-type-based dispatch (the old `tag` field, or any future
+    /// "simplification" that caches one) would send this back out as a string; suffix-based
+    /// dispatch must send it back out as binary regardless of how it was originally added --
+    /// the `-bin` suffix, not the original Swift value case, decides.
+    func testBinSuffixWinsOverOriginalValueType() throws {
+        var md = Metadata()
+        md.addString("hello", forKey: "z-bin")
+        let restored = WireMetadata(md).asMetadata()
+        XCTAssertTrue(Array(restored[stringValues: "z-bin"]).isEmpty)
+        XCTAssertEqual(Array(restored[binaryValues: "z-bin"]).first, Array("hello".utf8))
+    }
+
     /// Order and repeats survive, through the real xpc encoder this time.
     func testRepeatedKeysAndOrderSurviveTheXPCRoundTrip() throws {
         var md = Metadata()
