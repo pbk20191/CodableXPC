@@ -25,20 +25,25 @@ public final class XPCServerTransport: ServerTransport {
     ///
     /// - `.idle -> .listening`: the first `listen()` call, which then drains
     ///   `connection.acceptedStreams` until it finishes.
-    /// - `.listening -> .shutDown`: either `beginGracefulShutdown()` (explicit) or `listen()`'s
-    ///   own accept loop ending on its own (peer death, or the connection's `deinit`) -- both
-    ///   routes land here so a `listen()` that has already run once never runs a second time.
+    /// - `.listening -> .draining`: `beginGracefulShutdown()` while `listen()` is running. New
+    ///   streams are refused from here on, but the handlers already running are *not* disturbed --
+    ///   `listen()` stays inside its task group until the last of them returns.
+    /// - `.draining -> .shutDown` / `.listening -> .shutDown`: `listen()`'s accept loop and task
+    ///   group have both finished -- because the drain completed, or because the accept loop ended
+    ///   on its own (peer death, or the connection's `deinit`). Either way a `listen()` that has
+    ///   already run once never runs a second time.
     /// - `.idle -> .shutDown`: `beginGracefulShutdown()` arriving before any `listen()` call, so
     ///   a *later* `listen()` returns immediately instead of accepting anything.
     ///
     /// Unlike `XPCClientTransport.connect()`, no continuation is parked in this enum: the actual
     /// "block until told to stop" signal here is `connection.acceptedStreams` itself, whose
-    /// continuation `connection.failAll(...)` finishes (see that method's doc comment) -- so
-    /// `beginGracefulShutdown()` unblocks a running `listen()` by causing *that* AsyncStream to
-    /// finish, not by resuming anything owned by this type.
+    /// continuation `connection.stopAcceptingNewStreams()` finishes -- so `beginGracefulShutdown()`
+    /// unblocks a running `listen()` by causing *that* AsyncStream to finish, not by resuming
+    /// anything owned by this type.
     private enum ListenState: Sendable {
         case idle
         case listening
+        case draining
         case shutDown
     }
     private let state = Mutex<ListenState>(.idle)
@@ -57,12 +62,15 @@ public final class XPCServerTransport: ServerTransport {
     ///   .listening` transition happen together under one `state.withLock`, so two racing calls
     ///   can never both see `.idle` and both start accept loops.
     /// - A call made after `beginGracefulShutdown()` (or after a previous `listen()` has already
-    ///   ended) finds `.shutDown` and returns immediately without touching
+    ///   ended) finds `.draining`/`.shutDown` and returns immediately without touching
     ///   `connection.acceptedStreams` at all.
-    /// - Cancelling this call's own task calls `beginGracefulShutdown()` from the
-    ///   `withTaskCancellationHandler` `onCancel` side, which -- via `connection.failAll(...)`
-    ///   finishing `acceptedStreams`'s continuation -- unblocks the `for await` below the same
-    ///   way an explicit `beginGracefulShutdown()` or peer death does. Nothing in the loop below
+    /// - Once `beginGracefulShutdown()` has run, this method **drains**: the accept loop ends (its
+    ///   `AsyncStream` was finished by `connection.stopAcceptingNewStreams()`) but the task group
+    ///   keeps every handler that was already running, so `listen()` returns only after the last of
+    ///   them has returned. `beginGracefulShutdown()` itself never waits.
+    /// - Cancelling this call's own task is *not* graceful: `onCancel` begins the shutdown and then
+    ///   tears the streams down with `connection.failAll(...)`, because a cancelled task wants out
+    ///   now. The group's children are cancelled by the runtime too. Nothing in the loop below
     ///   throws on cancellation, so (mirroring `XPCClientTransport.connect()`, and matching what
     ///   `GRPCServer.serve()` expects: it wraps *any* thrown error from `listen` in a
     ///   `RuntimeError(code: .transportError, ...)`, which would misreport an ordinary cancelled
@@ -81,7 +89,7 @@ public final class XPCServerTransport: ServerTransport {
                 code: .failedPrecondition,
                 message: "XPCServerTransport.listen() is already running "
                     + "-- it must not be called more than once concurrently")
-        case .shutDown:
+        case .draining, .shutDown:
             return
         case .idle:
             break
@@ -93,6 +101,17 @@ public final class XPCServerTransport: ServerTransport {
                 for await accepted in connection.acceptedStreams {
                     group.addTask {
                         await withServerContextRPCCancellationHandle { handle in
+                            // The handle is registered against this stream *before* the handler
+                            // runs, so an inbound `.cancel` frame for it, a graceful shutdown, or
+                            // peer death can all reach the handler through
+                            // `withRPCCancellationHandler` / `context.cancellation` -- Task 6 built
+                            // valid contexts but registered nothing, so a cancel had no way in.
+                            // `alreadyDraining` closes the race where the shutdown swept the table
+                            // between this stream being accepted and this task being scheduled.
+                            let alreadyDraining = connection.setCancellationObserver(
+                                forStream: accepted.id) { handle.cancel() }
+                            if alreadyDraining { handle.cancel() }
+
                             let context = ServerContext(
                                 descriptor: accepted.descriptor,
                                 remotePeer: "xpc:peer",
@@ -100,6 +119,13 @@ public final class XPCServerTransport: ServerTransport {
                                 cancellation: handle
                             )
                             await streamHandler(accepted.stream, context)
+                            // Retires the stream: drops its registry entry and flushes whatever
+                            // credit it is still withholding. A handler that returns without
+                            // draining its request half (it read one message and stopped, say)
+                            // would otherwise pin a window's worth of withheld credit replies and
+                            // strand a peer that is still writing -- see
+                            // `XPCConnection.streamHandlerFinished(_:)`.
+                            connection.streamHandlerFinished(accepted.id)
                         }
                         // Referenced so this task captures `connection` strongly for its whole
                         // lifetime: `accepted.stream`'s outbound writer holds it only weakly
@@ -109,31 +135,58 @@ public final class XPCServerTransport: ServerTransport {
                     }
                 }
             }
+            // Reached only once the accept loop has ended *and* the task group has drained -- i.e.
+            // every handler that was in flight when the shutdown began has returned. This is the
+            // drain: `beginGracefulShutdown()` itself never waits.
         } onCancel: {
+            // Cancelling `listen()`'s own task is not a graceful shutdown -- the caller wants out
+            // now -- so this both begins the shutdown and tears the streams down. The task group's
+            // children are cancelled by the runtime as well, so a handler that cooperates with
+            // cancellation ends promptly and one that does not still finds its streams failed.
             self.beginGracefulShutdown()
+            self.connection.failAll(RPCError(
+                code: .unavailable, message: "the server's listen() task was cancelled"))
         }
 
         state.withLock { $0 = .shutDown }
     }
 
-    /// Stops accepting new streams and releases a running `listen()`. Idempotent: a second call
-    /// finds `.shutDown` already set and skips calling `connection.failAll(...)` again --
-    /// harmless either way since `failAll` (and the `AsyncStream.Continuation.finish()` inside
-    /// it) is itself safe to call more than once, but skipping makes the no-op explicit rather
-    /// than relying on that.
+    /// Begins a **graceful** shutdown: sends `.goAway`, refuses new streams, and lets the streams
+    /// already in flight finish. Returns immediately -- the waiting happens in `listen()`, which
+    /// stays inside its task group until the last handler returns (design section 8).
     ///
-    /// No drain state machine: existing streams are not specially waited on here (YAGNI --
-    /// deadlines, `.goAway`, and graceful draining semantics are Task 9/10's job). This only
-    /// needs to make `listen()` return; `connection.failAll(...)` already fails every live
-    /// stream's inbound sequence (rather than leaving any hung) as a side effect.
+    /// Three things happen, in this order:
+    /// 1. `connection.stopAcceptingNewStreams()` -- `.goAway` to the peer, later `.openStream`
+    ///    frames refused with `.status(.unavailable)`, and `acceptedStreams` finished so `listen()`'s
+    ///    accept loop ends.
+    /// 2. `connection.signalCancellationToAllStreams()` -- every in-flight RPC's
+    ///    `ServerContext.cancellation` handle fires, which is how a handler is *asked* to wind up.
+    ///    This is a signal, not a teardown: nothing is failed, and a handler that ignores it runs
+    ///    to completion.
+    /// 3. `listen()` drains and returns, moving the state to `.shutDown`.
+    ///
+    /// This deliberately no longer calls `connection.failAll(...)`, which is what the previous
+    /// implementation did (Task 6 deferred draining to this task): failing in-flight streams is the
+    /// opposite of draining them. The forceful teardown still exists for the paths that mean it --
+    /// cancellation of `listen()`'s own task, and peer death.
+    ///
+    /// Idempotent: a second call finds `.draining`/`.shutDown` and does nothing.
     public func beginGracefulShutdown() {
-        let shouldFail = state.withLock { current -> Bool in
-            if case .shutDown = current { return false }
-            current = .shutDown
-            return true
+        let shouldDrain = state.withLock { current -> Bool in
+            switch current {
+            case .draining, .shutDown:
+                return false
+            case .idle:
+                // No `listen()` to drain, and none may start later.
+                current = .shutDown
+                return true
+            case .listening:
+                current = .draining
+                return true
+            }
         }
-        if shouldFail {
-            connection.failAll(RPCError(code: .unavailable, message: "server shutting down"))
-        }
+        guard shouldDrain else { return }
+        connection.stopAcceptingNewStreams()
+        connection.signalCancellationToAllStreams()
     }
 }

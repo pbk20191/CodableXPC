@@ -109,18 +109,75 @@ public final class XPCClientTransport: ClientTransport {
         }
     }
 
+    /// How many deadline timers have actually *expired* on this transport.
+    ///
+    /// Test observability, and it has to be: "the timer for a completed RPC was cancelled rather
+    /// than left to fire later" is a negative, and one with no other visible symptom -- a leaked
+    /// timer keeps the transport alive for the rest of its timeout and then emits a `.cancel` for a
+    /// finished RPC, neither of which any assertion on the RPC itself can see. Pinned by
+    /// `LifecycleTests.testACompletedCallLeavesNoDeadlineTimerBehind`. Nothing in the transport
+    /// branches on it.
+    let firedDeadlines = Mutex(0)
+
     public func withStream<T: Sendable>(
         descriptor: MethodDescriptor,
         options: CallOptions,
         _ closure: (RPCStream<Inbound, Outbound>, ClientContext) async throws -> T
     ) async throws -> T {
+        // Refuse to open a stream once either end is shutting down: this transport's own
+        // `beginGracefulShutdown()`, or the peer's `.goAway` (which sets `connection.isDraining`).
+        // Failing here is strictly better than opening a stream the peer will immediately refuse --
+        // the caller gets `.unavailable`, which is retryable, instead of waiting out a deadline.
+        let isShutDown = state.withLock { current -> Bool in
+            if case .shutDown = current { return true } else { return false }
+        }
+        if isShutDown || connection.isDraining {
+            let reason = isShutDown
+                ? "this transport has shut down"
+                : "the connection is draining (the peer sent goAway, or it has been torn down)"
+            throw RPCError(code: .unavailable, message: "no new streams: \(reason)")
+        }
+
         let (streamID, stream) = connection.openClientStream(descriptor: descriptor)
-        try connection.send(.openStream(streamID, method: descriptor.fullyQualifiedMethod, deadlineNanos: nil))
+        // The deadline goes on the wire too. It is not what *enforces* the deadline (the local timer
+        // below is), but a peer that knows the deadline can stop working on a doomed RPC without
+        // waiting for the `.cancel` to arrive.
+        try connection.send(.openStream(streamID,
+                                        method: descriptor.fullyQualifiedMethod,
+                                        deadlineNanos: options.timeout.map(Self.nanoseconds(in:))))
         let context = ClientContext(
             descriptor: descriptor,
             remotePeer: "xpc:peer",
             localPeer: "xpc:self"
         )
+
+        // `CallOptions.timeout` as a per-stream timer (design section 8). On expiry the peer is told
+        // to stop (`.cancel`) and the local half is failed with `.deadlineExceeded`, which is what
+        // unblocks the closure: its `stream.inbound` iteration throws, and any writer parked on
+        // credit for this stream is released by `failStream`.
+        //
+        // Cancelled unconditionally on the way out by the `defer` below -- on success, on a throw,
+        // and on cancellation of this call's own task -- so no RPC can leave a timer behind. The
+        // cost of leaving one is not hypothetical: the task holds this transport (and through it
+        // the connection) for the whole of the timeout, so a server under load would accumulate one
+        // sleeping task per completed RPC for as long as its longest deadline, and each would
+        // eventually put a pointless `.cancel` frame on the wire for an RPC that is already over.
+        let deadline: Task<Void, Never>? = options.timeout.map { timeout in
+            Task { [self] in
+                do { try await Task.sleep(for: timeout) }
+                catch { return }   // cancelled: the RPC finished inside its deadline
+                // Re-checked because `Task.sleep` returning and this task being cancelled can race:
+                // the RPC may have completed in the instant between the two.
+                if Task.isCancelled { return }
+                firedDeadlines.withLock { $0 += 1 }
+                let error = RPCError(
+                    code: .deadlineExceeded,
+                    message: "stream \(streamID): the call's \(timeout) deadline expired")
+                try? connection.send(.cancel(streamID, reason: "deadline exceeded after \(timeout)"))
+                connection.failStream(streamID, error)
+            }
+        }
+        defer { deadline?.cancel() }
 
         // Mirrors `GRPCInProcessTransport`'s client: the closure's own result (success or
         // thrown error) is what this method returns/rethrows, but the stream's outbound side is
@@ -140,4 +197,16 @@ public final class XPCClientTransport: ClientTransport {
     }
 
     public func config(forMethod descriptor: MethodDescriptor) -> MethodConfig? { nil }
+
+    /// A `Duration` as whole nanoseconds, saturating rather than trapping. `Duration.components`
+    /// is (seconds, attoseconds); an attosecond is 1e-18, so 1e9 of them make a nanosecond. Only
+    /// used for the wire's advisory `deadlineNanos` -- the local timer sleeps on the `Duration`
+    /// itself and never goes through this.
+    private static func nanoseconds(in duration: Duration) -> Int64 {
+        let (seconds, attoseconds) = duration.components
+        let fromSeconds = seconds.multipliedReportingOverflow(by: 1_000_000_000)
+        guard !fromSeconds.overflow else { return seconds < 0 ? .min : .max }
+        let total = fromSeconds.partialValue.addingReportingOverflow(attoseconds / 1_000_000_000)
+        return total.overflow ? (seconds < 0 ? .min : .max) : total.partialValue
+    }
 }

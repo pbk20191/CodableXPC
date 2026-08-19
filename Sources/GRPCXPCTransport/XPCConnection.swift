@@ -87,8 +87,24 @@ final class XPCConnection: Sendable {
         var clientChannels: [StreamID: StreamChannel<RPCResponsePart<[UInt8]>>] = [:]
         var serverChannels: [StreamID: StreamChannel<RPCRequestPart<[UInt8]>>] = [:]
         var pendingCredits: [UInt64: PendingCredit] = [:]
+        /// Per-stream "this RPC has been cancelled" callbacks -- see
+        /// ``setCancellationObserver(forStream:_:)``.
+        var cancellationObservers: [StreamID: @Sendable () -> Void] = [:]
     }
     private let registry = Mutex(Registry())
+
+    /// Set once this connection stops taking *new* streams: either this side began a graceful
+    /// shutdown (``stopAcceptingNewStreams()``), or the peer told us it is shutting down by sending
+    /// `.goAway`. In-flight streams are deliberately untouched -- draining them is the whole point
+    /// of a graceful shutdown (design section 8) -- so this gates only stream *creation*: an
+    /// inbound `.openStream` is refused with a `.status(.unavailable)` rather than accepted, and
+    /// `XPCClientTransport.withStream` refuses to open one locally.
+    private let draining = Atomic<Bool>(false)
+
+    /// Whether new streams are refused -- see ``draining``. Read by `XPCClientTransport.withStream`
+    /// so a client that has received `.goAway` fails fast instead of opening a stream the peer will
+    /// immediately reject.
+    var isDraining: Bool { draining.load(ordering: .acquiring) }
 
     private let acceptedContinuation: AsyncStream<AcceptedStream>.Continuation
     /// Yields one `AcceptedStream` per inbound `.openStream` frame, each already carrying its
@@ -194,9 +210,22 @@ final class XPCConnection: Sendable {
     /// `halfClose`, `status` and `cancel`. Keeping the terminals here is load-bearing -- see
     /// ``XPCBackpressure`` -- because a stream must be closable by a writer that is already starved
     /// of credit. `.message` frames go through ``sendAwaitingCredit(_:onCredit:)``.
+    /// Errors are shaped, not passed through: once the peer is gone `session.send` fails with
+    /// libxpc's own error (an `XPCRichError` about an invalid connection), and gRPC's machinery --
+    /// and every caller in this transport -- expects transport failures as `RPCError`. A send that
+    /// failed because the far end is gone is `.unavailable`; a frame that failed to *encode* is
+    /// this side's own bug, so it is left to surface as itself rather than mislabelled as a peer
+    /// problem.
     func send(_ frame: XPCFrame) throws {
         let object = try frame.encodeToXPC()
-        try session.send(message: XPCDictionary(object))
+        do {
+            try session.send(message: XPCDictionary(object))
+        } catch {
+            throw RPCError(
+                code: .unavailable,
+                message: "stream \(frame.streamID): the XPC connection is no longer available "
+                    + "(sending \(frame.kindDescription) failed: \(error))")
+        }
     }
 
     /// Sends a credit-bearing `.message` frame: an XPC message *expecting a reply*, where the reply
@@ -280,6 +309,17 @@ final class XPCConnection: Sendable {
                 // (this frame is what would create one), so there is nothing to fail -- drop it.
                 return
             }
+            // Graceful shutdown: refuse *new* streams while letting in-flight ones drain (design
+            // section 8). Answered with a terminal `.status(.unavailable)` rather than dropped, so
+            // the peer's client fails its call immediately instead of waiting out a deadline for a
+            // stream this side will never accept. A lone `.status` is a legal response stream
+            // (`metadata* -> message* -> status`), so the peer's `StreamChannel` terminates cleanly.
+            if isDraining {
+                try? send(.status(id, code: RPCError.Code.unavailable.rawValue,
+                                  message: "the peer is shutting down and is not accepting new streams",
+                                  trailers: WireMetadata(Metadata())))
+                return
+            }
             // Build the server-side channel and the full `RPCStream` *now*, in the same routing
             // call as the `.openStream` frame itself -- not in a later, second call a consumer
             // makes after reading `acceptedStreams`. A real client writes metadata/the first
@@ -299,9 +339,17 @@ final class XPCConnection: Sendable {
             let stream = RPCStream(descriptor: descriptor, inbound: inbound, outbound: outbound)
             acceptedContinuation.yield(AcceptedStream(id: id, descriptor: descriptor, stream: stream))
         case .cancel(let id, let reason):
-            failStream(id, RPCError(code: .cancelled, message: reason))
+            // The peer aborted this RPC: fail the local half of it (`.cancelled`, per design
+            // section 8) *and* signal the RPC's own cancellation handle if one is registered, so a
+            // server handler sitting in `withRPCCancellationHandler` learns about it rather than
+            // only discovering it when its inbound sequence throws.
+            failStream(id, RPCError(code: .cancelled,
+                                    message: "the peer cancelled stream \(id): \(reason)"))
         case .goAway:
-            break   // Task 10
+            // The peer is shutting down gracefully: stop opening *new* streams on this connection
+            // (`XPCClientTransport.withStream` reads `isDraining`), but leave every in-flight
+            // stream alone -- letting those finish is exactly what makes the shutdown graceful.
+            draining.store(true, ordering: .releasing)
         case .credit:
             // Credit travels on the XPC *reply* channel, not as a standalone frame (design section
             // 6 / deviation D1): a `.credit` frame is only ever the *payload of a reply* to a
@@ -388,18 +436,96 @@ final class XPCConnection: Sendable {
         return (id, RPCStream(descriptor: descriptor, inbound: inbound, outbound: outbound))
     }
 
-    private func failStream(_ id: StreamID, _ error: any Error) {
-        let orphaned: [PendingCredit] = registry.withLock { reg in
+    // MARK: - Per-stream RPC cancellation
+
+    /// Registers `body` as "this RPC has been cancelled" for `id`, and reports whether the
+    /// connection is *already* draining.
+    ///
+    /// The table lives here rather than in `XPCServerTransport` (where the reference in-process
+    /// transport keeps its equivalent) for one reason: this is the object that routes an inbound
+    /// `.cancel` frame and that learns about peer death, so keying the callbacks by `StreamID` is
+    /// what lets a cancel for *one* stream reach exactly that stream's handle instead of every
+    /// handler on the connection.
+    ///
+    /// The returned flag closes the same race the reference guards: a shutdown that lands after a
+    /// stream was accepted but before its handler task got to run would otherwise never reach that
+    /// handler, whose handle did not exist yet when the shutdown swept the table.
+    ///
+    /// - Important: `body` must be cheap and non-blocking -- it can be called on this connection's
+    ///   serial queue (from `route`) or from a session cancellation handler.
+    func setCancellationObserver(forStream id: StreamID,
+                                 _ body: @escaping @Sendable () -> Void) -> Bool {
+        registry.withLock { $0.cancellationObservers[id] = body }
+        return isDraining
+    }
+
+    /// Signals every live stream's cancellation handle without failing anything.
+    ///
+    /// This is the *graceful* half of shutdown: it asks in-flight handlers to wind themselves up
+    /// (their `withRPCCancellationHandler` bodies fire, `ServerContext.cancellation.isCancelled`
+    /// flips) and then leaves them to finish their own streams. Nothing is torn down here -- see
+    /// ``failAll(_:)`` for the forceful counterpart.
+    func signalCancellationToAllStreams() {
+        let observers = registry.withLock { Array($0.cancellationObservers.values) }
+        observers.forEach { $0() }
+    }
+
+    /// A server-side stream whose handler has *returned*.
+    ///
+    /// Without this, nothing on the handler-completed path retires the stream: only `halfClose`,
+    /// `.cancel`, or the connection's death removed `serverChannels[id]`, and only those flushed
+    /// its `CreditLedger`. So a handler that read one message and returned left up to a full
+    /// window of withheld credit replies pinned forever, and a peer still writing on that stream
+    /// parked in `write` for good (measured before this existed: a 200-message client got 33
+    /// through and then hung). Dropping the entry makes later frames for `id` unroutable, and an
+    /// unroutable credit-bearing frame is credited immediately by ``route(_:received:)`` -- so the
+    /// peer's writer keeps moving instead of stalling. Flushing the ledger releases what was
+    /// already held.
+    ///
+    /// Deliberately does **not** fail the stream: the handler finished, so there is no error to
+    /// report, and its outbound writes (a `.status` sent as the very last thing, possibly still
+    /// in flight) must not be disturbed.
+    func streamHandlerFinished(_ id: StreamID) {
+        let channel = registry.withLock { reg -> StreamChannel<RPCRequestPart<[UInt8]>>? in
+            reg.cancellationObservers[id] = nil
+            return reg.serverChannels.removeValue(forKey: id)
+        }
+        channel?.credit.flush()
+    }
+
+    // MARK: - Failure paths
+
+    func failStream(_ id: StreamID, _ error: any Error) {
+        let (orphaned, observer): ([PendingCredit], (@Sendable () -> Void)?) = registry.withLock { reg in
             reg.clientChannels[id]?.failInbound(error); reg.clientChannels[id] = nil
             reg.serverChannels[id]?.failInbound(error); reg.serverChannels[id] = nil
             // A writer on this stream suspended for credit has to be released too, or cancelling an
             // RPC would leave it parked on a reply that is never coming.
             let doomed = reg.pendingCredits.filter { $0.value.streamID == id }
             doomed.keys.forEach { reg.pendingCredits[$0] = nil }
-            return Array(doomed.values)
+            return (Array(doomed.values), reg.cancellationObservers.removeValue(forKey: id))
         }
-        // Completed outside the lock: `complete` resumes a writer's continuation.
+        // Completed outside the lock: `complete` resumes a writer's continuation, and `observer`
+        // reaches into gRPC's cancellation machinery.
         orphaned.forEach { $0.complete(.failure(error)) }
+        observer?()
+    }
+
+    /// Begins a graceful shutdown of this connection's *inbound* direction: tells the peer to stop
+    /// opening streams (`.goAway`), refuses any that arrive regardless (see `route`'s `.openStream`
+    /// arm -- a `.goAway` in flight does not stop a stream the peer already sent), and finishes
+    /// ``acceptedStreams`` so an accept loop ends.
+    ///
+    /// Nothing in flight is failed. That is the difference between this and ``failAll(_:)``, and it
+    /// is the whole of "graceful": `XPCServerTransport.listen`'s task group keeps running every
+    /// handler that is already going, and `listen()` returns only once the last of them has
+    /// finished. A caller that needs the connection gone *now* follows this with ``failAll(_:)``.
+    func stopAcceptingNewStreams() {
+        draining.store(true, ordering: .releasing)
+        // Best effort: a peer that is already gone cannot be told anything, and a `.goAway` that
+        // fails to send changes nothing about this side's refusal to accept new streams.
+        try? send(.goAway)
+        acceptedContinuation.finish()
     }
 
     /// On peer death / shutdown: fails every live stream's inbound sequence and finishes
@@ -407,13 +533,19 @@ final class XPCConnection: Sendable {
     /// `deinit` separately finishes the accepted-streams continuation (see there) since by then
     /// there may be no error to report and no streams left to fail.
     func failAll(_ error: any Error) {
-        let orphaned: [PendingCredit] = registry.withLock { reg in
+        draining.store(true, ordering: .releasing)
+        let (orphaned, observers): ([PendingCredit], [@Sendable () -> Void]) = registry.withLock { reg in
             reg.clientChannels.values.forEach { $0.failInbound(error) }
             reg.serverChannels.values.forEach { $0.failInbound(error) }
             let doomed = Array(reg.pendingCredits.values)
+            let observers = Array(reg.cancellationObservers.values)
             reg = Registry()
-            return doomed
+            return (doomed, observers)
         }
+        // Every live RPC's cancellation handle fires too: a handler that is *not* currently reading
+        // its inbound sequence (it may be writing, or awaiting something else entirely) would
+        // otherwise not learn that the RPC is over from the inbound failure alone.
+        observers.forEach { $0() }
         // Every writer suspended for credit fails here rather than hanging. This is the *only*
         // thing that releases them: libxpc silently drops the reply handlers of a cancelled
         // session (verified by probe), so a dead connection produces no reply, no error, nothing.
@@ -431,6 +563,21 @@ extension XPCFrame {
              .halfClose(let id), .status(let id, _, _, _), .cancel(let id, _), .credit(let id, _):
             return id
         case .goAway: return 0
+        }
+    }
+
+    /// The frame's kind alone, for error messages -- deliberately without its payload, which can be
+    /// a whole message body.
+    var kindDescription: String {
+        switch self {
+        case .openStream: return "openStream"
+        case .metadata: return "metadata"
+        case .message: return "message"
+        case .halfClose: return "halfClose"
+        case .status: return "status"
+        case .cancel: return "cancel"
+        case .credit: return "credit"
+        case .goAway: return "goAway"
         }
     }
 }
