@@ -171,10 +171,20 @@ final class XPCConnection: Sendable {
                 } else if let s = reg.serverChannels[id] {
                     do {
                         try s.accept(frame)
-                        // `.halfClose` is the request direction's sole terminator.
-                        if case .halfClose = frame { reg.serverChannels[id] = nil }
+                        // `.halfClose` is the request direction's sole terminator. Clear
+                        // `pendingServerInbound[id]` here too, not just `serverChannels[id]` --
+                        // otherwise a stream the consumer never calls `registerServerStream` for
+                        // (ignores/rejects the RPC while still receiving its `halfClose`) leaks
+                        // one `pendingServerInbound` entry forever, unbounded in a peer-controlled
+                        // `StreamID`. `registerServerStream`'s fallback (see there) still answers
+                        // correctly for a *late* registration after this point.
+                        if case .halfClose = frame {
+                            reg.serverChannels[id] = nil
+                            reg.pendingServerInbound[id] = nil
+                        }
                     } catch {
                         reg.serverChannels[id] = nil
+                        reg.pendingServerInbound[id] = nil
                         s.failInbound(error)
                     }
                 }
@@ -222,12 +232,20 @@ final class XPCConnection: Sendable {
             if let pending = reg.pendingServerInbound.removeValue(forKey: id) {
                 return pending
             }
-            // No `.openStream` frame registered `id` first -- this id didn't come from
-            // `acceptedStreams` (a caller error). Register fresh so the call still returns a
-            // usable (if immediately empty) stream rather than crashing.
-            let (channel, inbound) = StreamChannel<RPCRequestPart<[UInt8]>>.serverInbound(streamID: id)
-            reg.serverChannels[id] = channel
-            return inbound
+            // No pending inbound for `id`. Two ways to get here, and neither can be told apart
+            // from the other at this point (nor does it matter): either `id` never went through
+            // `.openStream` on this connection at all (a caller error -- `registerServerStream`
+            // is documented to be called only with an id delivered on `acceptedStreams`), or it
+            // did, ran to its terminal `.halfClose`, and was cleared right there (see `route`)
+            // because this call is a *late* registration of an RPC the consumer had ignored.
+            // Either way, this connection will never route another frame into a fresh
+            // `StreamChannel` for `id` -- a request stream gets no legitimate frames after
+            // `.halfClose`, and one that was never opened gets none at all -- so handing back an
+            // open-but-unfed channel would just hang forever. An immediately-finished, empty
+            // sequence is the safe answer: valid, not a crash, not a hang.
+            let (stream, continuation) = AsyncThrowingStream<RPCRequestPart<[UInt8]>, any Error>.makeStream()
+            continuation.finish()
+            return RPCAsyncSequence(wrapping: stream)
         }
         let outbound = RPCWriter.Closable(wrapping: XPCOutboundWriter<RPCResponsePart<[UInt8]>>(
             streamID: id, connection: self))
