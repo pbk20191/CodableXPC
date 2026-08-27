@@ -48,7 +48,8 @@ public final class XPCServerTransport: ServerTransport {
     ///
     /// One lock, and every list of cores is taken out of it before anything is called on them
     /// (L7): `beginDraining`, `close` and `failAll` all send ops, resume continuations or cancel
-    /// timers.
+    /// timers. The one deliberate exception is the `yield` in ``accept(_:)``, which must be paired
+    /// atomically with the `admitting` check -- the reason is at that line.
     ///
     /// # No cap on concurrent connections, deliberately
     ///
@@ -74,10 +75,6 @@ public final class XPCServerTransport: ServerTransport {
             /// the `Decision` reaching libxpc kills the process (Task 5 §2.4). Publishing into
             /// this dictionary *before* returning the decision is what makes that impossible.
             var connections: [ObjectIdentifier: RPCTransportCore] = [:]
-            /// Serial-queue label counter. One queue per connection, distinct from the listener's
-            /// own: `XPCPipe.accepting` blocks on the queue it is handed (`queue.sync`) and trips
-            /// `dispatchPrecondition(.notOnQueue(queue))` if it is the listener's.
-            var nextConnection = 0
         }
         private let state = Mutex(State())
 
@@ -98,11 +95,15 @@ public final class XPCServerTransport: ServerTransport {
         func accept(
             _ request: XPCListener.IncomingSessionRequest
         ) -> XPCListener.IncomingSessionRequest.Decision {
+            // One queue per connection, distinct from the listener's own: `XPCPipe.accepting`
+            // blocks on the queue it is handed (`queue.sync`) and trips
+            // `dispatchPrecondition(.notOnQueue(queue))` if it is the listener's. The label comes
+            // from a process-wide counter so that several transports in one process do not all
+            // name their queues alike in a crash log.
             let queue: DispatchSerialQueue? = state.withLock { state in
                 guard state.admitting else { return nil }
-                state.nextConnection += 1
                 return DispatchSerialQueue(
-                    label: "GRPCXPCTransport.server.connection.\(state.nextConnection)")
+                    label: ConnectionQueueLabel.mint(role: "server", peer: "accepted"))
             }
             guard let queue else {
                 return XPCPipe.rejecting(
@@ -128,11 +129,24 @@ public final class XPCServerTransport: ServerTransport {
             }
 
             // Published BEFORE the decision is returned, and never dropped in that window.
+            //
+            // **The `yield` is deliberately inside the lock**, which is the one place this file
+            // departs from L7's "resume continuations outside the lock" and from this type's own
+            // doc comment above. The pairing is load-bearing: `admitting` and the `yield` have to
+            // be decided together, because `beginDraining()` clears `admitting` and finishes the
+            // sequence under the same lock. Hoisting the `yield` out reintroduces a
+            // yield-after-`finish()` race -- the item is then dropped with nothing to retire the
+            // core, so `.terminated` would need handling exactly as the `!admitted` arm below does,
+            // i.e. the same code with an extra way to get it wrong. It is safe as written for a
+            // narrow, checkable reason: `AsyncStream.Continuation.yield` enqueues (task
+            // resumption never runs the consumer inline), and the only re-entry into this lock is
+            // `retire(_:)`, from a `listen()` child task on a different thread.
+            //
+            // `yield`'s result is ignored deliberately: if the sequence has already finished,
+            // `admitting` is false too and the `!admitted` arm below is what handles it.
             let admitted: Bool = state.withLock { state in
                 state.connections[ObjectIdentifier(core)] = core
                 guard state.admitting else { return false }
-                // `yield`'s result is ignored deliberately: if the sequence has already finished,
-                // `admitting` is false too and the `!admitted` arm below is what handles it.
                 self.continuation.yield(core)
                 return true
             }
@@ -324,7 +338,8 @@ public final class XPCServerTransport: ServerTransport {
                 code: .failedPrecondition,
                 message: "only an anonymous XPCServerTransport has an endpoint to dial")
         }
-        let queue = DispatchSerialQueue(label: "GRPCXPCTransport.client.endpoint")
+        let queue = DispatchSerialQueue(
+            label: ConnectionQueueLabel.mint(role: "client", peer: "endpoint"))
         var built: RPCTransportCore?
         // The returned pipe is discarded: `built` holds it strongly. Handlers are installed by
         // `RPCTransportCore.init`, weakly -- never here.

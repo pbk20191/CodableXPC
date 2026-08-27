@@ -36,8 +36,8 @@ public struct GRPCSwiftData: GRPCContiguousBytes, Sendable, Equatable {
     }
 
     /// Adopt `data` as-is, **without copying**. A `Data` slice is a view onto its parent's buffer,
-    /// so this is what keeps a payload sliced out of a received frame (see
-    /// `GRPCMessageFraming.unframe`) referencing the original `xpc_data` rather than duplicating it.
+    /// so this is what keeps a message body sliced out of a received blob (see
+    /// `CompactWireCodec.decode`) referencing the original `xpc_data` rather than duplicating it.
     init(viewing data: Data) {
         self.data = data
     }
@@ -99,8 +99,9 @@ public struct GRPCSwiftData: GRPCContiguousBytes, Sendable, Equatable {
 /// It *is* a byte container, so it behaves like one: `first`, `Array(_:)`, iteration and equality
 /// against a literal all work without materialising an intermediate array at the call site.
 ///
-/// Indices are `Data`'s, **not rebased to zero** — a value produced by
-/// `GRPCMessageFraming.unframe` is a slice of the received frame, so its `startIndex` is 5, not 0.
+/// Indices are `Data`'s, **not rebased to zero** — a message body decoded by
+/// `CompactWireCodec.decode` is a slice of the received blob, so its `startIndex` is 10 (the op
+/// header's length), not 0.
 /// Subscripting from a hardcoded `0` would trap; that is `Data`'s own contract and copying it here
 /// is deliberate, since hiding it would mean copying the payload to rebase it.
 @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
