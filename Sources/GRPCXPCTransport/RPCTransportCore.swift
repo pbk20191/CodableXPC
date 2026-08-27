@@ -89,23 +89,36 @@ import Synchronization
 //   review found the opposite -- a malformed `:path`, a stray-metadata `openStream`, or a
 //   non-empty `halfClose` body each used to kill every other stream on the connection).
 //   `CompactWireCodec.decode(_:)` parses each op's 10-byte header, including its stream id, before
-//   it ever touches the body, so a body it rejects still yields a `WireDecodeItem.streamFailure`
-//   naming that stream; `receive(_:)` fails exactly that stream through ``failStream(_:dueTo:)``,
-//   the same path a state-machine grammar violation already takes (see ``deliver(_:toStream:)``'s
-//   `.violation` case) -- not a parallel one. A rejected `openStream` never got a table entry, so
-//   it gets no reply either, same as the bullet above and for the same anti-amplification reason.
+//   it ever touches the body, so a body it rejects still yields an item naming that stream. Two
+//   different outcomes follow, and which one depends only on the *kind* that failed:
+//   - Every kind except `openStream` yields `WireDecodeItem.streamFailure`, and `receive(_:)`
+//     fails that stream through ``failStream(_:dueTo:)`` -- the same path a state-machine grammar
+//     violation already takes (see ``deliver(_:toStream:)``'s `.violation` case), not a parallel
+//     one. If the id has no table entry, this is a silent drop, same as the bullet above and for
+//     the same anti-amplification reason -- the core cannot tell a forged id from an ordinary
+//     retirement race, and answering either would hand the peer a lever.
+//   - `openStream` yields `WireDecodeItem.streamOpenFailure` instead, and `receive(_:)` answers it
+//     through ``refuseOpen(_:dueTo:)`` with a **fixed-literal** `status`/`cancel` -- never the
+//     decode error's own text. `openStream` is the one kind whose semantics *create* state, so the
+//     peer is definitionally entitled to, and waiting on, a reply for that id; silence would just
+//     hang it to its own deadline. The reply is a fixed literal specifically because it is
+//     reachable at zero state cost (no table entry is ever created here, successfully or not), so
+//     echoing even a truncated form of the peer's own bytes would still let the peer's input size
+//     drive the reply's size, repeatably -- see `WireDecodeItem.streamOpenFailure`'s doc.
 //   Only a **header**-level failure (framing this codec cannot parse at all) and a malformed
 //   `goAway` body (connection-scoped by its own nature -- there is no stream to name) still fail
 //   the whole connection; see `CompactWireCodec.decode(_:)`'s doc for why `goAway` is the one
-//   exception.
+//   kind that does not get an item at all.
 // * **An accept is refused, never trapped.** A stream id of 0, an even id, a draining connection
 //   or too many concurrent streams all produce a `status` or `cancel` op for that id and no table
-//   entry. A malformed method **path** is caught earlier still, in the codec (the bullet above) --
-//   it never reaches this refusal path. `methodDescriptor(from:)`'s `nil` branch re-validates the
-//   same shape `GRPCWireHeaders.parseRequest` (via `validateMethodPath`) already enforced
-//   upstream, byte for byte, so nothing that reaches this guard can still fail it; it is
-//   unreachable by construction and stays only as defense in depth, not as the thing that
-//   rejects a malformed path today.
+//   entry -- and so, separately, does a malformed `openStream` **body** (the bullet above,
+//   `refuseOpen(_:dueTo:)`), which mirrors this function's own role-then-id-legality gate order
+//   for exactly the checks it can still make without a successfully-decoded `method`. A malformed
+//   method **path**, specifically, is caught earlier still, in the codec, and never reaches this
+//   function's own `methodDescriptor(from:)` guard: that guard re-validates the same shape
+//   `GRPCWireHeaders.parseRequest` (via `validateMethodPath`) already enforced upstream, byte for
+//   byte, so nothing that reaches it can still fail it. It is unreachable by construction and
+//   stays only as defense in depth, not as the thing that rejects a malformed path today.
 // * **The receive window is ENFORCED, not merely accounted for** (§O4, amended). Received-but-
 //   uncredited bytes are tracked per stream (`StreamEntry.unconsumedCharge`) and for the
 //   connection (`Registry.connectionUnconsumed`), and a peer that pushes past either bound is
@@ -588,10 +601,14 @@ final class RPCTransportCore: Sendable {
     /// not parse, and every op after it in the same blob is unrecoverable, so there is nothing to
     /// resynchronise to. `CompactWireCodec` also throws for a malformed `goAway` body specifically
     /// (see its `decode(_:)` doc) -- connection-scoped by its own nature, not a per-stream
-    /// exception carved out of this rule. Everything else that used to reach here as a thrown
-    /// error -- every **body**-level rejection §O2's amendment covers -- now arrives as a
-    /// `.streamFailure` item instead and is handled below exactly like a state-machine grammar
-    /// violation: fail that one stream, leave the rest of the blob's ops routed normally.
+    /// exception carved out of this rule. Every other **body**-level rejection §O2's amendment
+    /// covers now arrives as an item below instead, and splits two ways by kind, not uniformly:
+    /// `.streamFailure` for every kind but `openStream`, handled exactly like a state-machine
+    /// grammar violation (fail that one stream, leave the rest of the blob routed normally); and
+    /// `.streamOpenFailure` for `openStream` itself, answered on the wire through
+    /// ``refuseOpen(_:dueTo:)`` because that is the one kind whose rejection cannot be silently
+    /// dropped without hanging a peer that is definitionally waiting on this id -- see
+    /// `WireDecodeItem`'s doc.
     private func receive(_ blob: GRPCSwiftData) {
         // L4 tripwire. Measured caveat from Task 5: `.onQueue` is target-chain permissive, so this
         // catches "delivered from an unrelated queue" but would not catch "delivered from a child
@@ -622,6 +639,10 @@ final class RPCTransportCore: Sendable {
                 // exactly the path `deliver(_:toStream:)`'s `.violation` case already takes, not a
                 // parallel one, because it is the same kind of failure caught one layer earlier.
                 failStream(streamID, dueTo: error)
+            case .streamOpenFailure(let streamID, let error):
+                // §O2's carve-out: `openStream` creates state, so a rejection is answered, not
+                // dropped -- see `WireDecodeItem.streamOpenFailure`'s doc and `refuseOpen(_:dueTo:)`.
+                refuseOpen(streamID, dueTo: error)
             }
         }
     }
@@ -672,11 +693,23 @@ final class RPCTransportCore: Sendable {
     /// doomed it -- and both want the same outcome, so they share this one path rather than two
     /// that could drift apart.
     ///
-    /// The reason is truncated because a decoder's or codec's error message can embed
-    /// peer-supplied field bytes verbatim -- see ``truncatedForWire(_:)``. `removeStream` is where
-    /// that truncation happens, so this passes the full text and does not pre-truncate it.
+    /// Both the wire reason and the *local* error the application sees are truncated here, and
+    /// separately: `removeStream` truncates whatever `String` it is given before it reaches the
+    /// wire, but `error` itself is not a `String` -- passing it straight through as
+    /// `failingInboundWith` would hand the application an untruncated `RPCError` whose
+    /// description can embed a peer-supplied field verbatim (and, through a decoder's `cause`
+    /// chain, more than one), up to the 16 MiB body cap. Mirrors ``cancelStream(_:reason:)``'s own
+    /// truncation of its local error, for the same reason -- the two should read the same rather
+    /// than diverge on this. The original error's `code` is preserved where available (an `RPCError`
+    /// today; always is, in practice) rather than flattened to one code, since a decoder's grammar
+    /// violation and a codec's body rejection do not necessarily share one.
     private func failStream(_ id: RPCStreamID, dueTo error: any Error) {
-        removeStream(id, failingInboundWith: error, sendingCancel: "\(error)")
+        let reason = "\(error)"
+        let code = (error as? RPCError)?.code ?? .internalError
+        removeStream(
+            id,
+            failingInboundWith: RPCError(code: code, message: Self.truncatedForWire(reason)),
+            sendingCancel: reason)
     }
 
     /// Feeds one stream-scoped op to its machine and delivers whatever parts come out.
@@ -1025,6 +1058,39 @@ final class RPCTransportCore: Sendable {
     /// answer with a status (a stream id outside the legal space, or an `openStream` at a client).
     private func refuseWithCancel(_ id: RPCStreamID, _ reason: String) {
         sendControl([.cancel(id, reason: reason)])
+    }
+
+    /// Refuses an `openStream` whose body this codec rejected (`WireDecodeItem.streamOpenFailure`,
+    /// §O2's carve-out). `openStream` is the one kind whose body-level rejection is answered
+    /// rather than dropped, because it is the one kind whose semantics *create* state -- the id
+    /// belongs to the peer the moment it sends this op, so the peer is definitionally waiting on a
+    /// reply, unlike a made-up id on any other kind (see `WireDecodeItem.streamOpenFailure`'s doc).
+    ///
+    /// Deliberately mirrors `openInbound`'s own gate order for the two checks that do not need a
+    /// successfully-decoded `method` to evaluate -- role, then id legality -- because skipping
+    /// either one here would be exactly as wrong as skipping it there. In particular: **the role
+    /// gate must run first.** A malformed `openStream` body reaching a *client* transport must
+    /// still get `openInbound`'s treatment (a client never accepts, so `cancel`, not `status`) --
+    /// checking id legality or answering with `status` before checking role would have a client
+    /// transport answer an `openStream` it must never accept.
+    ///
+    /// Past those two gates this always answers `status`/`.invalidArgument` with a **fixed
+    /// literal** message, never `error`'s own text -- see `WireDecodeItem.streamOpenFailure`'s doc
+    /// for why: `error` can embed up to 16 MiB of peer-chosen bytes, and since no table entry is
+    /// ever created here (successfully or not), a peer can trigger this reply as many times as it
+    /// likes for free -- echoing even a truncated form of `error` would still let the peer's input
+    /// size drive the reply's size, repeatably.
+    private func refuseOpen(_ id: RPCStreamID, dueTo error: RPCError) {
+        guard role == .server else {
+            refuseWithCancel(id, "a client transport does not accept streams")
+            return
+        }
+        guard id != 0, id.isMultiple(of: 2) == false else {
+            refuseWithCancel(
+                id, "stream id \(id) is not a legal client-allocated id (must be odd and non-zero)")
+            return
+        }
+        refuseWithStatus(id, .invalidArgument, "malformed openStream")
     }
 
     // =======================================================================================

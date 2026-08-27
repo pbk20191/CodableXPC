@@ -73,23 +73,24 @@ struct CompactWireCodec: WireCodec {
 
     /// §O2 (as amended): a body-level rejection never takes the rest of the blob with it. Each
     /// op's 10-byte header -- including its stream id -- is parsed before its body ever is, so a
-    /// body this codec rejects still yields a `.streamFailure` naming that stream, and decoding
-    /// resumes at the next op using the same `bodyLength`-derived `cursor` advance this method
-    /// already uses to step over a `kind` it doesn't recognise. See `WireDecodeItem`'s doc for why
-    /// this is skip-and-continue rather than stop-at-first-failure or a separate failures array.
+    /// body this codec rejects still yields an item naming that stream, and decoding resumes at
+    /// the next op using the same `bodyLength`-derived `cursor` advance this method already uses
+    /// to step over a `kind` it doesn't recognise. See `WireDecodeItem`'s doc for why this is
+    /// skip-and-continue rather than stop-at-first-failure or a separate failures array, and for
+    /// why `openStream` gets its own `.streamOpenFailure` case instead of sharing `.streamFailure`.
     ///
     /// **`goAway` is the one kind whose body failure still `throw`s**, and deliberately so:
     /// `goAway` is already a connection-scoped signal (§O1: "no new streams above `lastStreamID`"),
     /// not a per-stream one, and this codec writes its header's `streamID` as 0 on encode --
     /// meaningless, not a real stream id (see `encodeOne`) -- so there is no stream to attribute a
-    /// `.streamFailure` to. Manufacturing `.streamFailure(0, …)` anyway would force the core to
-    /// special-case id 0 as "fail the connection," and `0` is never a legal client-allocated
-    /// stream id (§O1: odd, non-zero) -- so that special case would be indistinguishable at the
-    /// core from a hostile peer forging streamID 0 onto some *other* kind's malformed body, which
-    /// must NOT be connection-fatal (that forgery is exactly the amplification this task closes).
-    /// Throwing here keeps that special case out of the core entirely. The cost -- losing whatever
-    /// this call already decoded from the same blob -- is bounded and one-time: `failConnection`
-    /// (this error's eventual destination) fails every live stream in the same synchronous call
+    /// failure to. Manufacturing `.streamFailure(0, …)` anyway would force the core to special-case
+    /// id 0 as "fail the connection," and `0` is never a legal client-allocated stream id (§O1:
+    /// odd, non-zero) -- so that special case would be indistinguishable at the core from a
+    /// hostile peer forging streamID 0 onto some *other* kind's malformed body, which must NOT be
+    /// connection-fatal (that forgery is exactly the amplification this task closes). Throwing
+    /// here keeps that special case out of the core entirely. The cost -- losing whatever this
+    /// call already decoded from the same blob -- is bounded and one-time: `failConnection` (this
+    /// error's eventual destination) fails every live stream in the same synchronous call
     /// regardless of whether they got one more op processed first, so nothing decoded from this
     /// blob would have survived past that call either way. A hostile peer gains no leverage over
     /// any *other* blob or connection by corrupting a `goAway`'s body, only over the one
@@ -139,12 +140,19 @@ struct CompactWireCodec: WireCodec {
             do {
                 items.append(.op(try Self.decodeOne(kind: kind, streamID: streamID, body: body)))
             } catch let error as RPCError {
-                if kind == .goAway {
+                switch kind {
+                case .goAway:
                     // See this method's doc: goAway has no stream to fail, so its body rejection
-                    // stays connection-fatal instead of becoming a `.streamFailure`.
+                    // stays connection-fatal instead of becoming an item.
                     throw error
+                case .openStream:
+                    // §O2's carve-out: `openStream` is the one kind whose semantics create state,
+                    // so a rejection must be answered on the wire, not silently dropped like every
+                    // other kind's -- see `WireDecodeItem.streamOpenFailure`'s doc.
+                    items.append(.streamOpenFailure(streamID, error))
+                default:
+                    items.append(.streamFailure(streamID, error))
                 }
-                items.append(.streamFailure(streamID, error))
             } catch {
                 // Every throw site in `decodeOne` (and everything it calls: `decodeFieldList`,
                 // `GRPCWireHeaders.parseRequest`) constructs `RPCError`, so this is unreachable in
@@ -397,9 +405,14 @@ struct CompactWireCodec: WireCodec {
     /// from `body.startIndex`/`body.endIndex`, never a literal `0`.
     ///
     /// - Throws: `RPCError(code: .internalError)` for a truncated count/length/value, a declared
-    ///   length exceeding the bytes remaining *in this field list*, a non-UTF-8 name or value, or
-    ///   trailing bytes left over after the declared field count has been fully read.
+    ///   field count this field list cannot possibly hold, a declared length exceeding the bytes
+    ///   remaining *in this field list*, a non-UTF-8 name or value, or trailing bytes left over
+    ///   after the declared field count has been fully read.
     private static func decodeFieldList(_ body: GRPCSwiftData) throws -> [HTTPField] {
+        /// The smallest an encoded field can be: a 2-byte name length, a 0-byte name, a 4-byte
+        /// value length, a 0-byte value.
+        let minimumEncodedFieldLength = 6
+
         let data = body.data
         let end = data.endIndex
         var cursor = data.startIndex
@@ -409,6 +422,24 @@ struct CompactWireCodec: WireCodec {
         }
         let count = Int(readBE(data, at: cursor, as: UInt16.self))
         cursor += 2
+
+        // §O2's skip-and-continue turned a single-shot allocation lever into a per-op one: before
+        // this guard, a 12-byte `metadata` op (10-byte header, 2-byte body `count = 0xFFFF`) made
+        // `reserveCapacity` reserve ~2 MiB and then throw on field 1 -- once, when a bad blob was
+        // connection-fatal, but now once *per such op in the blob*, since decoding resumes after
+        // each rejection. A ~1 MiB blob packs ~87 000 of these 12-byte ops, so the same allocate/
+        // free churn that used to cost one blob now repeats per op: cheap and legitimate to reject
+        // here, not a heuristic -- `count` fields need at least `6 * count` bytes (the smallest
+        // possible field is 6 bytes; see `minimumEncodedFieldLength`), so a declared `count` this
+        // field list cannot possibly hold is already malformed, and rejecting it before
+        // `reserveCapacity` ever runs is exact, not approximate: a genuine 65 535-field list needs
+        // ≥ 393 210 bytes, comfortably inside the 16 MiB body cap.
+        guard end - cursor >= count * minimumEncodedFieldLength else {
+            throw RPCError(
+                code: .internalError,
+                message: "field list declares \(count) field(s), which would need at least "
+                    + "\(count * minimumEncodedFieldLength) byte(s), but only \(end - cursor) byte(s) remain")
+        }
 
         var fields: [HTTPField] = []
         fields.reserveCapacity(count)

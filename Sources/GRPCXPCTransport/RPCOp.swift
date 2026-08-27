@@ -84,14 +84,15 @@ enum RPCOp: Sendable {
 /// One entry in a decoded blob. §O2 (as amended): `decode(_:)` parses each op's 10-byte header --
 /// including its stream id -- before it ever touches the body, so a body-level rejection can
 /// always name the stream it belongs to. `WireCodec.decode(_:)` returns an array of these instead
-/// of `[RPCOp]` directly so that a body this codec rejects can surface as `.streamFailure` naming
-/// that stream, rather than as a thrown error that would hand the core nothing to fail but the
-/// whole connection -- exactly the hole §O2's amendment closes (a malformed `:path`, a
-/// stray-metadata `openStream`, and a non-empty `halfClose` body were each found killing every
-/// other stream on the connection).
+/// of `[RPCOp]` directly so that a body this codec rejects can surface naming that stream, rather
+/// than as a thrown error that would hand the core nothing to fail but the whole connection --
+/// exactly the hole §O2's amendment closes (a malformed `:path`, a stray-metadata `openStream`,
+/// and a non-empty `halfClose` body were each found killing every other stream on the connection).
 ///
-/// Deliberately a two-case enum, not three. A separate "failures" array was rejected: it would
-/// lose each failure's position relative to the ops around it, and the core has to see a stream's
+/// Three cases, not the "two, not three" this type started with -- §O2's review found that flat,
+/// and split `openStream` out on purpose; see `.streamOpenFailure`'s doc for why it cannot share
+/// `.streamFailure`'s silence. What stayed rejected is a *separate failures array*: it would lose
+/// each failure's position relative to the ops around it, and the core has to see a stream's
 /// failure at the position it occurred -- not batched at the end -- to keep per-connection
 /// ordering meaningful. Stopping at the first failure was also rejected: it would hand a hostile
 /// peer a cheap truncation lever, since appending one malformed op to a blob would silently
@@ -104,18 +105,46 @@ enum RPCOp: Sendable {
 /// A **header**-level failure -- a truncated 10-byte header, or a declared body length over the
 /// 16 MiB cap or past the bytes actually remaining -- has no representation here: `decode(_:)`
 /// still `throw`s for those, unchanged. The header carrying the stream id is the thing that failed
-/// to parse, so there is no id to attribute a `.streamFailure` to and no framing left to
-/// resynchronise to.
+/// to parse, so there is no id to attribute a failure to and no framing left to resynchronise to.
+/// A malformed `goAway` body also still `throw`s, by deliberate carve-out (§O2): `goAway` has no
+/// stream to fail either, and unlike a header failure this one *could* have kept the decoded
+/// prefix, but does not need to -- `failConnection` fails every live stream in the same
+/// synchronous call regardless of decode order, so nothing the prefix could have delivered would
+/// have survived that call anyway. See `CompactWireCodec.decode(_:)`'s doc for the full argument.
 @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
 enum WireDecodeItem: Sendable {
     /// One op that decoded cleanly.
     case op(RPCOp)
-    /// One op whose body this codec rejected. The `RPCStreamID` comes from the op's own header --
-    /// decoded before the body ever was -- so it is trustworthy even though the body was not. The
-    /// core fails exactly this stream and sends `cancel`, the same path a state-machine grammar
-    /// violation already takes; any later op addressed to this id then hits the ordinary
-    /// unknown-stream drop, because the core has already removed the stream.
+    /// One op whose body this codec rejected, for a kind that never creates state. The
+    /// `RPCStreamID` comes from the op's own header -- decoded before the body ever was -- so it
+    /// is trustworthy even though the body was not.
+    ///
+    /// **A `cancel` op is sent only if `id` names a live stream; otherwise this is silently
+    /// dropped.** Both outcomes go through the same removal path a state-machine grammar violation
+    /// already uses, and that path already no-ops when there is nothing to remove -- so "does this
+    /// id have a table entry" is the only thing that decides which happens, not the kind that
+    /// failed. An id with no entry is either a rejected `.streamOpenFailure` for some *other* op in
+    /// the same blob (that kind is handled separately -- see below) or a forgery: a peer-chosen id
+    /// that was never legitimately opened. The core cannot tell those apart, and answering either
+    /// one hands the peer a 1:1 amplification lever for the price of a single small malformed op,
+    /// so both stay silent. An id *with* an entry is failed and removed exactly like a grammar
+    /// violation; any later op addressed to it then hits the ordinary unknown-stream drop, because
+    /// the core has already removed it.
     case streamFailure(RPCStreamID, RPCError)
+    /// An `openStream` op whose body this codec rejected. Split out from `.streamFailure` because
+    /// `openStream` is the one kind whose semantics *create* state (§O2): the id belongs to the
+    /// peer the moment it sends this op, and the peer is definitionally waiting on a reply for it
+    /// -- unlike every other kind, where a made-up id might just be an ordinary retirement race,
+    /// here there is no such id, and silence would hang the peer to its own deadline for free.
+    ///
+    /// The core answers with a **fixed literal** `status` -- never the decode error's own text --
+    /// because the error can embed up to 16 MiB of peer-chosen bytes (a malformed `:path`, a
+    /// malformed `-bin` value): echoing it turns a ~12-byte malformed `openStream` into hundreds of
+    /// bytes out, repeatable forever at zero state cost, since rejecting it never creates a table
+    /// entry to bound the peer's attempts by (contrast `resourceExhausted`, reachable only after
+    /// the peer has paid for a full complement of admitted streams). The decode error itself is not
+    /// discarded -- it is still the `RPCError` carried here -- it just never reaches the wire.
+    case streamOpenFailure(RPCStreamID, RPCError)
 }
 
 // ===========================================================================================
@@ -136,10 +165,11 @@ protocol WireCodec: Sendable {
     /// back into the items it carries, in the order they were encoded -- see `WireDecodeItem` for
     /// why an item, not always an `RPCOp`.
     ///
-    /// - Throws: only for a **header-level** failure (truncated framing, or a declared body
-    ///   length this codec cannot trust). Those leave no stream id to name in a `.streamFailure`
-    ///   and no framing left to resynchronise past, so they stay connection-fatal; everything
-    ///   `WireDecodeItem` covers does not.
+    /// - Throws: for a **header-level** failure (truncated framing, or a declared body length
+    ///   this codec cannot trust) -- those leave no stream id to name and no framing left to
+    ///   resynchronise past -- and, by §O2's carve-out, for a malformed `goAway` body, which has
+    ///   no stream to name either even though the framing around it is fine. See
+    ///   `WireDecodeItem`'s doc for why every other kind's body-level rejection does not throw.
     func decode(_ blob: GRPCSwiftData) throws -> [WireDecodeItem]
 }
 
