@@ -2,7 +2,8 @@ import Foundation
 import GRPCCore
 
 /// Translates between gRPC's domain concepts -- a method path, a call deadline, ``Metadata``, a
-/// ``Status`` -- and the HTTP/2 header field lists that ``HPACKLiteralCodec`` encodes and decodes.
+/// ``Status`` -- and the wire-level header field lists (``HTTPField``) that a ``WireCodec``
+/// conformer (``CompactWireCodec``, the only one so far) encodes and decodes.
 ///
 /// Every rule here is taken verbatim from the gRPC-over-HTTP/2 wire spec
 /// (`https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md`), not inferred:
@@ -223,8 +224,8 @@ enum GRPCWireHeaders {
     /// (e.g. via a Release-mode build where the assert was compiled out) means the caller bypassed
     /// that contract, not that the peer sent something we're rejecting. This traps rather than
     /// silently emitting binary bytes as if they were printable ASCII, which would corrupt the
-    /// header block for every field after it -- the same "caller bug traps" convention
-    /// `HPACKLiteralCodec.encode` uses for the pseudo-header-ordering precondition.
+    /// header block for every field after it -- the same "caller bug traps" convention this
+    /// module's `WireCodec` conformers use for their own encode-side preconditions.
     private static func userMetadataFields(_ metadata: Metadata) -> [HTTPField] {
         var fields: [HTTPField] = []
         fields.reserveCapacity(metadata.count)
