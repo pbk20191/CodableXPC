@@ -445,19 +445,44 @@ final class RPCTransportCore: Sendable {
         /// Records `bytes` consumed on the connection and returns the batched credit, if any.
         mutating func creditConnection(consuming bytes: Int) -> UInt32? {
             guard let credit = connectionReceive.consumed(bytes) else { return nil }
-            connectionUnconsumed -= Int(credit)
+            debitConnection([credit])
             return credit
         }
 
-        /// Records `bytes` and then flushes the ledger unconditionally, for a stream removal.
-        /// Returns **up to two** credits rather than summing them, so no assumption is made about
-        /// the total staying inside §O4's 2³¹−1 ceiling.
+        /// Records `bytes` and then flushes the ledger past its batching threshold, for a stream
+        /// removal. Returns **up to two** credits rather than summing them, so no assumption is
+        /// made about the total staying inside §O4's 2³¹−1 ceiling.
+        ///
+        /// **Gated on `bytes > 0`, which is not a micro-optimisation.** Flushing unconditionally
+        /// drained residue contributed by *other* streams on every removal, clean completions
+        /// included -- and for a unary RPC "one control op per removal" *is* one per message,
+        /// precisely what §O4 batches to avoid (traced: roughly one `credit` op per 328 sequential
+        /// 100-byte unary RPCs became one per RPC).
+        ///
+        /// The gate costs none of the three properties the flush was added for, because each has
+        /// `bytes > 0` by construction: L3's early-returning handler strands bytes; a
+        /// `.streamOverran` recovery has `unconsumedCharge > initialWindow`; and a peer parked on
+        /// the connection window is parked *because* bytes were received and not consumed. Only
+        /// clean completion changes, and there the residue is carried by the next delivery exactly
+        /// as §O4 intends.
         mutating func flushConnection(recording bytes: Int) -> [UInt32] {
+            guard bytes > 0 else { return [] }
             var credits: [UInt32] = []
-            if bytes > 0, let credit = connectionReceive.consumed(bytes) { credits.append(credit) }
+            if let credit = connectionReceive.consumed(bytes) { credits.append(credit) }
             if let credit = connectionReceive.flush() { credits.append(credit) }
-            connectionUnconsumed -= credits.reduce(0) { $0 + Int($1) }
+            debitConnection(credits)
             return credits
+        }
+
+        /// The one place `connectionUnconsumed` is reduced. Clamped at zero for symmetry with
+        /// `outstandingAccepts`, and for one reachable reason: ``failAll(_:)`` zeroes the counter,
+        /// after which a late `deliver` for an unknown stream can still route residue through
+        /// ``creditConnection(consuming:)``. A negative value is harmless in every direction -- it
+        /// only makes the bound *more* lenient, on a connection that is already closed -- but an
+        /// unexplained asymmetry between two sibling counters is not.
+        private mutating func debitConnection(_ credits: [UInt32]) {
+            let total = credits.reduce(0) { $0 + Int($1) }
+            connectionUnconsumed = max(0, connectionUnconsumed - total)
         }
     }
 
@@ -921,6 +946,13 @@ final class RPCTransportCore: Sendable {
     /// Clamped at zero rather than trusting the pairing: `failAll` resets the counter, so an item
     /// buffered before a teardown and pulled after it would otherwise drive this negative and
     /// silently raise the effective cap.
+    ///
+    /// **There is no release-on-destruction path**: an accept loop that is abandoned mid-iteration,
+    /// or an `AcceptedStreamSequence` dropped without being iterated, leaves its items' slots
+    /// claimed until ``failAll(_:)`` zeroes the counter. That is deliberately fail-closed -- the
+    /// counter can only ever be too *high*, which refuses accepts and never admits extras -- and a
+    /// server that stops draining `acceptedStreams` while still expecting to serve RPCs is a caller
+    /// bug that this counter should surface rather than paper over.
     private func acceptDidDeliver() {
         registry.withLock { $0.outstandingAccepts = max(0, $0.outstandingAccepts - 1) }
     }
@@ -1112,7 +1144,15 @@ final class RPCTransportCore: Sendable {
     /// substrate is gone there is no peer to inform, and if the codec refuses one of these
     /// fixed-shape ops the connection is already being torn down by whatever produced it. Nothing
     /// on a stream's grammar path uses this -- a `write` reports its own failures.
-    /// The cap on any peer-derived text this file puts back on the wire.
+    private func sendControl(_ ops: [RPCOp]) {
+        do {
+            try sendEncoded(ops)
+        } catch {
+            // Intentionally terminal, for the reasons in this function's own doc comment above.
+        }
+    }
+
+    /// The cap on any peer-derived text this file puts back on the wire, **in UTF-8 bytes**.
     static let maxWireReasonLength = 512
 
     /// Bounds what a `cancel` op's `reason` (or a refusal's `message`) can carry back to the peer.
@@ -1124,8 +1164,19 @@ final class RPCTransportCore: Sendable {
     /// straight back at it, at whatever size it chose, on a control op that is exempt from flow
     /// control. A few hundred bytes is all a diagnostic needs.
     ///
-    /// Uses `Substring.endIndex` rather than `count` to detect truncation, so the common
-    /// short-string case stays O(1) instead of walking a possibly enormous string.
+    /// # It must bound BYTES, not `Character`s
+    ///
+    /// This truncated on `text.prefix(512)` until re-review, which bounds **grapheme clusters** --
+    /// and a cluster has no length bound. One base character followed by four million combining
+    /// marks is a single `Character`, so a 16 MiB peer value made of a handful of enormous clusters
+    /// passed `prefix(512)` completely unchanged and went straight back out. The codec validates
+    /// only that a field value is UTF-8 (`CompactWireCodec.decodeFieldList`), never what it
+    /// normalises to, so the peer chooses the clusters. Slicing `text.utf8` is what makes the cap a
+    /// real bound; `String(decoding:as:)` substitutes U+FFFD for a scalar the slice split rather
+    /// than failing, so a truncation can never throw or return the untruncated string as a fallback.
+    ///
+    /// Detection compares `endIndex` rather than counting, so the common short-string case stays
+    /// O(1) instead of walking a possibly enormous string.
     ///
     /// **There is exactly one truncation point for the wire**, in
     /// ``removeStream(_:failingInboundWith:sendingCancel:)``, so callers pass their full text and
@@ -1133,17 +1184,9 @@ final class RPCTransportCore: Sendable {
     /// two uses are the accept refusal's `status` message and ``cancelStream(_:reason:)``'s *local*
     /// error text, neither of which passes through that point.
     static func truncatedForWire(_ text: String) -> String {
-        let head = text.prefix(maxWireReasonLength)
-        guard head.endIndex != text.endIndex else { return text }
-        return String(head) + "… [truncated]"
-    }
-
-    private func sendControl(_ ops: [RPCOp]) {
-        do {
-            try sendEncoded(ops)
-        } catch {
-            // Intentionally terminal. See above.
-        }
+        let head = text.utf8.prefix(maxWireReasonLength)
+        guard head.endIndex != text.utf8.endIndex else { return text }
+        return String(decoding: head, as: UTF8.self) + "… [truncated]"
     }
 
     // =======================================================================================
