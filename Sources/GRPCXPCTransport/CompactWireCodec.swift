@@ -215,6 +215,20 @@ struct CompactWireCodec: WireCodec {
         case .openStream:
             let fields = try decodeFieldList(body)
             let parsed = try GRPCWireHeaders.parseRequest(fields)
+            // §O2: user metadata travels in its own `metadata` op, never inside `openStream`'s
+            // field list -- and `RPCOp.openStream` has no field that could carry it onward even
+            // if it did. A conforming peer never puts anything here, so anything `parseRequest`
+            // recovered as metadata is either a bug or an attack smuggling up to 16 MiB of extra
+            // field-list bytes into every call; both must be loud; a silent `continue` here would
+            // destroy the only evidence that it happened.
+            guard parsed.metadata.isEmpty else {
+                let strayNames = parsed.metadata.map(\.key).joined(separator: ", ")
+                throw RPCError(
+                    code: .internalError,
+                    message: "openStream op (stream \(streamID)) carries stray metadata field(s) "
+                        + "outside the reserved set: \(strayNames); user metadata must arrive as "
+                        + "a separate metadata op")
+            }
             let method = parsed.path.hasPrefix("/") ? String(parsed.path.dropFirst()) : parsed.path
             return .openStream(streamID, method: method, timeout: parsed.timeout)
 
