@@ -42,7 +42,6 @@ enum GRPCWireHeaders {
     private static let methodPseudoHeader = ":method"
     private static let schemePseudoHeader = ":scheme"
     private static let pathPseudoHeader = ":path"
-    private static let statusPseudoHeader = ":status"
     private static let teHeader = "te"
     private static let contentTypeHeader = "content-type"
     private static let timeoutHeader = "grpc-timeout"
@@ -55,7 +54,6 @@ enum GRPCWireHeaders {
     private static let schemeValue = "https"
     private static let contentTypeValue = "application/grpc"
     private static let teValue = "trailers"
-    private static let httpStatusOKValue = "200"
 
     // =======================================================================================
     // MARK: - Field-list construction
@@ -81,30 +79,7 @@ enum GRPCWireHeaders {
         return fields
     }
 
-    /// Builds the header field list for a response's initial (non-trailing) `HEADERS` frame.
-    static func initialResponse(metadata: Metadata) -> [HTTPField] {
-        var fields: [HTTPField] = [
-            (statusPseudoHeader, httpStatusOKValue),
-            (contentTypeHeader, contentTypeValue),
-        ]
-        fields.append(contentsOf: userMetadataFields(metadata))
-        return fields
-    }
 
-    /// Builds the header field list for a response's trailing `HEADERS` frame (`END_STREAM` set).
-    ///
-    /// `grpc-message` is omitted when `status.message` is empty -- there is nothing to say, and
-    /// omitting it (rather than emitting `grpc-message: `) keeps the trailers block minimal.
-    static func trailers(status: Status, metadata: Metadata) -> [HTTPField] {
-        var fields: [HTTPField] = [
-            (grpcStatusHeader, String(status.code.rawValue)),
-        ]
-        if !status.message.isEmpty {
-            fields.append((grpcMessageHeader, percentEncode(status.message)))
-        }
-        fields.append(contentsOf: userMetadataFields(metadata))
-        return fields
-    }
 
     // =======================================================================================
     // MARK: - Parsing
@@ -116,10 +91,6 @@ enum GRPCWireHeaders {
         var metadata: Metadata
     }
 
-    enum ParsedResponse {
-        case initial(Metadata)
-        case trailers(Status, Metadata)
-    }
 
     /// Parses a request's header field list.
     ///
@@ -130,7 +101,7 @@ enum GRPCWireHeaders {
     /// pseudo-header carries, so that split-then-reconstruct is the only way to confirm the path
     /// names a real method shape before handing it onward. The returned `path` is the original
     /// `:path` value (leading slash included), matching what `request(path:)` was given.
-    static func parseRequest(_ fields: [HTTPField]) throws -> ParsedRequest {
+    static func parseRequest(_ fields: [HTTPField]) throws(RPCError) -> ParsedRequest {
         guard let path = firstValue(fields, forLoweredName: pathPseudoHeader) else {
             throw RPCError(code: .invalidArgument, message: "request is missing the ':path' pseudo-header")
         }
@@ -145,36 +116,12 @@ enum GRPCWireHeaders {
         return ParsedRequest(path: path, timeout: timeout, metadata: metadata)
     }
 
-    /// Parses a response's header field list. `endStream` -- read off the enclosing `HEADERS`
-    /// frame by the caller -- decides whether this is trailing metadata (which must carry
-    /// `grpc-status`) or initial metadata (which must not).
-    static func parseResponse(_ fields: [HTTPField], endStream: Bool) throws -> ParsedResponse {
-        let statusValue = firstValue(fields, forLoweredName: grpcStatusHeader)
-
-        if endStream {
-            guard let statusValue else {
-                throw RPCError(code: .invalidArgument, message: "trailers are missing 'grpc-status'")
-            }
-            let status = try parseStatus(statusValue: statusValue, fields: fields)
-            let metadata = try parseUserMetadata(fields)
-            return .trailers(status, metadata)
-        } else {
-            guard statusValue == nil else {
-                throw RPCError(
-                    code: .invalidArgument,
-                    message: "initial metadata unexpectedly contains 'grpc-status'; "
-                        + "the frame that carried it should have set END_STREAM")
-            }
-            let metadata = try parseUserMetadata(fields)
-            return .initial(metadata)
-        }
-    }
 
     /// Splits `path` (leading slash optionally present) on the last `/` into service and method,
     /// then constructs a `MethodDescriptor` to confirm both halves are non-empty. The descriptor
     /// itself is discarded -- callers downstream (Task 6) reconstruct their own from `path` --
     /// this exists purely to reject a malformed `:path` here rather than downstream.
-    private static func validateMethodPath(_ path: String) throws {
+    private static func validateMethodPath(_ path: String) throws(RPCError) {
         let withoutLeadingSlash = path.hasPrefix("/") ? String(path.dropFirst()) : path
         guard let lastSlash = withoutLeadingSlash.lastIndex(of: "/") else {
             throw RPCError(code: .unimplemented, message: "malformed ':path' value: '\(path)'")
@@ -187,13 +134,6 @@ enum GRPCWireHeaders {
         _ = MethodDescriptor(fullyQualifiedService: service, method: method)
     }
 
-    private static func parseStatus(statusValue: String, fields: [HTTPField]) throws -> Status {
-        guard let rawCode = Int(statusValue), let code = Status.Code(rawValue: rawCode) else {
-            throw RPCError(code: .invalidArgument, message: "malformed 'grpc-status' value: '\(statusValue)'")
-        }
-        let message = firstValue(fields, forLoweredName: grpcMessageHeader).map(percentDecode) ?? ""
-        return Status(code: code, message: message)
-    }
 
     /// First field value whose lowercased name matches `loweredName`. Header names are
     /// case-insensitive on the wire (HTTP/2 requires lowercase, but a decoded field is only as
@@ -240,7 +180,7 @@ enum GRPCWireHeaders {
             case .binary(let bytes):
                 precondition(
                     loweredKey.hasSuffix(binaryKeySuffix),
-                    "GRPCWireHeaders.request/initialResponse/trailers: a binary metadata value's "
+                    "GRPCWireHeaders.request/userMetadataFields: a binary metadata value's "
                         + "key must end in '-bin', got '\(key)'")
                 wireValue = base64Unpadded(bytes)
             }
@@ -257,7 +197,7 @@ enum GRPCWireHeaders {
     /// already guarantees by construction) but has no way to reject bad *bytes*, so the base64
     /// decode failure has to be caught on this side of the boundary or it doesn't get caught at
     /// all.
-    static func parseUserMetadata(_ fields: [HTTPField]) throws -> Metadata {
+    static func parseUserMetadata(_ fields: [HTTPField]) throws(RPCError) -> Metadata {
         var metadata = Metadata()
         for field in fields {
             let loweredKey = field.name.lowercased()
@@ -299,9 +239,13 @@ enum GRPCWireHeaders {
     /// A non-positive `Duration` (already-expired or malformed deadline) encodes as `"0n"` --
     /// there is no shorter unit to round up into, and zero is itself already an upper bound on a
     /// non-positive duration's wire representation. An amount so large it doesn't fit even in
-    /// hours saturates at `"99999999H"` (~11,415 years) rather than overflowing; that clamp still
-    /// rounds toward being the *larger* number a coarser unit could have expressed, so it stays on
-    /// the safe (over-, not under-, estimating) side of the client's real deadline.
+    /// hours saturates at `"99999999H"` (~11,415 years) rather than overflowing -- and unlike every
+    /// other case here, **that clamp under-estimates**: it takes `min(roundedUpAmount, 99999999)`,
+    /// so a deadline past ~11,415 years is advertised shorter than it is. Measured, not reasoned:
+    /// 100,000,000 h goes out as `99999999H` and comes back 3,600 s short. Harmless in practice --
+    /// the deadline is unreachable and the client's own timer stays authoritative either way -- but
+    /// an earlier version of this sentence claimed the clamp stayed on the over-estimating side,
+    /// which is the one thing it does not do.
     static func encodeTimeout(_ d: Duration) -> String {
         guard d > .zero else { return "0n" }
 
@@ -380,7 +324,7 @@ enum GRPCWireHeaders {
     /// characters (`H`/`M`/`S`/`m`/`u`/`n`). Anything else -- empty, too many digits, a non-digit,
     /// an unrecognized unit -- is a malformed value from the peer, not a caller bug, so it throws
     /// rather than trapping.
-    static func parseTimeout(_ s: String) throws -> Duration {
+    static func parseTimeout(_ s: String) throws(RPCError) -> Duration {
         func malformed() -> RPCError {
             RPCError(code: .invalidArgument, message: "malformed 'grpc-timeout' value: '\(s)'")
         }
@@ -491,7 +435,7 @@ enum GRPCWireHeaders {
     /// `Data(base64Encoded:)`, which requires padding; a string whose length isn't already a
     /// multiple of 4 after padding to the next one (i.e. was already malformed) fails decoding
     /// there and throws.
-    static func parseBase64(_ s: String) throws -> [UInt8] {
+    static func parseBase64(_ s: String) throws(RPCError) -> [UInt8] {
         let remainder = s.count % 4
         let padded = remainder == 0 ? s : s + String(repeating: "=", count: 4 - remainder)
         guard let data = Data(base64Encoded: padded) else {

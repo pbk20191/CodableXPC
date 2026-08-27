@@ -57,11 +57,12 @@ import GRPCCore
 /// Routes directly through `GRPCWireHeaders.userMetadataFields(_:)` /
 /// `.parseUserMetadata(_:)` -- the two functions that actually do "user metadata in, plain field
 /// list out" (and back), with no pseudo-header added on either side. An earlier version of this
-/// type went through the public `initialResponse(metadata:)` / `parseResponse(_:endStream:)`
+/// type went through `GRPCWireHeaders`' response-direction helpers (now deleted: they were
+/// HTTP/2-era and had no callers left)
 /// instead, because `userMetadataFields`/`parseUserMetadata` were `private` -- but that silently
 /// prepended `:status: 200` and a *second* `content-type` onto every `metadata` op (both
 /// directions) and every `status` op's trailers: 50 bytes of stray HTTP/2 pseudo-header on the
-/// wire that happened to round-trip away only because `parseResponse`'s reserved-name filter
+/// wire that happened to round-trip away only because the decode side's reserved-name filter
 /// discarded them again on decode -- a §O3 violation (this op model carries no HTTP/2 frames to
 /// have pseudo-headers on) papered over by a filter, not actually absent. Fixed by widening
 /// `userMetadataFields`/`parseUserMetadata` to internal (same module) instead of re-deriving
@@ -72,7 +73,7 @@ private enum MetadataFieldCoding {
         GRPCWireHeaders.userMetadataFields(metadata)
     }
 
-    static func metadata(from fields: [HTTPField]) throws -> Metadata {
+    static func metadata(from fields: [HTTPField]) throws(RPCError) -> Metadata {
         try GRPCWireHeaders.parseUserMetadata(fields)
     }
 }
@@ -210,18 +211,26 @@ struct RequestOpDecoder: Sendable {
     /// this type is `.internalError`, and `position` must not have already advanced past
     /// `.pendingMetadata` by the time that error is thrown (see `fail(_:)`'s "once thrown, dead"
     /// contract in the file overview).
-    private mutating func decodeMetadata(_ fields: [HTTPField]) throws -> Metadata {
+    private mutating func decodeMetadata(_ fields: [HTTPField]) throws(RPCError) -> Metadata {
         do {
             return try MetadataFieldCoding.metadata(from: fields)
         } catch {
-            try fail("malformed metadata field list: \(error)")
+            try fail("malformed metadata field list", error: error)
         }
+    }
+    
+    /// Fails this stream: marks the decoder terminal and throws. Every violation in this type
+    /// routes through here, so the message shape (rule broken; what arrived) stays consistent --
+    /// see the type's doc comment for why a violation fails only this stream.
+    private mutating func fail(_ reason: String, error:any Error) throws(RPCError) -> Never {
+        isFailed = true
+        throw RPCError(code: .internalError, message: "RequestOpDecoder: \(reason)", cause: error)
     }
 
     /// Fails this stream: marks the decoder terminal and throws. Every violation in this type
     /// routes through here, so the message shape (rule broken; what arrived) stays consistent --
     /// see the type's doc comment for why a violation fails only this stream.
-    private mutating func fail(_ reason: String) throws -> Never {
+    private mutating func fail(_ reason: String) throws(RPCError) -> Never {
         isFailed = true
         throw RPCError(code: .internalError, message: "RequestOpDecoder: \(reason)")
     }
@@ -561,7 +570,7 @@ struct ResponseOpDecoder: Sendable {
         }
     }
 
-    private mutating func fail(_ reason: String) throws -> Never {
+    private mutating func fail(_ reason: String) throws(RPCError) -> Never {
         isFailed = true
         throw RPCError(code: .internalError, message: "ResponseOpDecoder: \(reason)")
     }
