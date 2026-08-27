@@ -387,6 +387,12 @@ lifecycle machines and mux shapes worth porting), `Tests/GRPCXPCTransportTests/X
   `XPCDispatchDataBridge`. **Nothing else. NIO in any form is forbidden.**
 - Frame constants: max frame payload 16 384; initial windows 65 535; stream IDs odd,
   client-allocated, 31-bit.
+- **The new wire never uses `Codable`.** `GRPCSwiftData` crosses to and from libxpc through
+  exactly two internal members — `init(from: xpc_object_t)` (zero-copy wrap on receive) and
+  `createXPCRepresentation() -> xpc_object_t` (send) — and every byte buffer in the stack is a
+  `GRPCSwiftData`, not a `Data`. `GRPCSwiftData`'s `Codable`/`XPCNativeObject` extension exists
+  only to keep the legacy stack compiling and is deleted in Task 9; no new code may reference it,
+  and the `CodableXPC` dependency leaves the target in Task 9.
 - All lessons L1–L12 above bind every task.
 - Keep every commit green: build the new stack alongside the old; the old stack is deleted
   only in Task 9’s swap commit.
@@ -428,7 +434,7 @@ struct HTTP2ErrorCode: RawRepresentable, Equatable, Sendable {
 
 enum HTTP2FrameCodec {
     static let maxFramePayload = 16_384
-    static func encode(_ frames: [HTTP2Frame]) -> Data          // concatenated wire bytes
+    static func encode(_ frames: [HTTP2Frame]) -> GRPCSwiftData   // concatenated wire bytes
     /// Parses a blob of ≥0 COMPLETE frames. Unknown frame types are skipped (RFC §4.1 MUST);
     /// a truncated trailing frame, a known-type frame with an invalid payload size, or a
     /// length > maxFramePayload throws.
@@ -469,7 +475,7 @@ test `Tests/GRPCXPCTransportTests/HPACKLiteralCodecTests.swift`.
 **Interfaces:**
 ```swift
 enum HPACKLiteralCodec {
-    static func encode(_ fields: [(name: String, value: String)]) -> Data
+    static func encode(_ fields: [(name: String, value: String)]) -> GRPCSwiftData
     static func decode(_ block: GRPCSwiftData) throws -> [(name: String, value: String)]
     // integer helpers, internal but tested directly:
     static func writeInt(_ value: Int, prefixBits: Int, firstByteBits: UInt8, into: inout Data)
@@ -545,7 +551,7 @@ test `Tests/GRPCXPCTransportTests/LPMCodecTests.swift`.
 ```swift
 enum LPMEncoder {
     /// 1-byte compressed flag (always 0) + 4-byte BE length + payload.
-    static func encode(_ message: GRPCSwiftData) -> Data
+    static func encode(_ message: GRPCSwiftData) -> GRPCSwiftData
 }
 /// Stateful reassembler: DATA payload chunks in, complete messages out. NOT thread-safe;
 /// owned by a single stream's decoder and driven on the connection's serial queue (L4).
@@ -647,12 +653,12 @@ struct RequestStreamDecoder {
 struct RequestStreamEncoder {
     init(descriptor: MethodDescriptor, timeout: Duration?)
     mutating func encodeMetadata(_ m: Metadata) -> HTTP2Frame        // opening HEADERS
-    mutating func encodeMessage(_ b: GRPCSwiftData) -> Data          // LPM bytes for DATA
+    mutating func encodeMessage(_ b: GRPCSwiftData) -> GRPCSwiftData  // LPM bytes for DATA
     mutating func endStream() -> HTTP2Frame?                          // empty DATA+ES if needed
 }
 struct ResponseStreamEncoder {
     mutating func encodeMetadata(_ m: Metadata) -> HTTP2Frame         // :status 200 …
-    mutating func encodeMessage(_ b: GRPCSwiftData) -> Data
+    mutating func encodeMessage(_ b: GRPCSwiftData) -> GRPCSwiftData
     mutating func encodeStatus(_ s: Status, _ trailers: Metadata) -> HTTP2Frame // HEADERS+ES
 }
 ```
@@ -683,7 +689,10 @@ final class XPCPipe: Sendable {
     enum Role: Sendable { case client, server }
     let queue: DispatchSerialQueue
     /// Wire: dictionary {"f": xpc_data}. Blob = ≥1 complete frames (the pipe doesn't parse).
-    func send(_ blob: Data) throws            // one-way; throws .unavailable after teardown
+    /// MUST build the xpc_data via `blob.createXPCRepresentation()` — never via Codable and never
+    /// by re-wrapping through `Data`. That method and `GRPCSwiftData(from:)` are the ONLY two
+    /// crossings between this module and libxpc.
+    func send(_ blob: GRPCSwiftData) throws   // one-way; throws .unavailable after teardown
     /// Set exactly once before activation: called on `queue`, in order, per received blob.
     func onReceive(_ handler: @escaping @Sendable (GRPCSwiftData) -> Void)
     func onPeerDeath(_ handler: @escaping @Sendable () -> Void)
