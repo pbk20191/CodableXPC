@@ -86,8 +86,8 @@ struct CompactWireCodec: WireCodec {
 
             let kindRaw = data[cursor]
             // data[cursor + 1] is flags: reserved, ignored on receive.
-            let streamID = Self.readUInt32BE(data, at: cursor + 2)
-            let bodyLength = Int(Self.readUInt32BE(data, at: cursor + 6))
+            let streamID = Self.readBE(data, at: cursor + 2, as: UInt32.self)
+            let bodyLength = Int(Self.readBE(data, at: cursor + 6, as: UInt32.self))
 
             guard bodyLength <= Self.maxBodyLength else {
                 throw RPCError(
@@ -172,7 +172,7 @@ struct CompactWireCodec: WireCodec {
 
         case .credit(let streamID, let bytes):
             var body = Data()
-            appendUInt32BE(bytes, to: &body)
+            appendBE(bytes, to: &body)
             try appendHeader(kind: .credit, streamID: streamID, bodyLength: body.count, to: &out)
             out.append(body)
 
@@ -180,7 +180,7 @@ struct CompactWireCodec: WireCodec {
             // Connection-level: the header's streamID field is meaningless here, so it is
             // written as 0 (and ignored on decode); the real payload is the body.
             var body = Data()
-            appendUInt32BE(lastStreamID, to: &body)
+            appendBE(lastStreamID, to: &body)
             try appendHeader(kind: .goAway, streamID: 0, bodyLength: body.count, to: &out)
             out.append(body)
         }
@@ -199,8 +199,8 @@ struct CompactWireCodec: WireCodec {
         }
         out.append(kind.rawValue)
         out.append(0)  // flags: reserved, MUST be 0 on send
-        appendUInt32BE(streamID, to: &out)
-        appendUInt32BE(UInt32(bodyLength), to: &out)
+        appendBE(streamID, to: &out)
+        appendBE(UInt32(bodyLength), to: &out)
     }
 
     // =======================================================================================
@@ -297,7 +297,7 @@ struct CompactWireCodec: WireCodec {
                     code: .internalError,
                     message: "credit op (stream \(streamID)) declares a \(body.count)-byte body; must be exactly 4")
             }
-            let bytes = readUInt32BE(body.data, at: body.startIndex)
+            let bytes = readBE(body.data, at: body.startIndex, as: UInt32.self)
             return .credit(streamID, bytes: bytes)
 
         case .goAway:
@@ -306,7 +306,7 @@ struct CompactWireCodec: WireCodec {
                     code: .internalError,
                     message: "goAway op declares a \(body.count)-byte body; must be exactly 4")
             }
-            let lastStreamID = readUInt32BE(body.data, at: body.startIndex)
+            let lastStreamID = readBE(body.data, at: body.startIndex, as: UInt32.self)
             return .goAway(lastStreamID: lastStreamID)
         }
     }
@@ -327,7 +327,7 @@ struct CompactWireCodec: WireCodec {
         }
 
         var out = Data()
-        appendUInt16BE(count, to: &out)
+        appendBE(count, to: &out)
         for field in fields {
             let nameBytes = Array(field.name.utf8)
             guard let nameLength = UInt16(exactly: nameBytes.count) else {
@@ -336,7 +336,7 @@ struct CompactWireCodec: WireCodec {
                     message: "field name '\(field.name)' is \(nameBytes.count) byte(s), exceeding "
                         + "the 65535 maximum")
             }
-            appendUInt16BE(nameLength, to: &out)
+            appendBE(nameLength, to: &out)
             out.append(contentsOf: nameBytes)
 
             let valueBytes = Array(field.value.utf8)
@@ -346,7 +346,7 @@ struct CompactWireCodec: WireCodec {
                     message: "field '\(field.name)' value is \(valueBytes.count) byte(s), exceeding "
                         + "the 4294967295 maximum")
             }
-            appendUInt32BE(valueLength, to: &out)
+            appendBE(valueLength, to: &out)
             out.append(contentsOf: valueBytes)
         }
         return out
@@ -367,7 +367,7 @@ struct CompactWireCodec: WireCodec {
         guard end - cursor >= 2 else {
             throw RPCError(code: .internalError, message: "field list truncated: expected a 2-byte field count")
         }
-        let count = Int(readUInt16BE(data, at: cursor))
+        let count = Int(readBE(data, at: cursor, as: UInt16.self))
         cursor += 2
 
         var fields: [HTTPField] = []
@@ -377,7 +377,7 @@ struct CompactWireCodec: WireCodec {
             guard end - cursor >= 2 else {
                 throw RPCError(code: .internalError, message: "field list truncated: expected a 2-byte name length")
             }
-            let nameLength = Int(readUInt16BE(data, at: cursor))
+            let nameLength = Int(readBE(data, at: cursor, as: UInt16.self))
             cursor += 2
             guard end - cursor >= nameLength else {
                 throw RPCError(
@@ -393,7 +393,7 @@ struct CompactWireCodec: WireCodec {
             guard end - cursor >= 4 else {
                 throw RPCError(code: .internalError, message: "field list truncated: expected a 4-byte value length")
             }
-            let valueLength = Int(readUInt32BE(data, at: cursor))
+            let valueLength = Int(readBE(data, at: cursor, as: UInt32.self))
             cursor += 4
             guard end - cursor >= valueLength else {
                 throw RPCError(
@@ -423,26 +423,25 @@ struct CompactWireCodec: WireCodec {
     // MARK: - Big-endian integer primitives
     // =======================================================================================
 
-    private static func appendUInt16BE(_ value: UInt16, to out: inout Data) {
-        out.append(UInt8((value >> 8) & 0xFF))
-        out.append(UInt8(value & 0xFF))
+    /// Appends `value` in network byte order. `bigEndian` does the swap, so the only thing left
+    /// is to copy the storage out -- no per-byte shift-and-mask ladder to get wrong.
+    private static func appendBE<T: FixedWidthInteger>(_ value: T, to out: inout Data) {
+        withUnsafeBytes(of: value.bigEndian) { out.append(contentsOf: $0) }
     }
 
-    private static func appendUInt32BE(_ value: UInt32, to out: inout Data) {
-        out.append(UInt8((value >> 24) & 0xFF))
-        out.append(UInt8((value >> 16) & 0xFF))
-        out.append(UInt8((value >> 8) & 0xFF))
-        out.append(UInt8(value & 0xFF))
-    }
-
-    /// - Precondition: the caller has already checked `data.endIndex - index >= 2`.
-    private static func readUInt16BE(_ data: Data, at index: Data.Index) -> UInt16 {
-        (UInt16(data[index]) << 8) | UInt16(data[index + 1])
-    }
-
-    /// - Precondition: the caller has already checked `data.endIndex - index >= 4`.
-    private static func readUInt32BE(_ data: Data, at index: Data.Index) -> UInt32 {
-        (UInt32(data[index]) << 24) | (UInt32(data[index + 1]) << 16)
-            | (UInt32(data[index + 2]) << 8) | UInt32(data[index + 3])
+    /// Reads a big-endian `T` starting at `index`.
+    ///
+    /// Deliberately *not* the mirror of `appendBE`: loading the bytes into a `T` and calling
+    /// `T(bigEndian:)` would need the source to be contiguous and correctly aligned, and here
+    /// it is neither guaranteed -- `data` is a slice of a received XPC payload whose
+    /// `startIndex` is arbitrary. Accumulating byte by byte is alignment-agnostic and reads
+    /// the same on either endianness.
+    ///
+    /// - Precondition: the caller has already checked
+    ///   `data.endIndex - index >= MemoryLayout<T>.size`.
+    private static func readBE<T: FixedWidthInteger>(
+        _ data: Data, at index: Data.Index, as: T.Type
+    ) -> T {
+        data[index ..< index + MemoryLayout<T>.size].reduce(T.zero) { ($0 << 8) | T($1) }
     }
 }
