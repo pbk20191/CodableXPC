@@ -354,6 +354,30 @@ public enum RPCResponsePart<Bytes> { case metadata(Metadata); case message(Bytes
   permitting nothing but building and publishing.** A list of operations that trap invites the
   reader to infer the complement is safe; that inference is what cost a reproduced process death.
 
+  **Where the window actually ends (measured, Task 8b's review):** exactly when the `Decision`
+  reaches libxpc — not when the closure returns. A6: a send immediately after the `Decision`
+  returned is safe, 60/60. A8b/A9b: a send or cancel from the closure's *tail*, with the window held
+  open 50 ms, traps 30/30. A8/A9 are that same event at its natural rate, ~1 per 150. So the reason
+  a caller can name no safe instant is **not** that the window outlives the closure; it is that the
+  caller cannot *observe* the moment the `Decision` lands. That kills the "defer past the closure"
+  class just as dead, and unlike the stronger claim it is true — an intermediate write-up asserted
+  the stronger one among verified facts, the third time in this project a conclusion outran its row.
+
+  **The one operation proven ordered after the window:** the first inbound delivery. N1, 100/100
+  with no `setTargetQueue` of ours in the way — the message handler never ran before the accept
+  closure finished. A11/A12: send or cancel from that first delivery, 0 traps in 600. libxpc holds
+  the connection until the accept completes, so **a delivery is a proof**, which is what lets a
+  caller act at all. Supporting rows: N2, a peer that connects and never sends never reaches the
+  incoming-session closure (40/40); N3, the triggering blob is redelivered even if the peer cancels
+  in the very next statement (150/150); N4/N5, `listener.cancel()` while a peer is mid-accept or
+  mid-reject is safe (60/60 each); N6/N7, cancelling or releasing an accepted session after its
+  listener was cancelled is safe (40/40 each); N8, an accepted session's cancellation handler never
+  fires inside the window and does fire on peer death (40/40).
+
+  **Re-run these rows; do not trust them.** One has already changed answer under an OS update
+  (`XPCSession(machService:)` to an absent name now throws from `activate()`), and the harness lives
+  in Task 7's report §13.5 because the scratchpad is not durable.
+
   One rule explains all four disposal rows: **libxpc still holds a reference for the duration of the
   accept window**, so a release inside it is never the last one — measured, the session does not dealloc
   until the closure returns. That is why the two "release" rows are safe. The trap in row 1 is not
