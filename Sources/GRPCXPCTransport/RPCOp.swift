@@ -123,11 +123,13 @@ enum WireDecodeItem: Sendable {
     /// dropped.** Both outcomes go through the same removal path a state-machine grammar violation
     /// already uses, and that path already no-ops when there is nothing to remove -- so "does this
     /// id have a table entry" is the only thing that decides which happens, not the kind that
-    /// failed. An id with no entry is either a rejected `.streamOpenFailure` for some *other* op in
-    /// the same blob (that kind is handled separately -- see below) or a forgery: a peer-chosen id
-    /// that was never legitimately opened. The core cannot tell those apart, and answering either
-    /// one hands the peer a 1:1 amplification lever for the price of a single small malformed op,
-    /// so both stay silent. An id *with* an entry is failed and removed exactly like a grammar
+    /// failed. An id with no entry is one of three things: a rejected `.streamOpenFailure` for
+    /// some *other* op in the same blob (that kind is handled separately -- see below), the
+    /// entirely ordinary race where a legitimate stream was just retired while this op was in
+    /// flight, or a forgery -- a peer-chosen id that was never legitimately opened. The core cannot
+    /// tell any of those apart, and answering would hand the peer a 1:1 amplification lever for
+    /// the price of a single small malformed op regardless of which one it actually was, so all
+    /// three stay silent. An id *with* an entry is failed and removed exactly like a grammar
     /// violation; any later op addressed to it then hits the ordinary unknown-stream drop, because
     /// the core has already removed it.
     case streamFailure(RPCStreamID, RPCError)
@@ -142,8 +144,13 @@ enum WireDecodeItem: Sendable {
     /// malformed `-bin` value): echoing it turns a ~12-byte malformed `openStream` into hundreds of
     /// bytes out, repeatable forever at zero state cost, since rejecting it never creates a table
     /// entry to bound the peer's attempts by (contrast `resourceExhausted`, reachable only after
-    /// the peer has paid for a full complement of admitted streams). The decode error itself is not
-    /// discarded -- it is still the `RPCError` carried here -- it just never reaches the wire.
+    /// the peer has paid for a full complement of admitted streams). **The `RPCError` this case
+    /// carries is not consulted by the core at all today** -- there is no table entry, no
+    /// continuation and no diagnostic-logging facility here for it to reach, so `refuseOpen(_:
+    /// dueTo:)` reads only `id` and discards `error` after choosing the fixed literal. It stays in
+    /// the case's payload anyway, matching `.streamFailure`'s shape, so a future diagnostic hook
+    /// (local logging, a metrics counter keyed on rejection reason) has something to read without
+    /// this type needing to change again to grow one.
     case streamOpenFailure(RPCStreamID, RPCError)
 }
 

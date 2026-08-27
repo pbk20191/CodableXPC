@@ -112,10 +112,10 @@ import Synchronization
 // * **An accept is refused, never trapped.** A stream id of 0, an even id, a draining connection
 //   or too many concurrent streams all produce a `status` or `cancel` op for that id and no table
 //   entry -- and so, separately, does a malformed `openStream` **body** (the bullet above,
-//   `refuseOpen(_:dueTo:)`), which mirrors this function's own role-then-id-legality gate order
+//   `refuseOpen(_:dueTo:)`), which mirrors `openInbound`'s own role-then-id-legality gate order
 //   for exactly the checks it can still make without a successfully-decoded `method`. A malformed
-//   method **path**, specifically, is caught earlier still, in the codec, and never reaches this
-//   function's own `methodDescriptor(from:)` guard: that guard re-validates the same shape
+//   method **path**, specifically, is caught earlier still, in the codec, and never reaches
+//   `openInbound`'s own `methodDescriptor(from:)` guard: that guard re-validates the same shape
 //   `GRPCWireHeaders.parseRequest` (via `validateMethodPath`) already enforced upstream, byte for
 //   byte, so nothing that reaches it can still fail it. It is unreachable by construction and
 //   stays only as defense in depth, not as the thing that rejects a malformed path today.
@@ -700,16 +700,25 @@ final class RPCTransportCore: Sendable {
     /// description can embed a peer-supplied field verbatim (and, through a decoder's `cause`
     /// chain, more than one), up to the 16 MiB body cap. Mirrors ``cancelStream(_:reason:)``'s own
     /// truncation of its local error, for the same reason -- the two should read the same rather
-    /// than diverge on this. The original error's `code` is preserved where available (an `RPCError`
-    /// today; always is, in practice) rather than flattened to one code, since a decoder's grammar
-    /// violation and a codec's body rejection do not necessarily share one.
+    /// than diverge on this, and applies to **both** of this function's callers, including the
+    /// pre-existing state-machine-violation path, not only the codec one added alongside it.
+    ///
+    /// The rebuilt local error preserves the original error's `code` where available (an
+    /// `RPCError` today; always is, in practice) but **not** its `cause` chain: `RPCError`'s own
+    /// `description` folds `cause` into the very string this truncates
+    /// (`"\(code): \"\(message)\" (cause: \"\(cause)\")"`), so re-wrapping it necessarily flattens a
+    /// decoder's live `cause` to text -- an application inspecting `(error as? RPCError)?.cause`
+    /// on the *local* error this function hands it now always sees `nil`, where before this
+    /// truncation existed it saw the decoder's original cause. Sourced from `error`'s own
+    /// `message`, not its full `"\(error)"` description, specifically so the rebuilt `RPCError`
+    /// does not end up stating its own `code` twice (`description` already prepends it).
     private func failStream(_ id: RPCStreamID, dueTo error: any Error) {
-        let reason = "\(error)"
+        let localMessage = (error as? RPCError)?.message ?? "\(error)"
         let code = (error as? RPCError)?.code ?? .internalError
         removeStream(
             id,
-            failingInboundWith: RPCError(code: code, message: Self.truncatedForWire(reason)),
-            sendingCancel: reason)
+            failingInboundWith: RPCError(code: code, message: Self.truncatedForWire(localMessage)),
+            sendingCancel: "\(error)")
     }
 
     /// Feeds one stream-scoped op to its machine and delivers whatever parts come out.
@@ -1293,8 +1302,11 @@ final class RPCTransportCore: Sendable {
     /// **There is exactly one truncation point for the wire**, in
     /// ``removeStream(_:failingInboundWith:sendingCancel:)``, so callers pass their full text and
     /// do not pre-truncate: stacking two calls would clip the first call's own marker. The other
-    /// two uses are the accept refusal's `status` message and ``cancelStream(_:reason:)``'s *local*
-    /// error text, neither of which passes through that point.
+    /// uses are all *local*, none of which passes through that point: the accept refusal's
+    /// `status` message, ``cancelStream(_:reason:)``'s local error text, and
+    /// ``failStream(_:dueTo:)``'s local error text (added when `.streamFailure` gave that function
+    /// a second caller -- when you add a fourth use, update this count, not just the code; this
+    /// sentence has already gone stale once).
     static func truncatedForWire(_ text: String) -> String {
         let head = text.utf8.prefix(maxWireReasonLength)
         guard head.endIndex != text.utf8.endIndex else { return text }

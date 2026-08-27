@@ -79,6 +79,20 @@ struct CompactWireCodec: WireCodec {
     /// skip-and-continue rather than stop-at-first-failure or a separate failures array, and for
     /// why `openStream` gets its own `.streamOpenFailure` case instead of sharing `.streamFailure`.
     ///
+    /// **What crosses this seam is not `kind`, it is blast radius.** Three outcomes, one per
+    /// rejection: `throw` means connection (the header-level guards below, and `goAway`'s
+    /// carve-out); `.streamOpenFailure` means answer (`openStream` only -- see
+    /// `WireDecodeItem.streamOpenFailure`'s doc); `.streamFailure` means fail-or-drop (every other
+    /// kind, decided by whether the id has a table entry, at the core, not here). That vocabulary
+    /// is deliberately encoding-independent -- `WireDecodeItem` says nothing about `kind` at all --
+    /// so the core still owns *how* each radius actually executes (which op to send, whether a
+    /// table entry exists) while this switch owns only *which radius applies*. Moving that
+    /// decision to the core instead would mean exporting `Kind`, a type this codec should be free
+    /// to redefine, or keeping a second enum in the core in sync with this one by hand -- the
+    /// classic two-places-that-must-agree-forever shape this codebase avoids elsewhere (see
+    /// `FlowControl.charge(for:)`'s "one definition" argument for the same principle applied to a
+    /// different pair of call sites).
+    ///
     /// **`goAway` is the one kind whose body failure still `throw`s**, and deliberately so:
     /// `goAway` is already a connection-scoped signal (§O1: "no new streams above `lastStreamID`"),
     /// not a per-stream one, and this codec writes its header's `streamID` as 0 on encode --
@@ -140,6 +154,13 @@ struct CompactWireCodec: WireCodec {
             do {
                 items.append(.op(try Self.decodeOne(kind: kind, streamID: streamID, body: body)))
             } catch let error as RPCError {
+                // This switch is the policy seam: it assigns one of the three blast radii a body
+                // rejection can have. Spelled out case by case, deliberately not `default:` --
+                // §O3 anticipates the encoding growing new kinds, and a `default:` here would let
+                // a ninth `Kind` silently inherit "fail that stream" with no compiler prompt at
+                // exactly the place this decision has to be made. `message` never actually throws
+                // (its body is taken verbatim), but it is listed anyway so this stays exhaustive
+                // by construction rather than by the switch happening not to notice.
                 switch kind {
                 case .goAway:
                     // See this method's doc: goAway has no stream to fail, so its body rejection
@@ -150,7 +171,7 @@ struct CompactWireCodec: WireCodec {
                     // so a rejection must be answered on the wire, not silently dropped like every
                     // other kind's -- see `WireDecodeItem.streamOpenFailure`'s doc.
                     items.append(.streamOpenFailure(streamID, error))
-                default:
+                case .metadata, .message, .halfClose, .status, .cancel, .credit:
                     items.append(.streamFailure(streamID, error))
                 }
             } catch {
