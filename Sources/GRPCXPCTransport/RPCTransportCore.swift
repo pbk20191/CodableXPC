@@ -1570,9 +1570,17 @@ final class RPCTransportCore: Sendable {
     /// would leak an un-cancelled source).
     ///
     /// Firing sends `cancel` rather than a `status(deadlineExceeded)` even on the server side:
-    /// §O5.3 makes `cancel` the abort op in both directions, and the client's own timer -- exact,
-    /// where the wire deadline is rounded *up* by `GRPCWireHeaders` -- normally fires first and is
-    /// what surfaces `.deadlineExceeded` to the caller.
+    /// §O5.3 makes `cancel` the abort op in both directions.
+    ///
+    /// **Which end's timer fires first, corrected by measurement (Task 8b §4.2).** This comment
+    /// used to claim the client's own timer "normally fires first" because the wire deadline is
+    /// rounded *up* by `GRPCWireHeaders`. That is right about what the **caller** sees -- the
+    /// client's timer is what surfaces `.deadlineExceeded` to it -- and wrong about the **peer**:
+    /// both ends arm a timer for the same RPC, and the server's won the race **20 times out of
+    /// 20**. Rounding up bounds the server's *deadline*, not the moment its handler is torn down,
+    /// and the server has no client-side scheduling to wait for. So a server handler observes its
+    /// stream failing on its own timer, not on the client's `cancel` op arriving. Neither is a
+    /// defect; both ends independently stop working on a doomed RPC, which is the point.
     private func installDeadline(_ timeout: Duration, forStream id: RPCStreamID) {
         let timer = DispatchSource.makeTimerSource(queue: pipe.queue)
         timer.schedule(deadline: .now() + Self.dispatchInterval(for: timeout))
@@ -1605,6 +1613,12 @@ final class RPCTransportCore: Sendable {
     /// `Int.max` nanoseconds (~292 years) clamps to "effectively never", which is the right
     /// reading of an absurd deadline; a negative one clamps to zero and fires immediately, which
     /// is the right reading of an already-expired one.
+    ///
+    /// "Effectively never" was an assumption about Dispatch and is now measured (Task 8b §5.3):
+    /// `DispatchTime.now() + .nanoseconds(Int.max)` **does** saturate rather than wrap, so the
+    /// clamped timer really does not fire, and it does not fire *immediately* either -- which is
+    /// what a wrap would have produced, and would have been the worst possible reading of an
+    /// absurd deadline.
     private static func dispatchInterval(for duration: Duration) -> DispatchTimeInterval {
         let components = duration.components
         let (seconds, secondsOverflowed) = components.seconds.multipliedReportingOverflow(

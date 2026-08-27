@@ -13,22 +13,37 @@ import XCTest
 /// **Case 37**, and the only test in this slice whose failure mode is a process death rather than a
 /// failed assertion.
 ///
-/// `XPCServerTransport.Acceptor.accept(_:)` decides, builds, publishes and returns -- in that order
-/// -- and takes its lock twice. A `beginGracefulShutdown()` landing *between* the two locks takes
-/// the `!admitted` arm, whose comment reads:
+/// # This test found a Critical, and the Critical is fixed -- so it runs
+///
+/// It was committed behind an `XCTSkip` because its failure mode kills the whole test process. The
+/// history below is kept verbatim, because the *reasoning* that let three reviews clear the defect
+/// is the part worth not repeating.
+///
+/// `Acceptor.accept(_:)` used to decide, build, publish and return with its lock taken **twice**. A
+/// `beginGracefulShutdown()` landing between the two locks took an `!admitted` arm whose comment
+/// read:
 ///
 /// > The connection is kept (releasing it here would cancel a session whose accept window is still
 /// > open) and put straight into a drain instead: `beginDraining` sends `goAway` and finishes the
 /// > core's own accept sequence, but never cancels the pipe, so it is safe in this window.
 ///
-/// That was argued from reading `beginDraining()` and had never been measured. **It is wrong.**
+/// Both clauses were true and the conclusion did not follow. `beginDraining()` **sends** --
+/// `sendControl([.goAway(lastStreamID:)])` -- and `xpc_session_send_message` on an accepted session
+/// whose accept `Decision` has not yet been returned to libxpc is `_xpc_api_misuse`. The process
+/// dies. Nothing anywhere had established that *sending* in that window is illegal; the disposal
+/// matrix enumerated which **disposals** trap, and everyone inferred that a non-disposal must
+/// therefore be fine.
 ///
-/// # ⚠️ This test found a Critical production defect and is SKIPPED until it is fixed
-///
-/// The argument checks that `beginDraining()` does not *cancel* the pipe. It does not, and that is
-/// beside the point: `beginDraining()` **sends** -- `sendControl([.goAway(lastStreamID:)])` -- and
-/// `xpc_session_send_message` on an accepted session whose accept `Decision` has not yet been
-/// returned to libxpc is `_xpc_api_misuse`. The process dies.
+/// **The fix, and why it is not just a moved call.** Measuring the alternatives showed that the
+/// window is worse than anyone had assumed: a send or a cancel hopped onto the connection's own
+/// queue from inside the accept closure traps (matrix rows A7/A10), and so does one performed by
+/// another thread the instant the closure *returns* (A8/A9). **No instant the caller can name is
+/// safe.** So `accept` now does the admission check, the build, the publish and the yield in **one**
+/// critical section -- which deletes the `!admitted` state rather than relocating its work -- and
+/// any connection whose accept window is not yet *provably* closed is held untouched in a separate
+/// `pending` table that no teardown path may act on. The proof is the first message libxpc delivers
+/// on the session (rows A11/A12, 200 runs each, no trap), surfaced as
+/// `XPCPipe.onFirstDelivery(_:)`.
 ///
 /// Measured, from the crash report of this very test (`EXC_BREAKPOINT` / `SIGTRAP`, exit 133):
 ///
@@ -46,29 +61,15 @@ import XCTest
 /// ```
 ///
 /// Isolated from the transport entirely, as a platform fact, by row **A5** of the out-of-process
-/// disposal matrix (`scratchpad/matrix/XPCSessionDisposalMatrix.swift`): sending inside the
-/// incoming-session closure exits 133, and sending immediately *after* the `Decision` (row A6) is
-/// safe. `XPCPipe`'s disposal matrix documents that *cancelling* in that window is illegal;
-/// **nothing anywhere said that sending is**, which is why three reviews did not catch it.
+/// disposal matrix: sending inside the incoming-session closure exits 133, and sending immediately
+/// *after* the `Decision` (row A6) is safe. `XPCPipe`'s disposal matrix documented that
+/// *cancelling* in that window is illegal; **nothing anywhere said that sending is**, which is why
+/// three reviews did not catch it.
 ///
-/// The brief's instruction is explicit -- do not change production code to make a test pass -- so
-/// the test is written, run, and left in place behind an `XCTSkip` that names the defect. It cannot
-/// simply be committed as-is: its failure mode kills the whole test process, which would take the
-/// other 570 tests with it. **Delete the `XCTSkip` when the fix lands**; the reproduction rate
-/// measured here is 1 in ~5–15 attempts of the sweep, i.e. it fails within a second.
+/// The reproduction rate measured here was 1 in ~5–15 attempts of the sweep -- it failed within a
+/// second -- which is what makes this suite running clean meaningful rather than merely quiet.
 @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
 final class AcceptRaceTests: XCTestCase {
-
-    /// Why this suite does not run. See the type's doc comment for the crash trace.
-    private static let skipReason = """
-        BLOCKED on a Critical production defect this test found: \
-        XPCServerTransport.Acceptor.accept's `!admitted` arm calls core.beginDraining(), which \
-        SENDS a goAway op on an accepted XPCSession before the accept Decision has been returned \
-        to libxpc. That is _xpc_api_misuse and the process dies (EXC_BREAKPOINT, exit 133), so \
-        running this would take the whole test process with it. The platform fact is pinned \
-        out-of-process by row A5 of the disposal matrix. Remove this skip when the arm no longer \
-        sends inside the accept window.
-        """
 
     /// Races run: one fresh listener, one fresh dial and one fresh drain each.
     private static let attempts = 80
@@ -118,14 +119,6 @@ final class AcceptRaceTests: XCTestCase {
     ///   would pass while racing nothing at all, which is precisely the kind of test this project
     ///   does not want.
     func testASessionAdmittedAsDrainingBeginsIsDrainedNotDropped() throws {
-        throw XCTSkip(Self.skipReason)
-    }
-
-    /// The body of the test above, kept intact and callable so that the fix can be verified by
-    /// deleting four lines rather than reconstructing a race from a report.
-    ///
-    /// Renamed off the `test` prefix rather than commented out: it still compiles, so it cannot rot.
-    func runTheAcceptDrainRace() throws {
         let served = Observed(0)
         let drainingRefusals = Observed(0)
         let refused = Observed(0)

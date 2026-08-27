@@ -132,6 +132,16 @@ import XPC
 // meet it. To refuse a peer, use ``XPCPipe/rejecting(_:reason:)`` -- it never creates a session, so
 // there is nothing to dispose of and the span does not exist.
 //
+// **And the span is worse than "you must not drop the pipe in it": you must not touch the session
+// in it at all.** Measured after a process death in the server transport (Task 7 round 4):
+// a `send` inside the accept closure traps (row A5), and so does a `send` or a `cancel` performed
+// the instant the closure *returns* (A8, A9) or hopped onto the connection's own queue from inside
+// it (A7, A10). The window outlives the closure, and no instant the caller can name is safe. The
+// one moment that is -- 200 runs of each, no trap -- is the **first message libxpc delivers**
+// (A11, A12), because libxpc cannot deliver on a session whose accept it has not finished. That is
+// what ``XPCPipe/onFirstDelivery(_:)`` exists for, and it is the only sound place for an owner to
+// do anything to a freshly accepted session.
+//
 // # Timers
 //
 // There are none (L12). This file starts no timer, arms no `DispatchSourceTimer`, and schedules
@@ -164,10 +174,14 @@ private final class Delivery: Sendable {
     private struct Handlers: Sendable {
         var onReceive: (@Sendable (GRPCSwiftData) -> Void)?
         var onPeerDeath: (@Sendable () -> Void)?
+        /// Fires at most once, from the **first** message libxpc delivers on this session, whatever
+        /// its shape. Taken out of the slot by whoever fires it, so it cannot fire twice.
+        var onFirstDelivery: (@Sendable () -> Void)?
         /// Set-once bookkeeping that survives ``shutDown()`` clearing the closures, so a handler
         /// registered after teardown is refused rather than silently installed on a dead pipe.
         var receiveInstalled = false
         var peerDeathInstalled = false
+        var firstDeliveryInstalled = false
         var isShutDown = false
     }
     private let handlers = Mutex(Handlers())
@@ -196,6 +210,35 @@ private final class Delivery: Sendable {
         }
     }
 
+    func setFirstDeliveryHandler(_ handler: @escaping @Sendable () -> Void) {
+        handlers.withLock {
+            guard !$0.isShutDown else { return }
+            precondition(
+                !$0.firstDeliveryInstalled, "XPCPipe.onFirstDelivery may only be set once")
+            $0.firstDeliveryInstalled = true
+            $0.onFirstDelivery = handler
+        }
+    }
+
+    /// Takes the first-delivery handler, if it has not already been taken, and fires it on
+    /// ``queue``.
+    ///
+    /// Called for **every** inbound message, before the `{"b": xpc_data}` shape check, because the
+    /// fact it reports is about libxpc rather than about this transport's wire format: a peer whose
+    /// first message is malformed has still proved that its session finished being accepted.
+    ///
+    /// The hop is enqueued *before* the blob's own hop, so an owner learns the window is closed
+    /// before the first op reaches it.
+    private func noteFirstDelivery() {
+        let handler = handlers.withLock { handlers -> (@Sendable () -> Void)? in
+            let taken = handlers.onFirstDelivery
+            handlers.onFirstDelivery = nil
+            return taken
+        }
+        guard let handler else { return }
+        queue.async { handler() }
+    }
+
     /// Called from libxpc's incoming-message callback, on whatever queue libxpc chose.
     ///
     /// The blob is decoded *here*, synchronously on the callback, and only the resulting
@@ -208,6 +251,8 @@ private final class Delivery: Sendable {
     /// order they arrived, which is the order the peer sent them. This is the whole of the
     /// ordering promise; there is no re-sequencing step because there is nothing to re-sequence.
     func deliver(_ message: XPCDictionary) {
+        // Before the shape check: any message at all is the proof (see ``noteFirstDelivery()``).
+        noteFirstDelivery()
         guard let blob = Self.blob(in: message) else {
             // Not a `{"b": xpc_data}` message at all: there is no blob to decode and no stream to
             // fail (this layer does not know what a stream is). Dropped. A peer sending malformed
@@ -247,6 +292,10 @@ private final class Delivery: Sendable {
             $0.isShutDown = true
             $0.onReceive = nil
             $0.onPeerDeath = nil
+            // A pipe torn down before its peer ever spoke will never prove its window closed. The
+            // handler is dropped rather than fired: firing it would report a fact that is not in
+            // evidence, and its whole purpose is to be trustworthy.
+            $0.onFirstDelivery = nil
         }
     }
 
@@ -471,6 +520,46 @@ final class XPCPipe: MessagePipe {
     /// - Important: the same no-strong-capture rule as ``onReceive(_:)``.
     func onPeerDeath(_ handler: @escaping @Sendable () -> Void) {
         delivery.setPeerDeathHandler(handler)
+    }
+
+    /// Fires once, on `queue`, when libxpc delivers the **first** message on this session --
+    /// whatever its shape, and before that message reaches ``onReceive(_:)``.
+    ///
+    /// # What it is for: this is the earliest moment an accepted session's accept window is *provably* closed
+    ///
+    /// The span documented at the top of this file -- between ``acceptWindowClosed()`` (which fires
+    /// when `building` returns) and the Decision actually reaching libxpc -- cannot be closed by
+    /// this file, and it turns out it cannot be closed by the caller either. Measured, in the
+    /// out-of-process matrix (Task 7 round 4, rows A7–A10):
+    ///
+    /// * a `send` **or** a `cancel` enqueued on this pipe's own queue from inside the accept
+    ///   closure traps (A7, A10: `_xpc_api_misuse`, ~1 in 100 runs) -- so "hop onto the connection
+    ///   queue" is not a fix;
+    /// * a `send` **or** a `cancel` performed by another thread the instant the accept closure
+    ///   *returns* also traps (A8, A9, same rate) -- so **the window outlives the closure**, and no
+    ///   moment the caller can name from inside it is safe.
+    ///
+    /// What *is* safe, 200 runs of each with no trap, is acting from the first delivery (A11, A12):
+    /// libxpc cannot deliver on a session whose accept it has not finished, so **a message having
+    /// arrived is a proof, not an inference.** And the proof always arrives, because the peer's
+    /// first blob is what made libxpc run the incoming-session closure in the first place and is
+    /// then redelivered like any other (Task 5 §2.1).
+    ///
+    /// So an owner that must send to, cancel, or otherwise touch an accepted session it has just
+    /// built should defer that work to this handler rather than doing it in `building` or after
+    /// `accepting` returns. `XPCServerTransport.Acceptor` does exactly that.
+    ///
+    /// - Note: registering from inside `building` cannot miss the triggering message. `building`
+    ///   runs inside `accepting`'s `queue.sync`, and every delivery is a `queue.async` onto that
+    ///   same serial queue, so the first delivery is necessarily *enqueued behind* the block that
+    ///   installs this handler.
+    /// - Note: never fires if the pipe is cancelled before its peer speaks, and never fires for a
+    ///   dialled pipe that receives nothing. "Not yet proven" is the safe reading in both cases.
+    /// - Important: the same no-strong-capture rule as ``onReceive(_:)``. This handler is held by
+    ///   `Delivery`, i.e. by libxpc's end of the retain path, so capturing the pipe or its owner
+    ///   strongly leaks the session exactly as it does there.
+    func onFirstDelivery(_ handler: @escaping @Sendable () -> Void) {
+        delivery.setFirstDeliveryHandler(handler)
     }
 
     /// Tears the pipe down from this side. Idempotent (L7: double shutdown is safe).

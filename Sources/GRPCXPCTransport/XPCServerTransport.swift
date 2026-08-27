@@ -64,16 +64,69 @@ public final class XPCServerTransport: ServerTransport {
     /// reader may expect to find and will not.
     private final class Acceptor: Sendable {
 
+        /// A connection whose accept window is **not yet provably closed**: libxpc has admitted
+        /// the session, but has not yet delivered anything on it, so nothing may be sent to it,
+        /// cancelled on it, or -- as always -- dropped.
+        ///
+        /// It is held here, strongly and untouched, until ``peerMadeFirstContact(_:)`` promotes it.
+        private struct Pending {
+            let core: RPCTransportCore
+            /// The strongest teardown that arrived while the window was open. Applied by
+            /// ``peerMadeFirstContact(_:)`` the moment acting is legal.
+            var deferred: DeferredTeardown = .none
+        }
+
+        /// What a teardown that arrived too early owes a ``Pending`` connection, ordered by force.
+        ///
+        /// `failAll(_:)` maps to `.close` rather than to a case of its own, and that collapse is
+        /// exact rather than a shortcut: a pending connection has provably had **no op routed to
+        /// it** (an op requires a delivery, and a delivery is what promotes it), so it has no
+        /// streams, and `failAll`'s entire effect on a stream-less core is to mark it closed. The
+        /// only remaining difference is the `pipe.cancel()` that `close()` adds -- and `failAll` is
+        /// only ever called from `listen()`'s `onCancel`, which is followed immediately by
+        /// `closeAll()`. So `.close` is where it lands anyway, one step sooner.
+        private enum DeferredTeardown: Int, Sendable {
+            case none = 0
+            case drain = 1
+            case close = 2
+
+            mutating func escalate(to other: DeferredTeardown) {
+                if other.rawValue > rawValue { self = other }
+            }
+        }
+
         private struct State {
+            /// Raises the recorded teardown of one still-untouchable connection, if it is still
+            /// untouchable. A key that has already been promoted is not here, and its connection is
+            /// in ``connections`` where the caller acts on it directly.
+            mutating func escalatePending(_ key: ObjectIdentifier, to teardown: DeferredTeardown) {
+                guard var entry = pending[key] else { return }
+                entry.deferred.escalate(to: teardown)
+                pending[key] = entry
+            }
+
+            /// The same, for every untouchable connection at once -- what the three sweepers do.
+            mutating func escalateEveryPending(to teardown: DeferredTeardown) {
+                for key in pending.keys { escalatePending(key, to: teardown) }
+            }
+
             /// Whether new *sessions* are admitted. Cleared by the first drain and never set
             /// again; a refused session is turned away with ``XPCPipe/rejecting(_:reason:)``,
             /// which creates no session at all and so cannot trip any accept-window hazard.
             var admitting = true
-            /// Every connection this acceptor has admitted and not yet retired, keyed by identity.
-            /// **Strong, and that is the point:** the core returned by `XPCPipe.accepting` is the
-            /// only strong reference to its pipe, and dropping it between `building` returning and
-            /// the `Decision` reaching libxpc kills the process (Task 5 §2.4). Publishing into
-            /// this dictionary *before* returning the decision is what makes that impossible.
+
+            /// Admitted, published for ownership, **and untouchable** -- see ``Pending``. Keyed by
+            /// core identity. Entries leave only through ``peerMadeFirstContact(_:)``.
+            var pending: [ObjectIdentifier: Pending] = [:]
+
+            /// Connections whose accept window is provably closed, and which every teardown path
+            /// may therefore act on. Keyed by core identity.
+            ///
+            /// **Strong, and that is the point** for both tables: the core returned by
+            /// `XPCPipe.accepting` is the only strong reference to its pipe, and dropping it while
+            /// the accept window is open runs `deinit`, which cancels the session and kills the
+            /// process (matrix row A1). Publishing into a table *before* returning the decision is
+            /// what makes that impossible.
             var connections: [ObjectIdentifier: RPCTransportCore] = [:]
         }
         private let state = Mutex(State())
@@ -89,87 +142,155 @@ public final class XPCServerTransport: ServerTransport {
 
         /// The listener's incoming-session closure, minus the `import XPC` ceremony.
         ///
-        /// The order of the four steps is the whole of L5 on this side and must not be rearranged:
-        /// decide, build (which installs nothing -- the core does that itself), **publish**, return
-        /// the decision.
+        /// # Everything happens in one critical section, and that is the fix
+        ///
+        /// The admission check, the build, the publish and the yield are all inside a single
+        /// `state.withLock`. That is not tidiness; it deletes a state that used to exist and used
+        /// to kill the process. Previously the check and the publish were two locks, so a
+        /// `beginGracefulShutdown()` could land between them and leave this function holding an
+        /// admitted connection the server had just decided not to serve -- and the arm that handled
+        /// it called `core.beginDraining()`, which **sends** `goAway` on a session whose accept
+        /// `Decision` had not yet been returned. libxpc traps on that (row A5): `_xpc_api_misuse`,
+        /// exit 133, reproduced from a crash report.
+        ///
+        /// With one critical section a concurrent drain either **wins** -- `admitting` is already
+        /// false, and the peer is refused with ``XPCPipe/rejecting(_:reason:)``, which creates no
+        /// session at all -- or **loses**, and the connection is admitted and published like any
+        /// other. There is no third state, so there is nothing to do inside the accept window, and
+        /// this function does nothing to the session beyond building it.
+        ///
+        /// Holding the lock across `XPCPipe.accepting` (which itself blocks on the new connection
+        /// queue via `queue.sync`) cannot deadlock: the only thing on that queue that takes this
+        /// lock is ``peerMadeFirstContact(_:)``, which runs from a delivery -- a `queue.async`
+        /// necessarily enqueued *behind* `accepting`'s `queue.sync` block. That same ordering is
+        /// load-bearing a second time: it is why the promotion cannot race the publish, because it
+        /// cannot even start until this lock is released.
         func accept(
             _ request: XPCListener.IncomingSessionRequest
         ) -> XPCListener.IncomingSessionRequest.Decision {
-            // One queue per connection, distinct from the listener's own: `XPCPipe.accepting`
-            // blocks on the queue it is handed (`queue.sync`) and trips
-            // `dispatchPrecondition(.notOnQueue(queue))` if it is the listener's. The label comes
-            // from a process-wide counter so that several transports in one process do not all
-            // name their queues alike in a crash log.
-            let queue: DispatchSerialQueue? = state.withLock { state in
-                guard state.admitting else { return nil }
-                return DispatchSerialQueue(
+            // Carried out of the lock in a local rather than returned from it: `withLock`'s result
+            // is `sending`, and `IncomingSessionRequest.Decision` is not `Sendable`. The closure is
+            // not `@Sendable` either, so writing the local from inside it is exactly as safe as
+            // the lock makes everything else here.
+            var outcome: (decision: XPCListener.IncomingSessionRequest.Decision, pipe: XPCPipe)?
+            state.withLock { state in
+                guard state.admitting else { return }
+
+                // One queue per connection, distinct from the listener's own: `XPCPipe.accepting`
+                // blocks on the queue it is handed (`queue.sync`) and trips
+                // `dispatchPrecondition(.notOnQueue(queue))` if it is the listener's. The label
+                // comes from a process-wide counter so that several transports in one process do
+                // not all name their queues alike in a crash log.
+                let queue = DispatchSerialQueue(
                     label: ConnectionQueueLabel.mint(role: "server", peer: "accepted"))
+
+                // `building` runs synchronously, before the decision goes back to libxpc and
+                // before any blob can be dispatched. Do NOT install `onReceive`/`onPeerDeath`
+                // here: `RPCTransportCore.init` installs both itself, weakly, and a second call
+                // replaces the core's and silently disconnects the mux.
+                var built: RPCTransportCore?
+                let (decision, pipe) = XPCPipe.accepting(request, queue: queue) { pipe in
+                    let core = RPCTransportCore(
+                        pipe: pipe, codec: CompactWireCodec(), role: .server)
+                    built = core
+
+                    // The window-closed hook, registered here because here is the only place it
+                    // cannot miss the peer's triggering message (see `onFirstDelivery`'s doc).
+                    //
+                    // It captures an `ObjectIdentifier` -- a *value* -- rather than the core, so
+                    // there is no `core -> pipe -> Delivery -> handler -> core` self-cycle to get
+                    // wrong, and `[weak self]` on the acceptor is mandatory for the same reason
+                    // the mux's own handlers are weak: this closure is held at libxpc's end of the
+                    // retain path, so a strong acceptor would make its `deinit` unreachable and
+                    // leak every session it owns.
+                    let key = ObjectIdentifier(core)
+                    pipe.onFirstDelivery { [weak self] in self?.peerMadeFirstContact(key) }
+                }
+                guard let core = built else {
+                    // Unreachable: `accepting` calls `building` synchronously. A trap rather than
+                    // a thrown error or an early return, because the alternative is releasing
+                    // `pipe` inside the accept window -- which is a process death anyway, with a
+                    // worse diagnostic.
+                    preconditionFailure("XPCPipe.accepting did not run its `building` closure")
+                }
+
+                // Published BEFORE the decision is returned, and never dropped in that window.
+                // `pending`, not `connections`: until libxpc delivers on this session nobody may
+                // touch it, and being in `pending` is exactly what "do not touch" means here.
+                state.pending[ObjectIdentifier(core)] = Pending(core: core)
+
+                // Yielded here, inside the lock, so that `admitting` and the yield are decided
+                // together -- `beginDraining()` clears `admitting` and finishes this sequence
+                // under this same lock, so hoisting the yield out would reintroduce a
+                // yield-after-`finish()` race. Safe as written for a narrow, checkable reason:
+                // `yield` enqueues (task resumption never runs the consumer inline), and nothing
+                // the resumed consumer does re-enters this lock except `retire(_:)`, from a
+                // `listen()` child task on another thread.
+                //
+                // `yield`'s result needs no handling: the sequence can only have finished if
+                // `admitting` was already false, and the guard above returned in that case.
+                self.continuation.yield(core)
+                outcome = (decision, pipe)
             }
-            guard let queue else {
+
+            guard let outcome else {
                 return XPCPipe.rejecting(
                     request,
                     reason: "this gRPC server is shutting down and is not accepting new "
                         + "connections")
             }
 
-            // `building` runs synchronously, before the decision goes back to libxpc and before
-            // any blob can be dispatched. Do NOT install `onReceive`/`onPeerDeath` here:
-            // `RPCTransportCore.init` installs both itself, weakly, and a second call replaces
-            // the core's and silently disconnects the mux.
-            var built: RPCTransportCore?
-            let (decision, pipe) = XPCPipe.accepting(request, queue: queue) { pipe in
-                built = RPCTransportCore(pipe: pipe, codec: CompactWireCodec(), role: .server)
-            }
-            guard let core = built else {
-                // Unreachable: `accepting` calls `building` synchronously. A trap rather than a
-                // thrown error or an early return, because the alternative is releasing `pipe`
-                // inside the accept window -- which is a process death anyway, with a worse
-                // diagnostic.
-                preconditionFailure("XPCPipe.accepting did not run its `building` closure")
-            }
-
-            // Published BEFORE the decision is returned, and never dropped in that window.
-            //
-            // **The `yield` is deliberately inside the lock**, which is the one place this file
-            // departs from L7's "resume continuations outside the lock" and from this type's own
-            // doc comment above. The pairing is load-bearing: `admitting` and the `yield` have to
-            // be decided together, because `beginDraining()` clears `admitting` and finishes the
-            // sequence under the same lock. Hoisting the `yield` out reintroduces a
-            // yield-after-`finish()` race -- the item is then dropped with nothing to retire the
-            // core, so `.terminated` would need handling exactly as the `!admitted` arm below does,
-            // i.e. the same code with an extra way to get it wrong. It is safe as written for a
-            // narrow, checkable reason: `AsyncStream.Continuation.yield` enqueues (task
-            // resumption never runs the consumer inline), and the only re-entry into this lock
-            // reachable *from the resumed consumer* is `retire(_:)`, from a `listen()` child task
-            // on a different thread. (`beginDraining`, `failAll` and `closeAll` take this lock
-            // too, but none of them is reachable from a yield; the resumed-consumer path is the
-            // only one the argument needs.)
-            //
-            // `yield`'s result is ignored deliberately: if the sequence has already finished,
-            // `admitting` is false too and the `!admitted` arm below is what handles it.
-            let admitted: Bool = state.withLock { state in
-                state.connections[ObjectIdentifier(core)] = core
-                guard state.admitting else { return false }
-                self.continuation.yield(core)
-                return true
-            }
-
-            if !admitted {
-                // A drain began between the two locks. The connection is kept (releasing it here
-                // would cancel a session whose accept window is still open) and put straight into
-                // a drain instead: `beginDraining` sends `goAway` and finishes the core's own
-                // accept sequence, but never cancels the pipe, so it is safe in this window. The
-                // core stays in `connections` and is closed by ``closeAll()`` or, failing that,
-                // released when this acceptor is.
-                core.beginDraining()
-            }
-
             // `core` is published and holds `pipe` strongly, so releasing this local reference
             // cannot be the last release -- which is the only thing that would be fatal here. The
             // `withExtendedLifetime` is not load-bearing; it is here so that the hazard is
             // documented at the line where a future edit would reintroduce it.
-            withExtendedLifetime(pipe) {}
-            return decision
+            withExtendedLifetime(outcome.pipe) {}
+            return outcome.decision
+        }
+
+        /// libxpc has delivered the first message on this connection's session, which is the
+        /// earliest **proof** that its accept window is closed (matrix rows A11/A12 -- see
+        /// ``XPCPipe/onFirstDelivery(_:)`` for why nothing earlier will do).
+        ///
+        /// Runs on that connection's own serial queue, ahead of the message it is proved by, so the
+        /// connection is eligible for teardown before its first op is routed.
+        ///
+        /// Promotes the entry and applies whatever teardown arrived while it was untouchable. A key
+        /// with no entry is an ordinary no-op: the connection has already been promoted, or closed
+        /// and forgotten.
+        private func peerMadeFirstContact(_ key: ObjectIdentifier) {
+            enum Action {
+                case none
+                case drain(RPCTransportCore)
+                case close(RPCTransportCore)
+            }
+
+            let action: Action = state.withLock { state in
+                guard let entry = state.pending.removeValue(forKey: key) else { return .none }
+                switch entry.deferred {
+                case .none:
+                    state.connections[key] = entry.core
+                    return .none
+                case .drain:
+                    // Still ours to hold: a drained connection is retired by `retire(_:)` or
+                    // `closeAll()` once its (now finished) accept loop unwinds.
+                    state.connections[key] = entry.core
+                    return .drain(entry.core)
+                case .close:
+                    // Dropped from both tables; the close below is the last thing owed to it.
+                    return .close(entry.core)
+                }
+            }
+
+            switch action {
+            case .none:
+                break
+            case .drain(let core):
+                core.beginDraining()
+                core.signalCancellationToAllStreams()
+            case .close(let core):
+                core.close()
+            }
         }
 
         /// Stops admitting new sessions, ends the connection sequence, and puts every live
@@ -178,9 +299,14 @@ public final class XPCServerTransport: ServerTransport {
         ///
         /// Nothing is failed and no handler is disturbed -- that is ``failAll(_:)``'s job.
         /// Idempotent.
+        ///
+        /// A connection still inside its accept window is **not** drained here -- the `goAway`
+        /// would be a send into that window, which is row A5, a process death. Its drain is
+        /// recorded and applied by ``peerMadeFirstContact(_:)``.
         func beginDraining() {
             let cores = state.withLock { state -> [RPCTransportCore] in
                 state.admitting = false
+                state.escalateEveryPending(to: .drain)
                 return Array(state.connections.values)
             }
             continuation.finish()  // idempotent; ends `listen`'s connection loop
@@ -193,9 +319,14 @@ public final class XPCServerTransport: ServerTransport {
         /// Forceful teardown of every connection, for a cancelled `listen()` task. Fails every
         /// live stream (which wakes every parked flow-control waiter) but leaves the sessions to
         /// ``closeAll()`` / `deinit`.
+        ///
+        /// A connection still inside its accept window has no streams to fail (an op requires a
+        /// delivery, and a delivery would have promoted it), so its recorded teardown is `.close`
+        /// -- see ``DeferredTeardown``.
         func failAll(_ error: any Error) {
             let cores = state.withLock { state -> [RPCTransportCore] in
                 state.admitting = false
+                state.escalateEveryPending(to: .close)
                 return Array(state.connections.values)
             }
             continuation.finish()
@@ -204,13 +335,16 @@ public final class XPCServerTransport: ServerTransport {
 
         /// Final teardown: forget every connection and release its XPC session.
         ///
-        /// A session admitted after the snapshot below (an `accept` racing this call) stays in
-        /// `connections` and is released when this acceptor is, by which time its accept window is
-        /// long closed. That is the safe direction: a late close is a delayed release, an early
-        /// one is a trap.
+        /// A connection still inside its accept window is again left alone -- `core.close()` reaches
+        /// `pipe.cancel()`, and cancelling in that window is row A1. Its close is recorded and
+        /// applied by ``peerMadeFirstContact(_:)``. If its peer never speaks at all, the entry stays
+        /// in `pending` and is released when this acceptor is, by which time the window is many
+        /// turns closed and the release-then-cancel is row A3. A late close is a delayed release;
+        /// an early one is a trap.
         func closeAll() {
             let cores = state.withLock { state -> [RPCTransportCore] in
                 state.admitting = false
+                state.escalateEveryPending(to: .close)
                 let taken = Array(state.connections.values)
                 state.connections.removeAll()
                 return taken
@@ -225,8 +359,18 @@ public final class XPCServerTransport: ServerTransport {
         /// Without this a long-lived server would accumulate one dead core (and one dead XPC
         /// session) per disconnected peer for as long as `listen()` runs, since `connections` is
         /// otherwise only emptied by ``closeAll()``.
+        /// A connection still inside its accept window records `.close` instead: `retire(_:)` is
+        /// reachable for one while `listen()`'s task is cancelled (the child task's `for await`
+        /// ends on cancellation rather than because the connection finished), and closing it here
+        /// would be a cancel in the window.
         func retire(_ core: RPCTransportCore) {
-            state.withLock { _ = $0.connections.removeValue(forKey: ObjectIdentifier(core)) }
+            let key = ObjectIdentifier(core)
+            let mayClose: Bool = state.withLock { state in
+                if state.connections.removeValue(forKey: key) != nil { return true }
+                state.escalatePending(key, to: .close)
+                return false
+            }
+            guard mayClose else { return }
             core.close()
         }
     }
@@ -437,10 +581,17 @@ public final class XPCServerTransport: ServerTransport {
         }
 
         state.withLock { $0 = .shutDown }
-        // Safe here and not before: the drain is over, so this can no longer tear down a
-        // connection someone is still using. Connections first, listener second -- see `deinit`.
+        // The drain is over, so closing the connections can no longer tear down one that someone
+        // is still using.
+        //
+        // **The listener is deliberately NOT cancelled here**, and that is a fix, not an omission.
+        // Cancelling it made a peer that dialled as the server drained vanish: its connection was
+        // never accepted and never refused, so its RPC waited forever -- measured, see the report's
+        // round 4 §2. A live listener whose acceptor has stopped admitting answers such a peer with
+        // ``XPCPipe/rejecting(_:reason:)``, which is a definite answer it can act on. The listener
+        // is cancelled by `deinit`, which is the point at which this transport is genuinely
+        // finished and no peer can be owed a reply.
         acceptor.closeAll()
-        listener.cancel()
     }
 
     /// One accepted stream, start to finish. Static, and taking `core` explicitly, so that the
@@ -538,7 +689,8 @@ public final class XPCServerTransport: ServerTransport {
         case .drainAndClose:
             acceptor.beginDraining()
             acceptor.closeAll()
-            listener.cancel()
+            // Not `listener.cancel()`, for the same reason as in `listen()`: a peer mid-dial must
+            // get a refusal rather than silence. `deinit` cancels it.
         }
     }
 }

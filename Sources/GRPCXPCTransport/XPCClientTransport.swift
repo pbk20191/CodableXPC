@@ -195,9 +195,18 @@ public final class XPCClientTransport: ClientTransport {
     /// Dials a launchd Mach service by name and returns a transport speaking to it.
     ///
     /// The session is live when this returns -- `XPCPipe`'s dial factory activates it -- so
-    /// `connect()` has no connecting work to do. A peer that is not there yet is not an error here:
-    /// libxpc will launch or wait for it, and a peer that never appears surfaces as peer death,
-    /// which fails every stream with `.unavailable`.
+    /// `connect()` has no connecting work to do.
+    ///
+    /// **This throws for a name that does not resolve**, which is a correction: it used to say a
+    /// missing peer "is not an error here" and would surface later as peer death. Measured in Task
+    /// 8b §6.1, and a change in the platform since Task 5 rather than a change here --
+    /// `XPCSession(machService:)` with a well-formed but nonexistent name now throws from
+    /// `activate()` ("Underlying connection was invalidated ... Bad file descriptor"), where it
+    /// used to activate successfully. A launchd job that exists but is not running still launches
+    /// on demand as before; it is a name with no job behind it that now fails early.
+    ///
+    /// A peer that dies later still surfaces as peer death, which fails every stream with
+    /// `.unavailable`.
     public static func connecting(toMachService name: String) throws -> XPCClientTransport {
         try dialling(.machService(name))
     }
