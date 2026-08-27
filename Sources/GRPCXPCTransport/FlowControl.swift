@@ -25,6 +25,27 @@ enum FlowControl {
     /// `SETTINGS_MAX_WINDOW_SIZE`; here it is the bound that keeps a peer's `UInt32` credit from
     /// growing a window without limit.
     static let maxWindow = Int(Int32.max)
+
+    /// §O4/§O5: what a `message` costs its stream and connection windows.
+    ///
+    /// Clamped to the window it must fit in -- an op body is atomic (§O2 has no chunking), so a
+    /// charge above the window could never be reserved and the sender would park forever with
+    /// nothing on the wire for the peer to consume. Both peers derive it from a payload length
+    /// both already know, so it needs no negotiation and no protocol change.
+    ///
+    /// **The send side and the receive side MUST call this same function.** Reserving with one
+    /// clamp and crediting with another -- or with a hand-inlined copy of the formula that later
+    /// drifts -- makes credit stop matching charge, and the window then grows or shrinks silently
+    /// until a stream stalls with no visible cause. That is the entire reason this is a function
+    /// and not a sentence in a doc comment.
+    ///
+    /// - Parameter window: the window this charge must fit in. Defaults to ``initialWindow``,
+    ///   which is what §O5 deviation 1 fixes production windows at; pass a `FlowControlWindow`'s
+    ///   own `initial` for any window sized differently, or the clamp stops matching the window
+    ///   and an oversize message parks forever.
+    static func charge(for payloadLength: Int, window: Int = initialWindow) -> Int {
+        min(payloadLength, window)
+    }
 }
 
 // ===========================================================================================
@@ -45,17 +66,16 @@ enum FlowControl {
 /// empty. A sender therefore loops:
 ///
 /// ```swift
-/// var remaining = charge          // §O4/§O5: min(payload.count, FlowControl.initialWindow)
+/// var remaining = FlowControl.charge(for: payload.count, window: window.initial)
 /// while remaining > 0 { remaining -= try await window.reserve(upTo: remaining) }
 /// ```
 ///
 /// Partial rather than all-or-nothing for two reasons, and **neither of them is "so an oversize
 /// message can be sent"**: an op body is atomic (§O2 has no chunking), so looping `reserve` on a
 /// payload larger than the window would still park with nothing on the wire for the peer to
-/// consume. That deadlock is closed by the *charge* instead -- §O4/§O5 charge a message
-/// `min(payload.count, 65_535)`, computed identically on both sides from a length both already
-/// know, so nothing can ever be charged more than the window it must fit in. What partial
-/// reservation buys is:
+/// consume. That deadlock is closed by the *charge* instead -- see ``FlowControl/charge(for:window:)``,
+/// which both sides call so that nothing can ever be charged more than the window it must fit in.
+/// What partial reservation buys is:
 ///
 /// - **Progress and fairness** when several senders share one window: a 60 KB sender does not sit
 ///   on an all-or-nothing claim while 8 KB of credit trickles in and every other sender starves
@@ -128,8 +148,11 @@ final class FlowControlWindow: Sendable {
         /// breach it. ``FlowControlWindow/release(_:)`` is the one exception and deliberately so:
         /// it returns bytes that were already *inside* this window, so refusing them would destroy
         /// window rather than protect it. It can therefore push `available` above the ceiling, but
-        /// only by as much as a peer over-granted while a reservation was outstanding -- and the
-        /// peer's *next* credit is then rejected as the protocol error it is.
+        /// only by as much as a peer over-granted while a reservation was outstanding. The check on
+        /// the next credit then becomes **conservative rather than diagnostic**: the overshoot is
+        /// ours, so the credit it rejects may well be an honest one. That is the right trade (it
+        /// only arises against a peer that had already inflated the window to the ceiling), but do
+        /// not read such a rejection as proof the peer misbehaved.
         var available: Int
         /// Every waiter that has taken a token and not yet been picked up by its own `reserve`.
         var slots: [UInt64: Slot] = [:]
@@ -432,6 +455,28 @@ final class FlowControlWindow: Sendable {
     /// Waiters are woken through the same FIFO walk `grant` uses, with the same
     /// resume-outside-the-lock discipline. On a failed window the bytes are dropped, exactly as
     /// credit is: nothing can reserve from it again.
+    ///
+    /// # What the caller owes: never release more than you reserved and did not send
+    ///
+    /// This is not checked. A negative count traps and zero is a no-op, but `release(10_000)`
+    /// against a 100-byte window that lent out 10 is accepted and leaves `available` at 10 090.
+    /// Deliberately: every caller is in-process transport code, and a running "outstanding" counter
+    /// on the hot path would catch nothing a caller-side `precondition` does not catch better.
+    ///
+    /// The obligation is still absolute. Over-releasing invents window the peer never authorised
+    /// and defeats backpressure **silently** -- the receiver is then handed more than it agreed to
+    /// buffer, with no error anywhere. Note the asymmetry: this file makes that failure impossible
+    /// to reach from the *peer* (``grant(_:)`` validates every byte the peer sends), so a careless
+    /// in-process caller is the only way in.
+    ///
+    /// # Not to be confused with `CreditWindow.release(_:)`
+    ///
+    /// `Backpressure.swift`'s legacy ``CreditWindow`` -- live in this module until Task 7 retires
+    /// the reply-as-credit stack -- also has a `release(_:)`, and it means the **opposite** end of
+    /// the exchange: "a credit reply arrived from the peer", i.e. the equivalent of this type's
+    /// ``grant(_:)``, not of this method. `credit.release(permits)` in `XPCOutboundWriter` is that
+    /// one. This `release` never touches peer input at all; it only hands back bytes this side
+    /// reserved and did not spend.
     func release(_ bytes: Int) {
         precondition(bytes >= 0, "release(_:) takes a byte count; got \(bytes)")
         guard bytes > 0 else { return }
@@ -501,14 +546,21 @@ final class FlowControlWindow: Sendable {
 ///
 /// # It takes the charge, not the payload length
 ///
-/// §O4/§O5 charge a message `min(payload.count, FlowControl.initialWindow)`, and that clamped
-/// number -- not `payload.count` -- is what belongs in ``consumed(_:)``. Both sides compute it from
-/// a length both already know, so it needs no negotiation and no protocol change, and it is the
-/// caller's job (Task 6's mux) to apply the identical clamp on the send side when reserving and on
-/// the receive side when crediting. **The symmetry is the whole point**: credit that does not match
-/// what was charged silently grows or shrinks the window. An oversize message is thereby capped at
-/// exactly one window's worth, which is what makes oversize messages serialise one at a time per
-/// stream instead of deadlocking a sender that could never reserve their full length.
+/// A message's charge is ``FlowControl/charge(for:window:)``, and that -- not `payload.count` -- is
+/// what belongs in ``consumed(_:)``. **Call the function; do not re-derive it.** The symmetry is the
+/// whole point: the send side reserves the charge and the receive side credits the charge, so if
+/// the two ever compute it differently the window grows or shrinks silently until a stream stalls
+/// with nothing to point at. One definition, called twice, is what makes that impossible; two
+/// hand-inlined clamps that must agree forever is the bug the rule was introduced to prevent.
+///
+/// An oversize message is thereby capped at exactly one window's worth. Note what that costs: the
+/// cap is the entire **connection** window as well as the entire stream window, so an oversize
+/// message serialises the *connection* -- every other stream's `message` op waits behind it until
+/// the receiving application consumes. That is head-of-line blocking, not deadlock, and §O4's
+/// stream-then-connection reservation order is what keeps it that way: two concurrent oversize
+/// senders queue on the connection window's FIFO rather than hold-and-wait against each other. Do
+/// not read "one at a time" as "other streams are unaffected" -- a retry or a timeout sized against
+/// that reading will be wrong.
 ///
 /// # Why `consumed` may return nil
 ///
@@ -560,8 +612,9 @@ struct WindowAccountant {
 
     /// Records one message delivered to the application.
     ///
-    /// - Parameter bytes: the message's **charge** -- `min(payload.count, initial)` per §O4/§O5,
-    ///   not its raw length. See the type's doc comment; the send side must clamp identically.
+    /// - Parameter bytes: the message's **charge** -- ``FlowControl/charge(for:window:)``, not its
+    ///   raw length, and not a hand-written clamp that happens to agree with it today. The send
+    ///   side reserves the value that same call returns.
     /// - Returns: the credit to send to the peer right now, or `nil` while the accumulation is
     ///   still below half the initial window. A returned value is subtracted from the
     ///   accumulation, so nothing is ever credited twice.
