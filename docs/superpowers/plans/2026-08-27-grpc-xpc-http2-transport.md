@@ -1,5 +1,13 @@
 # gRPC over XPC — HTTP/2-native transport (full redesign) Implementation Plan
 
+> **SUPERSEDED from Task 4 onward (2026-08-27).** The project owner observed that gRPC core
+> defines a transport by its stream-op batch semantics, not by HTTP/2 — gRPC's own in-process
+> transport carries no HTTP/2 at all — so byte-level HTTP/2 framing is only required for wire
+> interop with foreign peers, which an XPC endpoint does not have. The replacement is
+> `docs/superpowers/plans/2026-08-27-grpc-xpc-op-transport.md`. **Tasks 1–3 of this plan are
+> implemented, reviewed and kept**: the frame codec and HPACK codec stand unused as the basis of
+> a future optional HTTP/2 `WireCodec`, and the gRPC header vocabulary is reused directly.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development
 > (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use
 > checkbox (`- [ ]`) syntax for tracking. This plan is written to be executed by a model with
