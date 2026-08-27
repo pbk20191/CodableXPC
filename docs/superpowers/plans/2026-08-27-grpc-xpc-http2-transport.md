@@ -375,6 +375,23 @@ usage), `Sources/GRPCXPCTransport/XPCConnection.swift` + `XPCClientTransport.swi
 lifecycle machines and mux shapes worth porting), `Tests/GRPCXPCTransportTests/XPCServerTransportTests.swift`
 (the bounded-test worked example).
 
+## AMENDMENT (2026-08-27, project owner): test implementation is deferred
+
+Tasks 2 onward implement **production code only**. Every task's test file and its TDD steps are
+deferred to a dedicated test task run later; a task is "done" when it compiles clean and satisfies
+its interface and spec contract by inspection, not when tests pass.
+
+What this changes, stated plainly so nobody mistakes the state of the work:
+- `swift build` (and `swift build --build-tests`, since the legacy suite still exists) must stay
+  green at every commit. Behaviour is otherwise **unverified** until the test task runs.
+- Reviews still gate each task, but their evidence is code read against the RFC and the brief —
+  reviewers independently derive byte layouts rather than trusting a green suite (this is how
+  Task 1's vectors were confirmed, and it caught nothing false).
+- Each task's report MUST end with a **"Deferred tests"** section: the concrete cases its brief
+  specified, plus any case the implementer found while writing the code and would have pinned.
+  Those lists are the backlog the test task consumes; a case that is not written down is lost.
+- Task 1 already shipped with 17 passing tests. They stay and must keep passing.
+
 ## Global Constraints
 
 - Availability annotation on every public type:
