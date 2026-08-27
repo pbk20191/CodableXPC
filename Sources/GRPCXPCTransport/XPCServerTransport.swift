@@ -139,8 +139,11 @@ public final class XPCServerTransport: ServerTransport {
             // core, so `.terminated` would need handling exactly as the `!admitted` arm below does,
             // i.e. the same code with an extra way to get it wrong. It is safe as written for a
             // narrow, checkable reason: `AsyncStream.Continuation.yield` enqueues (task
-            // resumption never runs the consumer inline), and the only re-entry into this lock is
-            // `retire(_:)`, from a `listen()` child task on a different thread.
+            // resumption never runs the consumer inline), and the only re-entry into this lock
+            // reachable *from the resumed consumer* is `retire(_:)`, from a `listen()` child task
+            // on a different thread. (`beginDraining`, `failAll` and `closeAll` take this lock
+            // too, but none of them is reachable from a yield; the resumed-consumer path is the
+            // only one the argument needs.)
             //
             // `yield`'s result is ignored deliberately: if the sequence has already finished,
             // `admitting` is false too and the `!admitted` arm below is what handles it.

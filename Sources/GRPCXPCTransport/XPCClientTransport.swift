@@ -132,6 +132,34 @@ public final class XPCClientTransport: ClientTransport {
     }
     private let state = Mutex(ConnectState())
 
+    /// What a caller that just transitioned the state owes the outside world. Returned from under
+    /// the lock and acted on outside it (L7).
+    ///
+    /// The three cases are mutually exclusive by construction, which is the point of making this a
+    /// sum type rather than a pair: `closeSubstrate` is returned **exactly when** the transition
+    /// reached `.shutDown` with nothing parked, and `resume` exactly when there was something
+    /// parked. So "who releases the XPC session" has one answer per shutdown:
+    ///
+    /// * something was parked -> resume it, and `connect()`'s own tail calls `core.close()`;
+    /// * nothing was parked -> no `connect()` tail will ever run, so **this** caller closes.
+    private enum Completion {
+        case nothing
+        case resume(CheckedContinuation<Void, any Error>)
+        case closeSubstrate
+    }
+
+    /// Applies a ``Completion`` outside the lock.
+    private func complete(_ completion: Completion) {
+        switch completion {
+        case .nothing:
+            break
+        case .resume(let continuation):
+            continuation.resume()
+        case .closeSubstrate:
+            core.close()
+        }
+    }
+
     /// Adopts an already-live client-role core. The factories below are the ordinary way in; this
     /// exists separately because the in-process pair (`XPCServerTransport.connectingClient()`)
     /// builds its core from an endpoint, which only the XPC-importing file can name.
@@ -283,12 +311,11 @@ public final class XPCClientTransport: ClientTransport {
             // live stream (which also wakes every waiter parked on a flow-control window, since
             // `failAll` fails the connection window too) and only then releases `connect()`.
             //
-            // It is also the **only** client-side path that reaches the mux's teardown at all, and
-            // that matters for more than the contract: `ClientTransport`'s own guidance is to hold
-            // a transport for the lifetime of the application, so without this a transport that
-            // shut down gracefully would keep its XPC session open until it was released. The
-            // server's equivalent is `XPCServerTransport.listen`'s `onCancel` plus its
-            // `closeAll()`.
+            // **`failAll` fails the streams; it does not touch the pipe.** Releasing the XPC
+            // session is `core.close()`'s job and happens in this method's tail, below, which both
+            // this path and a completed graceful drain pass through. Saying it here instead would
+            // be the round-1 mistake again: a comment claiming a teardown the code does not do,
+            // in the file's most lifecycle-critical spot.
             //
             // Safe from a cancellation handler: `failAll` takes its snapshot under the registry
             // lock and resumes/fails everything outside it.
@@ -298,7 +325,49 @@ public final class XPCClientTransport: ClientTransport {
                     message: "the client's connect() task was cancelled"))
             self.shutDownForcefully()?.resume()
         }
+
+        // **This is where the XPC session is released**, and it is deliberately in the tail rather
+        // than in either of the two paths that get here, because it is the one point both of them
+        // pass through: a completed graceful drain, and a cancelled `connect()`. The client's
+        // counterpart to `listen()`'s trailing `acceptor.closeAll()`.
+        //
+        // `core.failAll` -- which is what `onCancel` calls, and all it calls -- does **not** touch
+        // the pipe; `core.close()` is `failAll` *plus* `pipe.cancel()`. Without this line nothing
+        // on the client side ever cancelled the session, so a transport held for the lifetime of
+        // the application (which `ClientTransport`'s own guidance recommends) kept it open
+        // indefinitely after shutting down, and only `deinit` closed it.
+        //
+        // Safe here, and only here:
+        // * by the time this runs `liveCalls == 0` and -- by the LIFO ordering of `withStream`'s
+        //   two `defer`s -- every stream is already out of the mux's table with its ops already
+        //   handed to `pipe.send`. So this fails nothing that is live.
+        // * a `withStream` body still unwinding finds `clientCallFinished` a no-op, and a
+        //   `pipe.send` after `cancel()` throws `.unavailable`, which is the correct surface.
+        // * `close()` is idempotent, so the `.shutDown`-returns-immediately arm reaching it is
+        //   harmless.
+        //
+        // A *second*, concurrent `connect()` throws `concurrentConnect` above and never reaches
+        // this line -- which is required, not incidental: it must not close the session out from
+        // under the first `connect()`.
+        core.close()
     }
+
+    /// A local shutdown is **permanent** for this transport -- there is no reconnect -- so
+    /// `withStream`'s documented mapping applies: `.failedPrecondition` for "the transport is
+    /// closing or has been closed", and `.unavailable` only for "temporarily not possible... may be
+    /// possible after some backoff". Telling a caller to back off and retry a transport that will
+    /// never reopen would be a lie. `InProcessTransport+Client` reports the same condition the same
+    /// way.
+    private static let localShutdownRefusal = RPCError(
+        code: .failedPrecondition,
+        message: "no new streams: this transport has begun shutting down")
+
+    /// The peer's `goAway`, by contrast, *is* retryable in the sense `.unavailable` means: this
+    /// connection is finished, another one to the same peer may work.
+    private static let peerDrainingRefusal = RPCError(
+        code: .unavailable,
+        message: "no new streams: the connection is draining (the peer sent goAway, or it has "
+            + "been torn down)")
 
     private static let concurrentConnect = RPCError(
         code: .failedPrecondition,
@@ -318,25 +387,34 @@ public final class XPCClientTransport: ClientTransport {
     /// 3. a parked `connect()` is resumed **only in the second case**. Otherwise the last
     ///    in-flight call to finish resumes it, in ``callDidFinish()``.
     ///
-    /// It deliberately does **not** call `core.failAll(...)` or `core.close()`: failing in-flight
-    /// streams is the opposite of draining them. Cancelling `connect()`'s task is the forceful
-    /// lever, and gRPC documents it as such.
+    /// It deliberately does **not** call `core.failAll(...)`: failing in-flight streams is the
+    /// opposite of draining them, and cancelling `connect()`'s task is the forceful lever gRPC
+    /// documents for that.
+    ///
+    /// It also does not call `core.close()` **here**, because when this method returns the drain is
+    /// not over -- there may be RPCs still running, and closing would cut them off. The session is
+    /// released in `connect()`'s tail instead, which both the graceful and the cancelled exit pass
+    /// through, *with one exception this method has to cover itself*: if the shutdown arrives with
+    /// nothing parked and no live calls, no `connect()` will ever run that tail, so this call is
+    /// the last one able to close and does. (Same for ``callDidFinish()`` when the last live call
+    /// drains with nothing parked.) That is what `Completion.closeSubstrate` carries.
     ///
     /// Idempotent: a second call finds `.draining`/`.shutDown` and changes nothing, and
     /// `beginDraining()` is itself a no-op once draining.
     public func beginGracefulShutdown() {
         core.beginDraining()
-        let pending: CheckedContinuation<Void, any Error>? = state.withLock { state in
-            guard !state.isShuttingDown else { return nil }
+        let completion: Completion = state.withLock { state in
+            guard !state.isShuttingDown else { return .nothing }
             let parked = state.parked
             guard state.liveCalls == 0 else {
                 state.phase = .draining(parked)
-                return nil
+                return .nothing
             }
             state.phase = .shutDown
-            return parked
+            if let parked { return .resume(parked) }
+            return .closeSubstrate
         }
-        pending?.resume()
+        complete(completion)
     }
 
     /// One `withStream` call has released its claim. If that was the last one and a drain is
@@ -347,13 +425,18 @@ public final class XPCClientTransport: ClientTransport {
     /// load-bearing: when the count reaches zero every stream really has been retired, rather
     /// than merely being about to be.
     private func callDidFinish() {
-        let pending: CheckedContinuation<Void, any Error>? = state.withLock { state in
+        let completion: Completion = state.withLock { state in
             state.liveCalls -= 1
-            guard case .draining(let parked) = state.phase, state.liveCalls == 0 else { return nil }
+            guard case .draining(let parked) = state.phase, state.liveCalls == 0 else {
+                return .nothing
+            }
             state.phase = .shutDown
-            return parked
+            if let parked { return .resume(parked) }
+            // The shutdown arrived before any `connect()` did, and none came since, so no
+            // `connect()` tail will run: this is the last caller able to release the session.
+            return .closeSubstrate
         }
-        pending?.resume()
+        complete(completion)
     }
 
     /// Moves straight to `.shutDown` and hands back whatever `connect()` call was parked, if any.
@@ -416,11 +499,7 @@ public final class XPCClientTransport: ClientTransport {
         // to back off and retry would be a lie. (`InProcessTransport+Client` reports the same
         // condition the same way.)
         let refusal: RPCError? = state.withLock { state in
-            guard !state.isShuttingDown else {
-                return RPCError(
-                    code: .failedPrecondition,
-                    message: "no new streams: this transport has begun shutting down")
-            }
+            guard !state.isShuttingDown else { return Self.localShutdownRefusal }
             state.liveCalls += 1
             return nil
         }
@@ -433,11 +512,16 @@ public final class XPCClientTransport: ClientTransport {
         // `.unavailable` means. Failing here is strictly better than opening a stream the peer
         // will immediately refuse. `core.openStream` also checks, under its own lock, so this is
         // a clearer error rather than the only gate.
+        //
+        // The local phase is **re-read** rather than assumed, because `core.isDraining` is the
+        // disjunction of the mux's three flags (`isClosed || localDraining || peerDraining`): a
+        // local `beginGracefulShutdown()` landing between the gate above and this check would
+        // otherwise be reported as a retryable `.unavailable` *and* blamed on the peer -- which
+        // inverts the very distinction the code above exists to draw.
         if core.isDraining {
-            throw RPCError(
-                code: .unavailable,
-                message: "no new streams: the connection is draining (the peer sent goAway, or "
-                    + "it has been torn down)")
+            throw state.withLock { state -> RPCError in
+                state.isShuttingDown ? Self.localShutdownRefusal : Self.peerDrainingRefusal
+            }
         }
 
         // The `openStream` op is not sent here: `RequestOpEncoder` prepends it to whatever the
