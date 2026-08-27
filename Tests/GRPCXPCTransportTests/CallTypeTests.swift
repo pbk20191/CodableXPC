@@ -16,7 +16,7 @@ import Synchronization
 @available(macOS 15.0, *)
 final class CallTypeTests: XCTestCase {
     private struct Outcome: Sendable {
-        var messages: [[UInt8]] = []
+        var messages: [GRPCSwiftData] = []
         var finalStatus: Status?
     }
 
@@ -32,7 +32,7 @@ final class CallTypeTests: XCTestCase {
         try await run(clientMessages: [[1], [2]], serverReplies: [[9], [8]])
     }
 
-    private func run(clientMessages: [[UInt8]], serverReplies: [[UInt8]]) async throws {
+    private func run(clientMessages: [GRPCSwiftData], serverReplies: [GRPCSwiftData]) async throws {
         let harness = XPCPairHarness()
         let (clientConn, serverConn) = try await harness.connectPair()
         let server = XPCServerTransport(connection: serverConn)
@@ -108,15 +108,15 @@ final class CallTypeTests: XCTestCase {
         let server = XPCServerTransport(connection: serverConn)
         let client = XPCClientTransport(connection: clientConn)
 
-        let clientMessages: [[UInt8]] = [[1], [2], [3]]
-        let expectedReplies: [[UInt8]] = [[2], [4], [6]]   // server doubles each byte
+        let clientMessages: [GRPCSwiftData] = [[1], [2], [3]]
+        let expectedReplies: [GRPCSwiftData] = [[2], [4], [6]]   // server doubles each byte
 
         let listenTask = Task {
             try await server.listen { stream, _ in
                 do {
                     for try await part in stream.inbound {
                         if case .message(let b) = part {
-                            let doubled = b.map { $0 * 2 }
+                            let doubled = GRPCSwiftData(b.map { $0 * 2 })
                             try? await stream.outbound.write(.message(doubled))   // reply per request, interleaved
                         }
                     }
@@ -137,8 +137,8 @@ final class CallTypeTests: XCTestCase {
                 descriptor: MethodDescriptor(fullyQualifiedService: "p.S", method: "M"),
                 options: .defaults
             ) { stream, _ in
-                async let reading: ([[UInt8]], Status?) = {
-                    var msgs: [[UInt8]] = []
+                async let reading: ([GRPCSwiftData], Status?) = {
+                    var msgs: [GRPCSwiftData] = []
                     var status: Status?
                     for try await part in stream.inbound {
                         switch part {

@@ -13,7 +13,7 @@ final class XPCClientTransportTests: XCTestCase {
         let (clientConn, serverConn) = try await harness.connectPair()
         let client = XPCClientTransport(connection: clientConn)
 
-        async let serverSaw: [UInt8]? = {
+        async let serverSaw: GRPCSwiftData? = {
             var it = serverConn.acceptedStreams.makeAsyncIterator()
             guard let accepted = await it.next() else { return nil }
             for try await part in accepted.stream.inbound {

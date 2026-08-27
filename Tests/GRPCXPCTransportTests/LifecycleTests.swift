@@ -494,7 +494,7 @@ final class LifecycleTests: XCTestCase {
         }
         defer { listenTask.cancel() }
 
-        let received = Mutex<[[UInt8]]>([])
+        let received = Mutex<[GRPCSwiftData]>([])
         let statusBox = Mutex<Status?>(nil)
         let clientReturned = expectation(description: "the client's call returned")
         let clientTask = Task {

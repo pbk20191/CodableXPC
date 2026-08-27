@@ -40,7 +40,7 @@ struct WireMetadata: Codable, Sendable {
 enum XPCFrame: Codable, Sendable {
     case openStream(StreamID, method: String, deadlineNanos: Int64?)
     case metadata(StreamID, WireMetadata)
-    case message(StreamID, seq: UInt64, bytes: Data)
+    case message(StreamID, seq: UInt64, bytes: GRPCSwiftData)
     case halfClose(StreamID)
     case status(StreamID, code: Int, message: String, trailers: WireMetadata)
     case cancel(StreamID, reason: String)

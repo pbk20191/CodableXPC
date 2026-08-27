@@ -16,7 +16,7 @@ import Synchronization
 // `GRPCInProcessTransport.Server.listen` itself uses -- followed here for the same reason.
 @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
 public final class XPCServerTransport: ServerTransport {
-    public typealias Bytes = [UInt8]
+    public typealias Bytes = GRPCSwiftData
 
     private let connection: XPCConnection
 

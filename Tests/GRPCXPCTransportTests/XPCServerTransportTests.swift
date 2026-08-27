@@ -17,7 +17,7 @@ final class XPCServerTransportTests: XCTestCase {
     /// one `Mutex.withLock` write -- not through captured `var`s mutated from outside that task
     /// -- so nothing here needs cross-task synchronization beyond that single write/read pair.
     private struct EchoOutcome: Sendable {
-        var echoed: [UInt8]?
+        var echoed: GRPCSwiftData?
         var finalStatus: Status?
         var messageArrivedBeforeStatus = false
     }

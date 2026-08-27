@@ -22,7 +22,7 @@ extension XPCFrameTests {
         let frames: [XPCFrame] = [
             .openStream(1, method: "pkg.S/M", deadlineNanos: 1_000),
             .metadata(2, WireMetadata(md)),
-            .message(3, seq: 7, bytes: Data([1, 2, 3])),
+            .message(3, seq: 7, bytes: GRPCSwiftData([1, 2, 3])),
             .halfClose(4),
             .status(5, code: 0, message: "ok", trailers: WireMetadata(md)),
             .cancel(6, reason: "test"),

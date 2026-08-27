@@ -26,8 +26,8 @@ import CodableXPC
 struct AcceptedStream: Sendable {
     let id: StreamID
     let descriptor: MethodDescriptor
-    let stream: RPCStream<RPCAsyncSequence<RPCRequestPart<[UInt8]>, any Error>,
-                          RPCWriter<RPCResponsePart<[UInt8]>>.Closable>
+    let stream: RPCStream<RPCAsyncSequence<RPCRequestPart<GRPCSwiftData>, any Error>,
+                          RPCWriter<RPCResponsePart<GRPCSwiftData>>.Closable>
 }
 
 /// Wraps one `XPCSession`, multiplexing many RPCs over it by `StreamID` and demultiplexing
@@ -84,8 +84,8 @@ final class XPCConnection: Sendable {
     }
 
     private struct Registry: Sendable {
-        var clientChannels: [StreamID: StreamChannel<RPCResponsePart<[UInt8]>>] = [:]
-        var serverChannels: [StreamID: StreamChannel<RPCRequestPart<[UInt8]>>] = [:]
+        var clientChannels: [StreamID: StreamChannel<RPCResponsePart<GRPCSwiftData>>] = [:]
+        var serverChannels: [StreamID: StreamChannel<RPCRequestPart<GRPCSwiftData>>] = [:]
         var pendingCredits: [UInt64: PendingCredit] = [:]
         /// Per-stream "this RPC has been cancelled" callbacks -- see
         /// ``setCancellationObserver(forStream:_:)``.
@@ -332,9 +332,9 @@ final class XPCConnection: Sendable {
             // under a still-pending claim. One phase avoids all three failure modes: `serverChannels[id]`
             // is both the only place the channel lives and the only thing `route` ever needs to
             // find to keep delivering frames to it.
-            let (channel, inbound) = StreamChannel<RPCRequestPart<[UInt8]>>.serverInbound(streamID: id)
+            let (channel, inbound) = StreamChannel<RPCRequestPart<GRPCSwiftData>>.serverInbound(streamID: id)
             registry.withLock { $0.serverChannels[id] = channel }
-            let outbound = RPCWriter.Closable(wrapping: XPCOutboundWriter<RPCResponsePart<[UInt8]>>(
+            let outbound = RPCWriter.Closable(wrapping: XPCOutboundWriter<RPCResponsePart<GRPCSwiftData>>(
                 streamID: id, connection: self, creditWindow: creditWindow))
             let stream = RPCStream(descriptor: descriptor, inbound: inbound, outbound: outbound)
             acceptedContinuation.yield(AcceptedStream(id: id, descriptor: descriptor, stream: stream))
@@ -426,12 +426,12 @@ final class XPCConnection: Sendable {
     ///   first, further writes fail with `RPCError(code: .unavailable, ...)` and the inbound
     ///   sequence fails rather than hanging.
     func openClientStream(descriptor: MethodDescriptor)
-    -> (StreamID, RPCStream<RPCAsyncSequence<RPCResponsePart<[UInt8]>, any Error>,
-                            RPCWriter<RPCRequestPart<[UInt8]>>.Closable>) {
+    -> (StreamID, RPCStream<RPCAsyncSequence<RPCResponsePart<GRPCSwiftData>, any Error>,
+                            RPCWriter<RPCRequestPart<GRPCSwiftData>>.Closable>) {
         let id = nextStreamID.wrappingAdd(1, ordering: .relaxed).oldValue
-        let (channel, inbound) = StreamChannel<RPCResponsePart<[UInt8]>>.clientInbound(streamID: id)
+        let (channel, inbound) = StreamChannel<RPCResponsePart<GRPCSwiftData>>.clientInbound(streamID: id)
         registry.withLock { $0.clientChannels[id] = channel }
-        let outbound = RPCWriter.Closable(wrapping: XPCOutboundWriter<RPCRequestPart<[UInt8]>>(
+        let outbound = RPCWriter.Closable(wrapping: XPCOutboundWriter<RPCRequestPart<GRPCSwiftData>>(
             streamID: id, connection: self, creditWindow: creditWindow))
         return (id, RPCStream(descriptor: descriptor, inbound: inbound, outbound: outbound))
     }
@@ -486,7 +486,7 @@ final class XPCConnection: Sendable {
     /// report, and its outbound writes (a `.status` sent as the very last thing, possibly still
     /// in flight) must not be disturbed.
     func streamHandlerFinished(_ id: StreamID) {
-        let channel = registry.withLock { reg -> StreamChannel<RPCRequestPart<[UInt8]>>? in
+        let channel = registry.withLock { reg -> StreamChannel<RPCRequestPart<GRPCSwiftData>>? in
             reg.cancellationObservers[id] = nil
             return reg.serverChannels.removeValue(forKey: id)
         }

@@ -35,7 +35,7 @@ final class StreamChannel<Part: Sendable>: Sendable {
     /// closure turns into this channel's concrete `Part`.
     enum Inbound: Sendable {
         case metadata(Metadata)
-        case message([UInt8])
+        case message(GRPCSwiftData)
         case status(Status, Metadata)
     }
 
@@ -137,12 +137,12 @@ final class StreamChannel<Part: Sendable>: Sendable {
 extension StreamChannel {
     /// A server's inbound view of an RPC: the request parts the peer sends.
     static func serverInbound(streamID: StreamID)
-        -> (StreamChannel<RPCRequestPart<[UInt8]>>, RPCAsyncSequence<RPCRequestPart<[UInt8]>, any Error>)
-        where Part == RPCRequestPart<[UInt8]>
+        -> (StreamChannel<RPCRequestPart<GRPCSwiftData>>, RPCAsyncSequence<RPCRequestPart<GRPCSwiftData>, any Error>)
+        where Part == RPCRequestPart<GRPCSwiftData>
     {
-        let (stream, continuation) = AsyncThrowingStream.makeStream(of: RPCRequestPart<[UInt8]>.self)
+        let (stream, continuation) = AsyncThrowingStream.makeStream(of: RPCRequestPart<GRPCSwiftData>.self)
         let credit = CreditLedger(streamID: streamID)
-        let channel = StreamChannel<RPCRequestPart<[UInt8]>>(
+        let channel = StreamChannel<RPCRequestPart<GRPCSwiftData>>(
             streamID: streamID, isServer: true, credit: credit, continuation: continuation
         ) { event in
             switch event {
@@ -159,12 +159,12 @@ extension StreamChannel {
 
     /// A client's inbound view of an RPC: the response parts the peer sends.
     static func clientInbound(streamID: StreamID)
-        -> (StreamChannel<RPCResponsePart<[UInt8]>>, RPCAsyncSequence<RPCResponsePart<[UInt8]>, any Error>)
-        where Part == RPCResponsePart<[UInt8]>
+        -> (StreamChannel<RPCResponsePart<GRPCSwiftData>>, RPCAsyncSequence<RPCResponsePart<GRPCSwiftData>, any Error>)
+        where Part == RPCResponsePart<GRPCSwiftData>
     {
-        let (stream, continuation) = AsyncThrowingStream.makeStream(of: RPCResponsePart<[UInt8]>.self)
+        let (stream, continuation) = AsyncThrowingStream.makeStream(of: RPCResponsePart<GRPCSwiftData>.self)
         let credit = CreditLedger(streamID: streamID)
-        let channel = StreamChannel<RPCResponsePart<[UInt8]>>(
+        let channel = StreamChannel<RPCResponsePart<GRPCSwiftData>>(
             streamID: streamID, isServer: false, credit: credit, continuation: continuation
         ) { event in
             switch event {

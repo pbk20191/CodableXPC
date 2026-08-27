@@ -18,7 +18,7 @@ import Synchronization
 /// `XPCOutboundWriter` (which stores an `Atomic`) is a class rather than a struct.
 @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
 public final class XPCClientTransport: ClientTransport {
-    public typealias Bytes = [UInt8]
+    public typealias Bytes = GRPCSwiftData
 
     private let connection: XPCConnection
 

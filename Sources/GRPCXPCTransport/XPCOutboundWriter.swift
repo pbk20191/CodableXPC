@@ -124,7 +124,7 @@ final class XPCOutboundWriter<Part: Sendable>: ClosableRPCWriterProtocol {
         // `finish` cannot throw (the protocol's signature is non-throwing), so a gone connection
         // is a no-op here rather than an error: there is no peer left to inform of a half-close,
         // and no caller to report it to. `write` above is where a lost connection is surfaced.
-        if Part.self == RPCRequestPart<[UInt8]>.self {
+        if Part.self == RPCRequestPart<GRPCSwiftData>.self {
             try? connection?.send(.halfClose(streamID))
         }
     }
@@ -140,10 +140,10 @@ final class XPCOutboundWriter<Part: Sendable>: ClosableRPCWriterProtocol {
     /// wire must not consume a seq (the peer's `StreamChannel` treats a gap as a protocol violation).
     private func isMessage(_ element: Part) -> Bool {
         switch element {
-        case let request as RPCRequestPart<[UInt8]>:
+        case let request as RPCRequestPart<GRPCSwiftData>:
             if case .message = request { return true }
             return false
-        case let response as RPCResponsePart<[UInt8]>:
+        case let response as RPCResponsePart<GRPCSwiftData>:
             if case .message = response { return true }
             return false
         default:
@@ -153,7 +153,7 @@ final class XPCOutboundWriter<Part: Sendable>: ClosableRPCWriterProtocol {
 
     private func frame(for element: Part) -> XPCFrame {
         switch element {
-        case let req as RPCRequestPart<[UInt8]>:
+        case let req as RPCRequestPart<GRPCSwiftData>:
             switch req {
             case .metadata(let m):
                 return .metadata(streamID, WireMetadata(m))
@@ -161,7 +161,7 @@ final class XPCOutboundWriter<Part: Sendable>: ClosableRPCWriterProtocol {
                 let s = seq.wrappingAdd(1, ordering: .relaxed).oldValue
                 return .message(streamID, seq: s, bytes: GRPCMessageFraming.frame(b))
             }
-        case let resp as RPCResponsePart<[UInt8]>:
+        case let resp as RPCResponsePart<GRPCSwiftData>:
             switch resp {
             case .metadata(let m):
                 return .metadata(streamID, WireMetadata(m))
