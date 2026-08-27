@@ -178,9 +178,24 @@ defaults — not because we are HTTP/2 but because those numbers and that shape 
 - Sender: reserve from the stream window then the connection window (always that order, so two
   streams cannot deadlock each other); suspend when either is exhausted.
 - Receiver: replenish **on consumption** — when a message is delivered to the application's async
-  iterator, send `credit` for its byte count on both the stream and the connection.
+  iterator, credit its charge on both the stream and the connection. Credits are **batched**: the
+  receiver accumulates and emits a `credit` op only once the accumulation reaches half the initial
+  window, so a stream of small messages does not produce one control op each.
+- **A message's charge is `min(payload.count, 65_535)`, not its length.** Both sides compute it
+  from the payload length, which both sides know, so it needs no negotiation and no protocol
+  change. Without this clamp an oversize message deadlocks: `message` op bodies are atomic (O2 has
+  no chunking), so a sender reserving partially would take the whole window, block, and wait on a
+  receiver that cannot credit a message it has not finished receiving and therefore cannot deliver.
+  With it, the window serializes oversize messages one at a time per stream — which is exactly as
+  much backpressure as chunking with consumption-credit could give — and no message can charge more
+  than the window it must fit in.
 - A credit that would take a window above 2³¹−1 is a protocol error. Applying credit is **O(1)
   arithmetic** — never a loop over a peer-supplied count (see lesson L2).
+- A reservation is **spent, not lent**. A sender that reserves and then does not send must hand the
+  bytes back with `release(_:)`, which is not `grant`: those bytes were already inside the window,
+  so they cannot breach the ceiling and must not be validated against the peer's contract. `fail`
+  is for a window that is actually dead — never for a stranded reservation, since failing the
+  *connection* window because one stream's send failed would kill every other stream on it.
 
 ### O5. Deviations, complete list
 
@@ -190,6 +205,9 @@ defaults — not because we are HTTP/2 but because those numbers and that shape 
 3. `cancel` carries a human-readable reason rather than a numeric code; the core maps it to
    `RPCError(code: .cancelled)`.
 4. No compression, no message-size limits in v1.
+5. Credit is batched at half the initial window rather than emitted per message, and an oversize
+   message is charged the window rather than its length — both in O4, both consequences of O2's
+   atomic `message` bodies.
 
 ---
 
