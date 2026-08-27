@@ -124,7 +124,13 @@ seam earning its keep — do not add LPM to the compact codec "for standardness"
 - Response direction: `metadata`? → `message`* → `status`. `status` is the single terminator; a
   second terminal, or a `message` after it, is a violation.
 - A violation fails **that stream** with `RPCError(code: .internalError, …)` and sends `cancel`;
-  it never tears down the connection.
+  it never tears down the connection. **This binds the codec, not only the core.** A blob carries
+  several ops, and `decode` parses each op's 10-byte header — including its stream id — before it
+  touches the body. So a body-level rejection MUST surface that stream id and the ops that decoded
+  cleanly before it, or the core has nothing to fail but the whole connection: Task 6's review found
+  a malformed `:path`, a stray-metadata `openStream`, and a non-empty `halfClose` body each killing
+  every other stream on the connection. A **header**-level failure stays connection-fatal, and
+  correctly so — framing you cannot parse is framing you cannot resynchronise.
 - `cancel` from either side terminates the stream in both directions.
 - Ordering: the substrate delivers messages in order, and the core processes them serially per
   connection. There is no sequence number — XPC guarantees ordering, and the Task “XPCPipe”
@@ -215,6 +221,10 @@ defaults — not because we are HTTP/2 but because those numbers and that shape 
 5. Credit is batched at half the initial window rather than emitted per message, and an oversize
    message is charged the window rather than its length — both in O4, both consequences of O2's
    atomic `message` bodies.
+6. **Concurrent inbound streams are capped at 256**, refused with `status(resourceExhausted)`.
+   Nothing here bounded stream *count*, so a peer bought a table entry plus two 65 535-byte windows
+   for about forty wire bytes. The cap needs no new op and no negotiation, and it is the same order
+   as every HTTP/2 server's `SETTINGS_MAX_CONCURRENT_STREAMS` in practice.
 
 ---
 
