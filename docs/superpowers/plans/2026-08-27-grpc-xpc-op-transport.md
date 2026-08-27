@@ -82,7 +82,7 @@ the task must report it rather than importing.
 | File | Status |
 |---|---|
 | `Sources/GRPCXPCTransport/GRPCDispatchData.swift` (`GRPCSwiftData`) | **Keep, central.** The byte type everywhere. Zero-copy `init(from: xpc_object_t)` and `createXPCRepresentation()` are the ONLY two crossings to libxpc. Its `Codable`/`XPCNativeObject` extension is deleted at the swap. |
-| `Sources/GRPCXPCTransport/GRPCWireHeaders.swift` (Task 3) | **Keep, reused.** Metadata ↔ name/value fields, `grpc-timeout`, `grpc-status`/`grpc-message`, `-bin` base64, reserved-name stripping. Encoding-agnostic. |
+| `Sources/GRPCXPCTransport/GRPCWireHeaders.swift` (Task 3) | **Keep, reused.** Metadata ↔ name/value fields, `grpc-timeout`, `grpc-status`/`grpc-message`, `-bin` base64, reserved-name stripping. Encoding-agnostic. **Correction to the superseded plan: `grpc-timeout` rounds UP, never truncates** — truncating tells the server a shorter deadline than the caller asked for, so it can abandon a call the client would still have accepted; grpc-swift's own `Timeout.swift` rounds up for the same reason. |
 | `HTTP2Frame.swift`, `HPACKLiteralCodec.swift` (+ their 37 tests) | **Keep, unused for now.** They are the basis of a future optional `HTTP2Codec` conforming to `WireCodec`. Do not delete; do not wire them in. |
 | `XPCFrame.swift`, `StreamChannel.swift`, `XPCOutboundWriter.swift`, `XPCConnection.swift`, `Backpressure.swift`, `GRPCMessageFraming.swift` + their tests | **Legacy.** Stay compiling until the swap task deletes them. |
 
