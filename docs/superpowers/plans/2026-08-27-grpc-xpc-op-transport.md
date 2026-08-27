@@ -344,8 +344,18 @@ public enum RPCResponsePart<Bytes> { case metadata(Metadata); case message(Bytes
   | cancel after the `Decision` returned | safe |
   | release uncancelled after the `Decision` returned | safe |
 
-  One rule explains all four: **libxpc still holds a reference for the duration of the accept
-  window**, so a release inside it is never the last one — measured, the session does not dealloc
+  **The accept window forbids more than cancelling — it forbids *sending* too (measured, Task 8b,
+  row A5).** `xpc_session_send` on an accepted session before its `Decision` returns is
+  `_xpc_api_misuse`: `EXC_BREAKPOINT`, exit 133. Row A6 is the control — the same send after the
+  `Decision` returns is fine. This is the rule everyone got wrong: the table below enumerates which
+  *disposals* trap, and Task 7's review reasoned from it that a `goAway` in the window "cannot trip
+  the matrix" because it "never touches `cancel()`/release". True, and beside the point — nothing
+  had established that anything *else* in that window was legal either. **Treat the accept window as
+  permitting nothing but building and publishing.** A list of operations that trap invites the
+  reader to infer the complement is safe; that inference is what cost a reproduced process death.
+
+  One rule explains all four disposal rows: **libxpc still holds a reference for the duration of the
+  accept window**, so a release inside it is never the last one — measured, the session does not dealloc
   until the closure returns. That is why the two "release" rows are safe. The trap in row 1 is not
   a refcount problem at all: `xpc_session_cancel` is simply illegal inside the window, whatever the
   refcount. And an accepted session never *requires* cancelling to be released safely, which is the
