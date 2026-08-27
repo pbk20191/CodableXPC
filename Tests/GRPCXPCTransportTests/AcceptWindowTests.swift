@@ -38,10 +38,14 @@ import XPC
 /// Before Task 5's fix, `accepting(request, queue:) { $0.cancel() }` **killed the process** (§5 fact
 /// 23): the accepted pipe was seeded `sessionIsLive: true`, so `cancel()` called
 /// `session.cancel(reason:)` from inside the incoming-session closure, which is `_xpc_api_misuse`.
-/// The fix seeds it `false` and re-arms it in `acceptWindowClosed()`, after `building` returns.
+/// The fix seeded it `false`; round 6 went further and removed the stored flag from the accepted
+/// path altogether, so an accepted pipe now asks libxpc (`Delivery.windowIsProvedClosed`) at the
+/// moment it would cancel. A `cancel()` inside `building` therefore cancels nothing at all, rather
+/// than being a no-op only because a flag has not been re-armed yet.
+///
 /// Row **A1** of the out-of-process disposal matrix
-/// (`scratchpad/matrix/XPCSessionDisposalMatrix.swift`) is the platform half of that -- it exits
-/// 133 -- and this is the wrapper half.
+/// (`docs/xpc-platform-matrix/`, checked in -- it used to be cited under `/private/tmp`, which a
+/// reboot destroys) is the platform half of that -- it exits 133 -- and this is the wrapper half.
 ///
 /// The expected answer here is "no trap", so an in-process test is the right shape: a trap is a loud
 /// crash of the whole run, not a swallowed assertion.

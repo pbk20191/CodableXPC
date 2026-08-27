@@ -228,13 +228,15 @@ struct AcceptedRPCStream: Sendable {
 ///   inbound sequence has already been failed by `deinit`. Whoever hands `RPCStream`s out must
 ///   keep the core alive for as long as they are in use -- the reviewed `XPCServerTransport`
 ///   pattern of holding the connection in the per-stream task is the shape.
-/// - **Do not drop the core inside an accept window.** If the core is built inside
-///   `XPCPipe.accepting`'s `building` closure, releasing it between `building` returning and the
-///   `Decision` reaching libxpc runs `deinit`, which calls `pipe.cancel()` on a session still
-///   inside its accept window -- a **process death**, documented on `XPCPipe.accepting`'s
-///   `- Important:` and not closable from inside either file. Publish the core (or the pipe)
-///   before returning the `Decision`. Dropping it *inside* `building` is safe: an accepted pipe's
-///   `sessionIsLive` is still false there, so the `cancel()` is a no-op.
+/// - **Publish the core before returning an accept `Decision`, and do not touch the pipe until
+///   `XPCPipe.onWindowProvedClosed(_:)` has fired.** Dropping the core between `building` returning
+///   and the `Decision` reaching libxpc used to be a process death; `XPCPipe` closed that span, so
+///   `deinit` there now releases the session uncancelled (safe, measured) rather than cancelling
+///   into an open window. What has *not* changed is that **sending on the pipe in that span still
+///   traps** -- `beginDraining()` and `close()` both reach `pipe`, so neither may be called on a
+///   freshly accepted core until the window is proved closed. `XPCServerTransport.Acceptor` is the
+///   worked example: it holds such a core untouched in a `pending` table and acts only from the
+///   proof.
 @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
 final class RPCTransportCore: Sendable {
 
@@ -1299,14 +1301,23 @@ final class RPCTransportCore: Sendable {
     /// Detection compares `endIndex` rather than counting, so the common short-string case stays
     /// O(1) instead of walking a possibly enormous string.
     ///
-    /// **There is exactly one truncation point for the wire**, in
-    /// ``removeStream(_:failingInboundWith:sendingCancel:)``, so callers pass their full text and
-    /// do not pre-truncate: stacking two calls would clip the first call's own marker. The other
-    /// uses are all *local*, none of which passes through that point: the accept refusal's
-    /// `status` message, ``cancelStream(_:reason:)``'s local error text, and
-    /// ``failStream(_:dueTo:)``'s local error text (added when `.streamFailure` gave that function
-    /// a second caller -- when you add a fourth use, update this count, not just the code; this
-    /// sentence has already gone stale once).
+    /// **Four uses, of which two are wire-bound.** The count was right before; the
+    /// characterisation was not, and a reader would have concluded that every wire-bound peer text
+    /// funnels through one place. It does not:
+    ///
+    ///   * **wire, and the one everything else funnels through** --
+    ///     ``removeStream(_:failingInboundWith:sendingCancel:)``. Callers pass their full text and
+    ///     must not pre-truncate: stacking two calls clips the first call's own marker.
+    ///   * **wire, and separate** -- ``openInbound(streamID:method:timeout:)``'s malformed-method
+    ///     refusal, which interpolates the peer's `method` (up to the codec's 16 MiB body cap) into
+    ///     a `status` op. It is truncated at that site because it never reaches `removeStream`: no
+    ///     table entry is created for a refused open.
+    ///   * **local** -- ``cancelStream(_:reason:)``'s error text and ``failStream(_:dueTo:)``'s
+    ///     error text. Bounded not because they cross the wire but because an unbounded in-process
+    ///     message is still an unbounded allocation.
+    ///
+    /// When you add a fifth use, say which class it is in as well as updating the count. This
+    /// sentence has now gone stale twice: once on the count, once on the classification.
     static func truncatedForWire(_ text: String) -> String {
         let head = text.utf8.prefix(maxWireReasonLength)
         guard head.endIndex != text.utf8.endIndex else { return text }

@@ -111,26 +111,43 @@ import XPC
 //     **no path may release a constructed dialled session without activating it first**, so a pipe
 //     that was cancelled before it could be activated is activated anyway, purely so that it can
 //     be cancelled.
-//   - **accepted:** also seeded `false`, because cancelling inside the accept window traps, and
-//     flipped by ``XPCPipe/acceptWindowClosed()`` -- which is what makes
-//     `accepting(_:queue:) { $0.cancel() }` a safe no-op instead of a process death.
+//   - **accepted:** seeded `false` and **never set**. An accepted pipe's obligation is not stored
+//     at all: ``XPCPipe/takeCancelObligation()`` asks libxpc instead, via
+//     `Delivery.windowIsProvedClosed`. See below.
 //
-// ## The one hazard this file cannot close, stated precisely
+// ## The span that used to be "the one hazard this file cannot close" -- now closed
 //
-// It is **not** merely "no Decision-returned hook exists". It is sharper, and worth stating in the
-// form a future reader can act on:
+// The hazard was real and is worth recording, because the shape of the mistake recurs. An earlier
+// version of this file flipped the "a cancel is owed" flag from an `acceptWindowClosed()` hook
+// called when `building` returned. `building` returning is **not** the instant the accept
+// `Decision` reaches libxpc, and the span between them is exactly where the caller does its
+// publishing -- so the flag said "a cancel is owed" while a cancel was still illegal, and a caller
+// that dropped the pipe there ran `deinit`, cancelled into an open window (row A1) and killed the
+// process. The file documented that as unclosable, having tried two closures that both fail (never
+// cancelling accepted sessions silences `onPeerDeath`; deferring onto a caller queue has no
+// ordering relationship to the `Decision`).
 //
-//   ``acceptWindowClosed()`` fires when `building` returns, but the real window closes when the
-//   **Decision** is returned to libxpc. Those are not the same instant, and the span between them
-//   is exactly where the caller does its publishing. So the flag is re-armed **one step too
-//   early**, and a caller that drops the pipe in that span runs `deinit`, which cancels a session
-//   whose accept window is still open -- row 1 -- and the process dies.
+// **That enumeration was complete when it was written and was never revisited after
+// ``XPCPipe/onWindowProvedClosed(_:)`` landed** -- a third option, in this same file, three commits
+// later: a libxpc-ordered hook this file's own matrix measures safe to act from. The span is now
+// closed structurally rather than documented:
 //
-// This file cannot close that span: `accepting` has already returned by then, and the Decision is
-// returned by the caller. "Publish before you return" is therefore not a tidiness rule, it is the
-// mitigation, and it is documented on ``XPCPipe/accepting(_:queue:building:)`` where a caller will
-// meet it. To refuse a peer, use ``XPCPipe/rejecting(_:reason:)`` -- it never creates a session, so
-// there is nothing to dispose of and the span does not exist.
+//   * there is no stored flag to be re-armed early, and no `acceptWindowClosed()` hook;
+//   * `takeCancelObligation()` reads `Delivery.windowIsProvedClosed` at the moment of the take, so
+//     "the window has not been proved closed" answers **do nothing** -- and doing nothing means
+//     releasing the session uncancelled, which rows A2 and A4 measure safe *both inside the window
+//     and after it*. It is the one disposal that is safe without knowing where in the accept you
+//     are, which is precisely what a caller cannot know;
+//   * once a proof has fired, cancelling is legal (A11/A12 for the delivery exit, N8 for the
+//     cancellation exit), so the peer is still hung up promptly and `onPeerDeath` still fires;
+//   * how long the flag can stay false is bounded: a peer that connects and never sends never
+//     reaches the incoming-session closure at all (N2, 40/40), so there is no accepted pipe whose
+//     proof is not already in flight.
+//
+// "Publish before you return" survives as a rule, but it is now about the *core*, not about
+// survival: dropping the pipe in that span is safe, and what it costs is a peer that is released
+// rather than hung up. To refuse a peer, use ``XPCPipe/rejecting(_:reason:)`` -- it never creates a
+// session at all.
 //
 // **And the span is worse than "you must not drop the pipe in it": you must not touch the session
 // in it at all.** Measured after a process death in the server transport (Task 7 round 4): a `send`
@@ -151,11 +168,18 @@ import XPC
 // its own closure -- or schedule relative to it -- that is provably after the window. That kills
 // "defer past the closure" exactly as dead, and unlike the other claim it is true.
 //
-// What *is* provable is a libxpc-ordered event. Two are measured safe, and both are exits from the
-// window rather than guesses about its end:
+// What *is* usable is a libxpc-ordered event. Two are measured, and both are exits from the window
+// rather than guesses about its end:
 //
-//   * **the first message libxpc delivers** (A11, A12: 200 runs each, no trap) -- it cannot deliver
-//     on a session whose accept it has not finished;
+//   * **the first message libxpc delivers.** Two rows, and they say different things -- worth
+//     keeping separate, because collapsing them is how an earlier version of this comment came to
+//     claim more than it had. A11/A12 (200 runs each) say *acting from the first delivery does not
+//     trap*: absence of a trap, which is evidence about the operation. **A13** (60/60) is the
+//     ordering row, added because the first two do not establish it: it holds the accept window open
+//     50 ms with a spinner -- the same amplification that turns A8/A9's 1-in-150 into A8b/A9b's
+//     30/30 -- sets the session's target queue as this file does, and asserts that **no delivery
+//     lands before `return decision`**. So "the window is closed by the time a message arrives" is
+//     now a measurement rather than an inference about libxpc's internals.
 //   * **the session's cancellation handler** (N8: 40/40) -- it never fires inside the window, and
 //     does fire on peer death.
 //
@@ -264,11 +288,21 @@ private final class Delivery: Sendable {
     ///
     /// In both cases the hop is enqueued *before* the caller's own hop, so an owner learns the
     /// window is closed before the first op, or the peer-death notification, reaches it.
+    /// Whether either libxpc-ordered exit from the accept window has fired: the first inbound
+    /// message, or the session's cancellation.
+    ///
+    /// This is the **authoritative** answer to "has this accepted session's accept window closed?",
+    /// and `XPCPipe` reads it instead of storing a guess. It lives here rather than on the pipe
+    /// because only this object is on the receiving end of libxpc's callbacks -- and it is
+    /// deliberately independent of whether anyone installed a handler, because it records a
+    /// platform fact rather than an interest in one.
+    var windowIsProvedClosed: Bool { windowProofClaimed.load(ordering: .acquiring) }
+
     private func noteWindowProvedClosed() {
         // Fast path, and the only work done for all but one message in a connection's life.
         guard !windowProofClaimed.load(ordering: .relaxed) else { return }
         let (won, _) = windowProofClaimed.compareExchange(
-            expected: false, desired: true, ordering: .relaxed)
+            expected: false, desired: true, ordering: .releasing)
         guard won else { return }
 
         let handler = handlers.withLock { handlers -> (@Sendable () -> Void)? in
@@ -430,6 +464,7 @@ final class XPCPipe: MessagePipe {
     }
 
     private let session: XPCSession
+    private let origin: Origin
     private let delivery: Delivery
     private let state: Mutex<State>
 
@@ -443,15 +478,15 @@ final class XPCPipe: MessagePipe {
     /// a caller has to remember.
     private init(session: XPCSession, origin: Origin, delivery: Delivery) {
         self.session = session
+        self.origin = origin
         self.delivery = delivery
         switch origin {
         case .accepted:
-            // Already live, so nothing to activate -- but `sessionIsLive` starts **false** and is
-            // flipped by ``acceptWindowClosed()`` once `building` has returned. An accepted
-            // session cannot be cancelled while the listener's incoming-session closure is still
-            // running (measured: it traps), so the "a cancel is owed" flag must not be set until
-            // that window has closed. See the accept-window row of the matrix at the top of this
-            // file.
+            // Already live, so nothing to activate. `sessionIsLive` stays **false for the whole
+            // life of an accepted pipe** and is not the predicate for one: see
+            // ``takeCancelObligation()``, which reads `delivery.windowIsProvedClosed` instead. An
+            // accepted session may not be cancelled until libxpc has proved its accept window
+            // closed, and this file cannot know that instant -- only libxpc can tell it.
             self.state = Mutex(State(phase: .running, sessionIsLive: false))
         case .dialled:
             // Inactive. Cancelling it now would trap; only a successful `activate()` earns that.
@@ -476,12 +511,12 @@ final class XPCPipe: MessagePipe {
     ///     the session. This is the only safe "false" a dialled session has, and ``activate()`` is
     ///     what guarantees no other one exists: see its `.shutDown` arm, which activates before
     ///     cancelling rather than returning early.
-    ///   - **accepted, still inside the accept window** (``acceptWindowClosed()`` has not run) --
-    ///     safe because libxpc holds its own reference for the whole window, so this release is
-    ///     never the last one.
-    ///   - **accepted, `building` cancelled the pipe** -- safe because an accepted session never
-    ///     *requires* cancelling in order to be released; the flag is deliberately left false and
-    ///     the session is released uncancelled.
+    ///   - **accepted, libxpc has not yet proved the accept window closed** -- safe twice over:
+    ///     inside the window libxpc holds its own reference, so this release is never the last one
+    ///     (row A2), and after it a release of an uncancelled accepted session is safe and does
+    ///     deallocate (row A4). This is the case that used to be a process death.
+    ///   - **accepted, `building` cancelled the pipe** -- the same case: an accepted session never
+    ///     *requires* cancelling in order to be released, so the pipe is released uncancelled.
     ///
     /// The last two are **not** self-invalidation, and reading them that way leads to wrong
     /// conclusions about the whole accept path. See the matrix at the top of this file.
@@ -491,17 +526,46 @@ final class XPCPipe: MessagePipe {
     ///
     /// Reaching here at all is the L6 property: nothing libxpc retains points back at the pipe.
     deinit {
-        let owesCancel = state.withLock { st -> Bool in
-            let live = st.sessionIsLive
-            st.sessionIsLive = false
-            st.phase = .shutDown
-            return live
-        }
+        let owesCancel = takeCancelObligation()
         // Handlers first, so a delivery already in flight on `queue` finds nothing to call rather
         // than reaching into an owner that is being torn down.
         delivery.shutDown()
         if owesCancel {
             session.cancel(reason: "XPCPipe deinitialized")
+        }
+    }
+
+    /// Takes the one-shot "cancel this session" obligation, atomically, and marks it discharged.
+    ///
+    /// The single place the two kinds of session differ, and the reason they cannot share a stored
+    /// flag:
+    ///
+    ///   - **dialled:** the obligation is *stored*. `sessionIsLive` becomes true when
+    ///     ``activate()`` succeeds and is cleared here, because for a dialled session **not**
+    ///     cancelling is the trap. Semantics unchanged.
+    ///   - **accepted:** the obligation is *asked*, not stored, and the source of truth is libxpc:
+    ///     `delivery.windowIsProvedClosed`. Cancelling an accepted session before libxpc has proved
+    ///     its accept window closed traps (row A1); releasing one uncancelled never does, inside the
+    ///     window or after it (rows A2 and A4). So the safe reading of "not proved yet" is **do
+    ///     nothing**, and that is what makes this side of the file free of the span that used to be
+    ///     "the one hazard this file cannot close" -- see the header.
+    ///
+    /// `phase` is the latch rather than `sessionIsLive`, so that a `cancel()` followed by `deinit`
+    /// cannot cancel twice on the accepted path either (where `sessionIsLive` is always false and
+    /// therefore cannot latch anything). For the dialled path the guard is redundant but harmless:
+    /// every path that reaches `.shutDown` has already cleared or never set the flag.
+    private func takeCancelObligation() -> Bool {
+        state.withLock { st -> Bool in
+            guard st.phase != .shutDown else { return false }
+            st.phase = .shutDown
+            switch origin {
+            case .dialled:
+                let live = st.sessionIsLive
+                st.sessionIsLive = false
+                return live
+            case .accepted:
+                return delivery.windowIsProvedClosed
+            }
         }
     }
 
@@ -581,9 +645,10 @@ final class XPCPipe: MessagePipe {
     ///
     /// # What it is for
     ///
-    /// The span documented at the top of this file -- between ``acceptWindowClosed()`` (which fires
-    /// when `building` returns) and the Decision actually reaching libxpc -- cannot be closed by
-    /// this file, and it turns out it cannot be closed by the caller either.
+    /// The span documented at the top of this file -- between `building` returning and the Decision
+    /// actually reaching libxpc -- cannot be *observed* by this file, and it turns out it cannot be
+    /// observed by the caller either. This hook is what lets both stop trying: it reports the fact
+    /// rather than predicting the instant, and it is what closed that span (see the header).
     ///
     /// **Not because the window outlives the closure.** It does not: the window is exactly
     /// `[request.accept() … Decision reaches libxpc]`, and a send immediately after the Decision has
@@ -601,11 +666,14 @@ final class XPCPipe: MessagePipe {
     ///
     /// What *is* safe is a libxpc-ordered event, and there are two:
     ///
-    /// * **the first delivery** (A11, A12: 200 runs each, no trap). libxpc cannot deliver on a
-    ///   session whose accept it has not finished, so **a message having arrived is a proof, not an
-    ///   inference.** It normally arrives at once, because the peer's first blob is what made libxpc
-    ///   run the incoming-session closure in the first place and is then redelivered like any other
-    ///   -- including when the peer cancels in its very next statement (N3, 150/150).
+    /// * **the first delivery**, on three rows that say three different things and are worth not
+    ///   collapsing. A11/A12 (200 runs each) say acting from the first delivery does not trap --
+    ///   evidence about the *operation*. **A13 (60/60) is the ordering row**: window held open 50 ms
+    ///   with a spinner, target queue set as this file sets it, and no delivery lands before
+    ///   `return decision`. N3 (150/150) says the triggering blob is redelivered even if the peer
+    ///   cancels in its very next statement. Together they support "a message having arrived means
+    ///   the window is closed"; A11/A12 alone would not, and an earlier version of this doc said
+    ///   they did.
     /// * **the session's cancellation** (N8: 40/40 -- never inside the window, and does fire on peer
     ///   death). This is the exit that bounds the problem: without it, a peer that connected and
     ///   then died would leave an owner's bookkeeping stranded forever, holding a live session.
@@ -643,13 +711,7 @@ final class XPCPipe: MessagePipe {
     /// session anyway and cancels it immediately. Deferring rather than skipping is the only
     /// arrangement that satisfies every row of the disposal matrix at the top of this file.
     func cancel() {
-        let owesCancel = state.withLock { st -> Bool in
-            guard st.phase != .shutDown else { return false }
-            st.phase = .shutDown
-            let live = st.sessionIsLive
-            st.sessionIsLive = false
-            return live
-        }
+        let owesCancel = takeCancelObligation()
         // Before the libxpc cancel, so the cancellation handler libxpc is about to run finds no
         // `onPeerDeath` and does not report our own hang-up as the peer dying.
         delivery.shutDown()
@@ -661,36 +723,6 @@ final class XPCPipe: MessagePipe {
     // ---------------------------------------------------------------------------------------
     // MARK: Activation
     // ---------------------------------------------------------------------------------------
-
-    /// Called by ``accepting(_:queue:building:)`` once `building` has returned -- i.e. once the
-    /// pipe is fully built and the accept decision is about to go back to libxpc.
-    ///
-    /// Until this runs, an accepted pipe deliberately believes no cancel is owed, because
-    /// cancelling an accepted session from inside the listener's incoming-session closure traps
-    /// (`_xpc_api_misuse`). After it runs, the ordinary rule applies and ``cancel()`` / ``deinit``
-    /// will hang the peer up.
-    ///
-    /// If `building` cancelled the pipe, the phase is `.shutDown` and the flag is deliberately
-    /// left false: the session is then released uncancelled, which for an *accepted* session is
-    /// measured safe (unlike a dialled one). The peer is dropped when the pipe is released.
-    ///
-    /// - Important: **this fires one step too early, and that is the one hazard this file cannot
-    ///   close.** `building` returning is not the same instant as the accept `Decision` reaching
-    ///   libxpc, and only the latter actually closes the window. Between them the flag says "a
-    ///   cancel is owed" while a cancel is still illegal -- which is precisely the span in which
-    ///   the caller publishes the pipe, so a caller that drops it there dies. There is no later
-    ///   hook to move this to: ``accepting(_:queue:building:)`` has already returned by then and
-    ///   the `Decision` is returned by the caller. Two closures were tried and both fail (never
-    ///   cancelling accepted sessions silences `onPeerDeath`; deferring onto a caller queue has no
-    ///   ordering relationship to the `Decision`, since the incoming-session closure runs on
-    ///   `com.apple.listener.queue` whatever `XPCListener(targetQueue:)` says). The mitigation is
-    ///   documentation, and it lives on ``accepting(_:queue:building:)`` where a caller meets it.
-    private func acceptWindowClosed() {
-        state.withLock { st in
-            guard st.phase == .running else { return }
-            st.sessionIsLive = true
-        }
-    }
 
     /// Activates a dialled session exactly once. Private: ``connecting(to:queue:building:)`` and
     /// its siblings are the only callers, and they construct-and-activate in one step so there is
@@ -831,17 +863,16 @@ extension XPCPipe {
     ///   strong reference** -- nothing in libxpc holds one (L6) -- so whoever calls this owns the
     ///   connection's lifetime.
     ///
-    /// - Important: **publish the returned pipe before returning the decision, and do not drop it.**
-    ///   Releasing it while still inside the listener's closure runs `deinit`, which cancels a
-    ///   session whose accept window is still open -- an `_xpc_api_misuse` trap, i.e. a **process
-    ///   death, not a leak**.
+    /// - Important: **publish the returned pipe before returning the decision.** Dropping it in
+    ///   that span is no longer fatal -- it used to be a process death and is now a released peer,
+    ///   see the header -- but it still abandons a connection the peer believes it has, and it
+    ///   abandons it *silently*: the session is released uncancelled, so the peer is not hung up
+    ///   promptly.
     ///
-    ///   The precise reason, because it is worth not rediscovering: ``acceptWindowClosed()`` fires
-    ///   when `building` returns, but the window actually closes when the **Decision** reaches
-    ///   libxpc. Those are different instants, and the span between them is exactly where a caller
-    ///   does its publishing -- so the "a cancel is owed" flag is re-armed **one step too early**,
-    ///   and a drop inside that span cancels into a still-open window. This function cannot close
-    ///   the span: it has already returned by then, and only the caller can return the Decision.
+    ///   **You may not send to, cancel, or otherwise operate on the session in that span**, and that
+    ///   has not changed: every such operation traps (rows A5, A7–A10), and this function cannot
+    ///   tell you when the span ends because only the caller returns the Decision. Defer any such
+    ///   work to ``onWindowProvedClosed(_:)``, which is exactly what it is for.
     ///
     ///   To turn a peer away use ``rejecting(_:reason:)`` *instead of* calling this -- it creates
     ///   no session, so the span does not exist -- rather than accepting and then discarding.
@@ -871,13 +902,18 @@ extension XPCPipe {
             session.setTargetQueue(queue)
             let pipe = XPCPipe(session: session, origin: .accepted, delivery: delivery)
             build(pipe)
-            pipe.acceptWindowClosed()
             return (decision, pipe)
         }
     }
 
-    /// Refuses an inbound session. **This is the correct way to turn a peer away** -- e.g. while
-    /// the server is draining, or when a peer requirement fails.
+    /// Refuses an inbound session. **This is the correct way to turn a peer away** -- today that
+    /// means one thing: the server is draining.
+    ///
+    /// It does **not** yet mean "a peer requirement failed". There is no peer-gating facility in this
+    /// stack: RULING 3 removed `peerAttestation` from ``MessagePipe`` and nothing replaced it, so a
+    /// caller has nothing to check a peer against. When one is added this is where the refusal
+    /// belongs, which is why the shape is worth stating -- but it is not a use case a caller has
+    /// today, and listing it as one implies a facility that does not exist.
     ///
     /// Refusing is not the same as accepting and then cancelling. `reject` never creates an
     /// `XPCSession` at all, so there is nothing to dispose of and none of the accept-window

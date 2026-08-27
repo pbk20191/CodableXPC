@@ -346,14 +346,26 @@ public final class XPCClientTransport: ClientTransport {
         // the application (which `ClientTransport`'s own guidance recommends) kept it open
         // indefinitely after shutting down, and only `deinit` closed it.
         //
-        // Safe here, and only here:
-        // * by the time this runs `liveCalls == 0` and -- by the LIFO ordering of `withStream`'s
-        //   two `defer`s -- every stream is already out of the mux's table with its ops already
-        //   handed to `pipe.send`. So this fails nothing that is live.
-        // * a `withStream` body still unwinding finds `clientCallFinished` a no-op, and a
-        //   `pipe.send` after `cancel()` throws `.unavailable`, which is the correct surface.
-        // * `close()` is idempotent, so the `.shutDown`-returns-immediately arm reaching it is
-        //   harmless.
+        // Safe here, and only here -- but the two paths that reach it are safe for **different
+        // reasons**, and an earlier version of this comment gave the graceful one's reason for both:
+        //
+        // * **graceful** (`beginGracefulShutdown()`, then the last call drains): `liveCalls == 0` by
+        //   the time this runs, and by the LIFO ordering of `withStream`'s two `defer`s every stream
+        //   is already out of the mux's table with its ops already handed to `pipe.send`. So this
+        //   fails nothing that is live.
+        // * **cancelled** (this call's task): `liveCalls` may be **non-zero** -- and this is where
+        //   the old comment was wrong, because `shutDownForcefully()` sets `.shutDown`
+        //   unconditionally without reading or zeroing the count, so bodies can still be unwinding.
+        //   What makes it safe is not the count but the ordering: `onCancel` has already run
+        //   `core.failAll(...)`, so every stream is failed and every parked waiter woken *before*
+        //   this line, and `close()`'s own `failAll` finds nothing left to fail. gRPC documents task
+        //   cancellation as the forceful lever precisely so that in-flight calls do not have to be
+        //   waited for.
+        //
+        // In both cases: a `withStream` body still unwinding finds `clientCallFinished` a no-op, and
+        // a `pipe.send` after `cancel()` throws `.unavailable`, which is the correct surface. And
+        // `close()` is idempotent, so the `.shutDown`-returns-immediately arm reaching it is
+        // harmless.
         //
         // A *second*, concurrent `connect()` throws `concurrentConnect` above and never reaches
         // this line -- which is required, not incidental: it must not close the session out from
