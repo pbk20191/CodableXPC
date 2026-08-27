@@ -28,23 +28,52 @@ enum FlowControl {
 
     /// §O4/§O5: what a `message` costs its stream and connection windows.
     ///
-    /// Clamped to the window it must fit in -- an op body is atomic (§O2 has no chunking), so a
-    /// charge above the window could never be reserved and the sender would park forever with
-    /// nothing on the wire for the peer to consume. Both peers derive it from a payload length
-    /// both already know, so it needs no negotiation and no protocol change.
+    /// **Clamped above, floored below: `max(1, min(payloadLength, window))`.** Two independent
+    /// rules, each closing a measured hole, and both peers derive the value from a payload length
+    /// both already know -- so it needs no negotiation and no protocol change.
+    ///
+    /// # The clamp (upper bound): an oversize message must stay reservable
+    ///
+    /// An op body is atomic (§O2 has no chunking), so a charge above the window could never be
+    /// reserved: the sender would park forever with nothing on the wire for the peer to consume.
+    /// Clamping to the window makes an oversize message serialise the *connection* -- head-of-line
+    /// blocking -- instead of deadlocking it.
+    ///
+    /// # The floor (lower bound): a zero-length message must not be free
+    ///
+    /// A `message` op costs **at least one byte of window even when its payload is empty**. Added
+    /// per §O4's amendment after Task 6's review: without it, a zero-length `message` -- legal, and
+    /// `google.protobuf.Empty` makes it common -- is a ten-byte wire op that buys the receiver
+    /// unbounded buffering for free, and it *survives* §O4's receive-side enforcement rule because
+    /// a correct enforcement still charges it nothing. Flooring keeps one counter meaningful
+    /// instead of needing a second one that counts messages rather than bytes.
+    ///
+    /// Note what the floor changes for callers: `charge(for:)` now returns `>= 1` for **every**
+    /// `message`, so a `if charge > 0` test at a call site means "is this part flow-controlled?",
+    /// not "is the payload non-empty?" -- and ``FlowControlWindow/reserve(upTo:)``'s "at least 1
+    /// byte" precondition becomes unreachable by construction for message sends rather than
+    /// something a caller must remember to guard.
+    ///
+    /// # One definition
     ///
     /// **The send side and the receive side MUST call this same function.** Reserving with one
     /// clamp and crediting with another -- or with a hand-inlined copy of the formula that later
     /// drifts -- makes credit stop matching charge, and the window then grows or shrinks silently
     /// until a stream stalls with no visible cause. That is the entire reason this is a function
-    /// and not a sentence in a doc comment.
+    /// and not a sentence in a doc comment. The floor makes that doubly true: a receiver that
+    /// clamped but did not floor would credit 0 for a message the sender paid 1 for, and the
+    /// window would leak one byte per empty message.
     ///
     /// - Parameter window: the window this charge must fit in. Defaults to ``initialWindow``,
     ///   which is what §O5 deviation 1 fixes production windows at; pass a `FlowControlWindow`'s
     ///   own `initial` for any window sized differently, or the clamp stops matching the window
-    ///   and an oversize message parks forever.
+    ///   and an oversize message parks forever. **Must be at least 1** for the result to be
+    ///   reservable at all: with `window == 0` the floor wins and returns 1, which no such window
+    ///   could ever grant. Nothing in this transport builds a zero-sized window (§O5 deviation 1
+    ///   fixes every one of them at ``initialWindow``); the degenerate case is called out here
+    ///   rather than trapped so this stays a pure function.
     static func charge(for payloadLength: Int, window: Int = initialWindow) -> Int {
-        min(payloadLength, window)
+        max(1, min(payloadLength, window))
     }
 }
 
@@ -274,10 +303,14 @@ final class FlowControlWindow: Sendable {
     ///
     /// - Parameter requested: how many bytes of the sender's *charge* remain unreserved. Must be
     ///   at least 1 -- a zero-byte reservation has nothing to wait for and no meaning, so it traps
-    ///   rather than quietly returning. **A zero-length message is legal and common**
-    ///   (`google.protobuf.Empty`): §O4 charges it nothing, and it must simply not reach this call.
-    ///   The `while remaining > 0` loop in the type's doc comment already skips it; a straight-line
-    ///   `reserve(upTo: payload.count)` does not, and would trap.
+    ///   rather than quietly returning. **A zero-length message can no longer produce one.**
+    ///   (Corrected with §O4's floor: this doc previously said "§O4 charges a zero-length message
+    ///   nothing, and it must simply not reach this call". That was true and is now not --
+    ///   ``FlowControl/charge(for:window:)`` floors at 1, so `google.protobuf.Empty` charges 1
+    ///   byte and reaches this call legitimately.) The trap still guards the real caller bug it
+    ///   always guarded: a straight-line `reserve(upTo: someRemaining)` where `someRemaining` has
+    ///   already reached 0, i.e. a loop written without the `while remaining > 0` test in the
+    ///   type's doc comment.
     /// - Returns: a **partial** reservation: at least 1, at most `requested`. The caller loops
     ///   until it has reserved everything it needs (see the type's doc comment).
     /// - Throws: the window's failure (`RPCError(code: .unavailable)` when the connection is torn
@@ -624,6 +657,31 @@ struct WindowAccountant {
         guard accumulated >= threshold else { return nil }
         // Clamped so one enormous delivery cannot produce a credit the peer must reject (§O4's
         // 2^31-1 ceiling) -- the remainder stays accumulated and goes out with the next message.
+        let credit = min(accumulated, FlowControl.maxWindow)
+        accumulated -= credit
+        return UInt32(credit)
+    }
+
+    /// Emits everything accumulated **regardless of the threshold**, for the one moment when
+    /// there is no future delivery to carry a remainder: the stream this ledger belongs to is
+    /// being removed.
+    ///
+    /// ``consumed(_:)``'s batching is safe precisely because a long-lived ledger crosses the
+    /// threshold on some later delivery (see the type's "Lifetime" note). At a removal that
+    /// promise expires: up to `threshold - 1` bytes -- as much as 32 766 with the default window
+    /// -- would sit accumulated forever, permanently shrinking the peer's window by that much per
+    /// removed stream. That is the same class of bug as L3's stranded charge, one layer down, and
+    /// it is why the connection ledger's flush at removal has to ignore the threshold rather than
+    /// merely be *offered* the bytes.
+    ///
+    /// - Returns: the credit to send now, or `nil` if nothing is accumulated. Clamped to §O4's
+    ///   2³¹−1 ceiling exactly as ``consumed(_:)`` is, so an enormous accumulation needs a second
+    ///   call rather than producing a credit the peer must reject.
+    /// - Note: not "reset". The remainder above the ceiling stays accumulated, and the accountant
+    ///   remains usable -- calling this on the **connection** ledger is normal and happens on
+    ///   every stream removal; it does not retire the ledger.
+    mutating func flush() -> UInt32? {
+        guard accumulated > 0 else { return nil }
         let credit = min(accumulated, FlowControl.maxWindow)
         accumulated -= credit
         return UInt32(credit)

@@ -49,6 +49,15 @@ import Synchronization
 //     consumption callback captures it weakly too. Both matter: an accepted stream sits in
 //     `acceptedStreams`' buffer *inside* the core until `listen()` drains it, so a strong edge
 //     back would make the core immortal.
+//   - `acceptedStreams`' iterator callback captures it weakly for the same reason.
+//   - **the one strong edge that remains is `StreamEntry.cancellationObserver`, and it is a
+//     caller's obligation, not this file's.** The closure is supplied by Task 7 and stored in the
+//     registry, so `core -> registry -> entry -> observer -> core` is a *self*-cycle that no
+//     external weak-reference check can see. It cannot be held weakly (it is a closure, not a
+//     reference), so the rule is stated instead and repeated on
+//     ``setCancellationObserver(forStream:_:)``: the observer must not capture the core. The
+//     intended shape, `{ handle.cancel() }` over a `RPCCancellationHandle` from
+//     `withServerContextRPCCancellationHandle`, captures nothing that points back here.
 //   - a write after the core is gone throws `RPCError(code: .unavailable)`; it never traps and
 //     never reports a send that did not happen.
 //
@@ -79,11 +88,33 @@ import Synchronization
 // * **An accept is refused, never trapped.** A stream id of 0, an even id, a malformed method
 //   path, a draining connection or too many concurrent streams all produce a `status` or `cancel`
 //   op for that id and no table entry.
-// * **Concurrent inbound streams are capped** at ``maxConcurrentInboundStreams``. §O4's byte
-//   credit bounds bytes per stream but says nothing about stream *count*, and §O5 negotiates
-//   nothing, so this is a local resource guard rather than protocol surface: an over-limit
-//   `openStream` is answered with `status(resourceExhausted)`, which is an ordinary gRPC failure
-//   the peer's client already understands.
+// * **The receive window is ENFORCED, not merely accounted for** (§O4, amended). Received-but-
+//   uncredited bytes are tracked per stream (`StreamEntry.unconsumedCharge`) and for the
+//   connection (`Registry.connectionUnconsumed`), and a peer that pushes past either bound is
+//   failed at that bound's blast radius: a stream over its 65 535 fails *that stream* and gets a
+//   `cancel`; the connection total over its own fails the *connection*. This is what HTTP/2 spends
+//   `FLOW_CONTROL_ERROR` on. Without it the inbound `AsyncThrowingStream` is an unbounded buffer
+//   and a peer that simply ignores `credit` retains 16 MiB per op, on every admitted stream, until
+//   an application that will never read it does. An accountant with no debit side is not flow
+//   control. See ``deliver(_:toStream:)`` for the exactness argument -- the counter mirrors the
+//   peer's own send-window arithmetic byte for byte, so it can never fail a conforming peer.
+// * **A zero-length `message` is not free.** `FlowControl.charge(for:window:)` floors at 1 byte
+//   (§O4, amended), so the enforcement above bounds empty-payload floods too. Without the floor a
+//   ten-byte wire op bought unbounded buffering and *survived* the enforcement rule, because a
+//   correct enforcement still charges a zero-length payload nothing.
+// * **Concurrent inbound streams are capped** at ``maxConcurrentInboundStreams``, counting streams
+//   in the table **plus accepts yielded but not yet pulled**. §O4's byte credit bounds bytes per
+//   stream but says nothing about stream *count*, and §O5 negotiates nothing, so this is a local
+//   resource guard rather than protocol surface: an over-limit `openStream` is answered with
+//   `status(resourceExhausted)`, which is an ordinary gRPC failure the peer's client already
+//   understands. Counting the undrained accepts is not belt-and-braces: one blob carrying
+//   `openStream(id) ; cancel(id)` inserts an entry, yields it, and removes the entry again inside a
+//   single routing turn, so a table-only cap never engages while the buffer grows without bound at
+//   two ops per item.
+// * **Peer bytes are never reflected back unbounded.** A `cancel` op's `reason` is built from an
+//   error whose message can embed up to 16 MiB of peer-supplied field data (a `-bin` key with a
+//   non-base64 value, say), so every reason this file sends goes through
+//   ``truncatedForWire(_:)``.
 // * **A grammar violation fails one stream** (§O2): the machine's throw is never `try?`-swallowed,
 //   the stream is removed, its inbound sequence is failed with the machine's own error, and a
 //   `cancel` op goes out. The connection is untouched.
@@ -91,7 +122,14 @@ import Synchronization
 //   and it is not a §O2 violation: a framing error is not attributable to any stream and leaves
 //   the remainder of the blob unparseable, so there is nothing to resynchronise to.
 // * **An overflowing `credit` fails the connection**, per the plan's contract line 3 -- that one
-//   *is* a peer-triggered teardown, and it is the only one besides a framing error.
+//   *is* a peer-triggered teardown, and it is one of only three (the others being a framing error
+//   and a connection-level receive-window overrun).
+// * **An inbound `goAway` cannot stop this side accepting work.** Draining is two *directional*
+//   facts, not one state: `localDraining` (we sent `goAway`) gates inbound accepts and ends the
+//   accept loop; `peerDraining` (the peer sent one) gates only our own ``openStream``. Collapsing
+//   them into a single `Phase` -- which this file did until Task 6's review -- handed a peer a
+//   one-op lever that permanently stopped the connection accepting new streams, and contradicted
+//   `goAway`'s own directional meaning.
 
 // ===========================================================================================
 // MARK: - The accepted-stream payload
@@ -133,11 +171,15 @@ struct AcceptedRPCStream: Sendable {
 ///
 /// // client
 /// let (id, stream) = try core.openStream(descriptor: descriptor, timeout: options.timeout)
-/// core.cancelStream(id, reason: "…")            // withStream exit / local abandon
+/// defer { core.clientCallFinished(id) }         // MUST run on every withStream exit path
+/// core.cancelStream(id, reason: "…")            // an explicit local abandon (deadline, etc.)
 ///
 /// // server
-/// for await accepted in core.acceptedStreams { … ; core.streamHandlerFinished(accepted.id) }
+/// for await accepted in core.acceptedStreams {  // iterate ONCE; pulling releases the accept slot
+///     … ; core.streamHandlerFinished(accepted.id)   // MUST run on every handler exit path
+/// }
 /// let alreadyOver = core.setCancellationObserver(forStream: id) { handle.cancel() }
+///                                              // the observer MUST NOT capture the core (L6)
 ///
 /// // both
 /// core.beginDraining()                          // goAway + refuse new streams + end accept loop
@@ -187,12 +229,26 @@ final class RPCTransportCore: Sendable {
         RPCAsyncSequence<RPCRequestPart<GRPCSwiftData>, any Error>,
         RPCWriter<RPCResponsePart<GRPCSwiftData>>.Closable>
 
-    /// The cap on simultaneously live *inbound* streams -- a local resource guard, not protocol
-    /// surface (see the file overview). §O4's byte credit bounds a stream's bytes; nothing in the
-    /// op model bounds how many streams a peer may open, and §O5 negotiates nothing, so without
-    /// this a peer can spend ~40 wire bytes per `openStream` to buy a table entry, two windows and
-    /// an `AsyncThrowingStream` each. Over-limit accepts are refused with
-    /// `status(resourceExhausted)`, which is an ordinary gRPC failure on the peer's side.
+    /// The cap on outstanding *inbound* streams -- a local resource guard, not protocol surface
+    /// (§O5 deviation 6). §O4's byte credit bounds a stream's bytes; nothing in the op model bounds
+    /// how many streams a peer may open, and §O5 negotiates nothing, so without this a peer can
+    /// spend ~40 wire bytes per `openStream` to buy a table entry, two windows and an
+    /// `AsyncThrowingStream` each. Over-limit accepts are refused with `status(resourceExhausted)`,
+    /// which is an ordinary gRPC failure on the peer's side.
+    ///
+    /// **"Outstanding" counts the table *plus* accepts yielded but not yet pulled**, and that
+    /// second term is load-bearing rather than defensive. A table-only cap does not bound anything:
+    /// one blob carrying `openStream(id) ; cancel(id)` inserts an entry, yields the built stream,
+    /// and removes the entry again -- all inside one routing turn -- so the table returns to its
+    /// previous size while `acceptedStreams`' buffer grows by one, for about sixty wire bytes.
+    /// Repeat with 3, 5, 7… and the cap never engages. `Registry.outstandingAccepts` is incremented
+    /// at the `yield` and decremented when ``AcceptedStreamSequence``'s iterator actually hands the
+    /// item to the accept loop.
+    ///
+    /// The sum double-counts a stream that is *both* in the table and undrained, so the effective
+    /// limit during an accept-loop backlog is lower than 256. That is deliberate and is the safe
+    /// direction: it admits fewer streams, never more, and in steady state the accept loop drains
+    /// continuously so `outstandingAccepts` sits at 0.
     ///
     /// 256 is chosen in the range HTTP/2 servers use for `SETTINGS_MAX_CONCURRENT_STREAMS`
     /// (gRPC's own default is 100, nginx's 128) and is far above anything the test suite needs.
@@ -216,25 +272,26 @@ final class RPCTransportCore: Sendable {
 
     /// Inbound streams, fully built (L5). Finished by ``beginDraining()``, ``failAll(_:)`` and
     /// `deinit`; a client-role core never yields into it.
-    let acceptedStreams: AsyncStream<AcceptedRPCStream>
+    ///
+    /// An ``AcceptedStreamSequence`` rather than the bare `AsyncStream` because pulling an item is
+    /// what releases its slot against ``maxConcurrentInboundStreams`` -- see that constant's doc
+    /// comment for why a table-only cap bounds nothing.
+    ///
+    /// **Iterate it exactly once.** It is computed rather than stored so that the slot-releasing
+    /// callback can capture `self` weakly (L6) -- a stored property cannot, because the capture
+    /// would have to happen before `init` has finished initializing it. Each access therefore
+    /// returns a fresh wrapper over the *same* underlying `AsyncStream`, whose single-consumer
+    /// contract is what makes "iterate once" the rule either way.
+    var acceptedStreams: AcceptedStreamSequence {
+        AcceptedStreamSequence(base: acceptedBase) { [weak self] in self?.acceptDidDeliver() }
+    }
+
+    private let acceptedBase: AsyncStream<AcceptedRPCStream>
     private let acceptedContinuation: AsyncStream<AcceptedRPCStream>.Continuation
 
     // =======================================================================================
     // MARK: - Mutable state (one lock)
     // =======================================================================================
-
-    /// L7: explicit, not inferred from side effects.
-    ///
-    /// - `.running -> .draining`: local ``beginDraining()`` (we sent `goAway`) **or** an inbound
-    ///   `goAway` (the peer will accept no more new streams). Either way ``openStream`` throws
-    ///   `.unavailable` from here on; streams already open are untouched.
-    /// - `.running`/`.draining` `-> .closed`: ``failAll(_:)`` -- peer death, a connection-level
-    ///   protocol error, `deinit`, or a forceful teardown. Terminal.
-    private enum Phase: Sendable {
-        case running
-        case draining
-        case closed
-    }
 
     /// One live stream's state.
     ///
@@ -263,7 +320,17 @@ final class RPCTransportCore: Sendable {
         var receive: WindowAccountant
 
         /// Charge received on this stream but not yet consumed by the application, and therefore
-        /// not yet credited. Flushed into the **connection** accountant when the stream is
+        /// not yet credited. Also the per-stream half of §O4's receive-window **enforcement**:
+        /// exceeding ``FlowControl/initialWindow`` fails this stream (see
+        /// ``RPCTransportCore/deliver(_:toStream:)``).
+        ///
+        /// Unlike `Registry.connectionUnconsumed` this is decremented on *consumption* rather than
+        /// on credit emission, which makes it up to `threshold - 1` bytes **more lenient** than the
+        /// peer's real stream entitlement -- never stricter, so it cannot fail a conforming peer.
+        /// The looser bound is deliberate: the flush at removal needs the count of bytes the
+        /// application never took, which is exactly a consumption-based figure.
+        ///
+        /// Flushed into the **connection** accountant when the stream is
         /// removed -- that flush is L3: without it, a handler that returns without draining its
         /// request half strands exactly this many bytes of the peer's connection window forever,
         /// and after a handful of RPCs the connection wedges (measured in the old build: 33 of 200
@@ -280,6 +347,10 @@ final class RPCTransportCore: Sendable {
         /// Fired when this stream is torn down abnormally, so a server handler's
         /// `ServerContext.cancellation` handle can be cancelled. Never fired on a clean
         /// completion, which would tell a handler it was cancelled after it had already succeeded.
+        ///
+        /// **Held strongly, and the only strong edge into the core this file cannot break** -- see
+        /// the L6 rule on ``RPCTransportCore/setCancellationObserver(forStream:_:)``: the supplier
+        /// must not let it capture the core.
         var cancellationObserver: (@Sendable () -> Void)?
 
         /// L12: at most one per deadline-bearing RPC, cancelled on every removal path.
@@ -305,8 +376,29 @@ final class RPCTransportCore: Sendable {
             AsyncThrowingStream<RPCResponsePart<GRPCSwiftData>, any Error>.Continuation)
     }
 
+    /// L7: the connection's lifecycle, explicit and under the one lock.
+    ///
+    /// **Three flags, not one enum, and that is the fix for a real defect.** A single
+    /// `Phase = .running | .draining | .closed` conflated two *directional* facts, so an inbound
+    /// `goAway` -- which says only "I will accept no more streams from you" -- also made this side
+    /// refuse the peer's own subsequent `openStream` ops with `status(.unavailable)`. That
+    /// contradicted `goAway`'s meaning, contradicted this file's own documentation of it, and handed
+    /// a peer a one-op lever that permanently stopped the connection accepting work.
+    ///
+    /// | flag | set by | gates |
+    /// |---|---|---|
+    /// | `localDraining` | ``beginDraining()`` -- we sent `goAway` | inbound accepts (refused with `status(.unavailable)`), our own ``openStream``, and it finishes `acceptedStreams` |
+    /// | `peerDraining` | ``peerBeganDraining()`` -- the peer sent `goAway` | **only** our own ``openStream`` (contract line 8 asks exactly this) |
+    /// | `isClosed` | ``failAll(_:)`` -- peer death, a connection-level protocol error, `deinit`, a forceful teardown | everything. Terminal, and never un-set |
+    ///
+    /// The two draining flags are independent facts about two directions, not states of one
+    /// machine; ``isDraining`` is their disjunction with `isClosed` for callers that want the
+    /// summary.
     private struct Registry {
-        var phase: Phase = .running
+        var isClosed = false
+        var localDraining = false
+        var peerDraining = false
+
         var streams: [RPCStreamID: StreamEntry] = [:]
 
         /// Client-allocated stream ids: odd, ascending, never reused. `0` is the sentinel for
@@ -315,16 +407,58 @@ final class RPCTransportCore: Sendable {
         /// wrapping: a wrapped id would silently collide with a live stream.
         var nextClientStreamID: RPCStreamID = 1
 
+        /// §O4's connection-level receive ledger. **One per connection, outliving every stream**
+        /// -- a per-stream instance would strand up to `threshold - 1` bytes of the connection
+        /// window per RPC. (`WindowAccountant.flush()` exists for the one moment that promise
+        /// expires: the stream removal in ``removeStream(_:failingInboundWith:sendingCancel:)``,
+        /// where there is no future delivery to carry a remainder.)
+        var connectionReceive = WindowAccountant()
+
+        /// §O4's connection-level receive **window**, as opposed to the ledger above: bytes
+        /// charged on this connection minus bytes actually credited back to the peer.
+        ///
+        /// This is the debit side the accountant does not have, and it mirrors the peer's own send
+        /// arithmetic exactly -- which is what makes enforcement safe. The peer's available
+        /// connection window is `initialWindow - (charged - credited)`, so
+        /// `connectionUnconsumed > initialWindow` is precisely "the peer's own window went
+        /// negative", something a conforming peer cannot do. Note it is decremented by what is
+        /// *emitted*, not by what is consumed: consumption is batched, so a consumption-based
+        /// counter would run up to `threshold - 1` bytes more lenient than the peer's real
+        /// entitlement.
+        var connectionUnconsumed = 0
+
+        /// Accepts yielded into `acceptedStreams` but not yet pulled by the accept loop. Counted
+        /// against ``maxConcurrentInboundStreams`` alongside `streams.count` -- see that constant.
+        var outstandingAccepts = 0
+
         /// The highest stream id seen in either direction, for `goAway`'s `lastStreamID`.
         var highestStreamID: RPCStreamID = 0
 
-        /// §O4's connection-level receive ledger. **One per connection, outliving every stream**
-        /// -- `WindowAccountant` has no flush, so a per-stream instance would strand up to
-        /// `threshold - 1` bytes of the connection window per RPC.
-        var connectionReceive = WindowAccountant()
-
         /// `acceptedStreams`' continuation may be finished at most once, from three racing places.
         var acceptedFinished = false
+
+        // ---------------------------------------------------------------------------------
+        // Connection-ledger helpers. Every emission of connection credit goes through one of
+        // these two, so the `connectionUnconsumed` debit can never drift from what went out.
+        // ---------------------------------------------------------------------------------
+
+        /// Records `bytes` consumed on the connection and returns the batched credit, if any.
+        mutating func creditConnection(consuming bytes: Int) -> UInt32? {
+            guard let credit = connectionReceive.consumed(bytes) else { return nil }
+            connectionUnconsumed -= Int(credit)
+            return credit
+        }
+
+        /// Records `bytes` and then flushes the ledger unconditionally, for a stream removal.
+        /// Returns **up to two** credits rather than summing them, so no assumption is made about
+        /// the total staying inside §O4's 2³¹−1 ceiling.
+        mutating func flushConnection(recording bytes: Int) -> [UInt32] {
+            var credits: [UInt32] = []
+            if bytes > 0, let credit = connectionReceive.consumed(bytes) { credits.append(credit) }
+            if let credit = connectionReceive.flush() { credits.append(credit) }
+            connectionUnconsumed -= credits.reduce(0) { $0 + Int($1) }
+            return credits
+        }
     }
 
     private let registry = Mutex(Registry())
@@ -338,13 +472,11 @@ final class RPCTransportCore: Sendable {
     /// stale before the getter returns.
     var liveStreamCount: Int { registry.withLock { $0.streams.count } }
 
+    /// The disjunction of all three lifecycle flags: `true` once this connection has begun
+    /// winding down for any reason, in either direction. A summary for callers -- the code below
+    /// always tests the specific flag it means.
     var isDraining: Bool {
-        registry.withLock {
-            switch $0.phase {
-            case .running: return false
-            case .draining, .closed: return true
-            }
-        }
+        registry.withLock { $0.isClosed || $0.localDraining || $0.peerDraining }
     }
 
     // =======================================================================================
@@ -368,7 +500,7 @@ final class RPCTransportCore: Sendable {
         self.codec = codec
         self.role = role
         let (stream, continuation) = AsyncStream.makeStream(of: AcceptedRPCStream.self)
-        self.acceptedStreams = stream
+        self.acceptedBase = stream
         self.acceptedContinuation = continuation
         self.installPipeHandlers()
     }
@@ -489,6 +621,8 @@ final class RPCTransportCore: Sendable {
         // owed back to its connection window whether or not the op turns out to be legal.
         let charge: Int
         if case .message(_, let payload) = op {
+            // §O4's floor makes this at least 1 even for an empty payload, so `charge > 0` below
+            // reads as "this op is flow-controlled", not "the payload is non-empty".
             charge = FlowControl.charge(for: payload.count)
         } else {
             charge = 0
@@ -496,6 +630,8 @@ final class RPCTransportCore: Sendable {
 
         enum Delivered {
             case unknownStream
+            case streamOverran(Int)
+            case connectionOverran(Int)
             case request(
                 [RPCRequestPart<GRPCSwiftData>],
                 AsyncThrowingStream<RPCRequestPart<GRPCSwiftData>, any Error>.Continuation,
@@ -508,11 +644,34 @@ final class RPCTransportCore: Sendable {
         }
 
         let outcome: Delivered = registry.withLock { registry in
-            guard var entry = registry.streams[id] else { return .unknownStream }
+            // §O4 (amended): ENFORCE the receive window, do not merely account for it.
+            //
+            // The connection counter is charged whatever the id, because the peer spent its
+            // connection window whatever the id. The two bounds are then checked
+            // **narrowest-first**: a single stream over its own 65 535 necessarily puts the
+            // connection total over too, and failing one stream is the smaller blast radius --
+            // HTTP/2's own `FLOW_CONTROL_ERROR` split. Only an overrun that no single stream
+            // accounts for is a connection-level violation, and that is reachable exactly when the
+            // peer's own connection window went negative, which a conforming peer cannot do.
+            registry.connectionUnconsumed += charge
+            let connectionOverran = registry.connectionUnconsumed > FlowControl.initialWindow
+
+            guard var entry = registry.streams[id] else {
+                // No per-stream ledger to check; the connection bound is the only one there is.
+                return connectionOverran
+                    ? .connectionOverran(registry.connectionUnconsumed) : .unknownStream
+            }
             entry.unconsumedCharge += charge
-            // Written back on every exit, including the violation one: `removeStream` reads
-            // `unconsumedCharge` to flush it, and this op's bytes belong in that flush.
+            // Written back on every exit, including the violation and overrun ones:
+            // `removeStream` reads `unconsumedCharge` to flush it, and this op's bytes belong in
+            // that flush -- which is also what brings `connectionUnconsumed` back under its bound
+            // after a stream-level overrun.
             defer { registry.streams[id] = entry }
+
+            if entry.unconsumedCharge > FlowControl.initialWindow {
+                return .streamOverran(entry.unconsumedCharge)
+            }
+            if connectionOverran { return .connectionOverran(registry.connectionUnconsumed) }
 
             switch entry.inbound {
             case .request(var decoder, let continuation):
@@ -549,6 +708,26 @@ final class RPCTransportCore: Sendable {
             // peer could drain our advertised connection window by writing to ids we retired.
             creditConnection(charge)
 
+        case .streamOverran(let outstanding):
+            // §O2's blast radius: one stream. `removeStream` flushes this stream's whole
+            // outstanding charge back onto the connection window, so the connection recovers.
+            removeStream(
+                id,
+                failingInboundWith: RPCError(
+                    code: .internalError,
+                    message: "the peer exceeded stream \(id)'s receive window: \(outstanding) "
+                        + "byte(s) received and not yet credited, limit "
+                        + "\(FlowControl.initialWindow)"),
+                sendingCancel: "stream receive-window overrun")
+
+        case .connectionOverran(let outstanding):
+            failConnection(
+                RPCError(
+                    code: .internalError,
+                    message: "the peer exceeded the connection's receive window: \(outstanding) "
+                        + "byte(s) received and not yet credited, limit "
+                        + "\(FlowControl.initialWindow)"))
+
         case .request(let parts, let continuation, let ended):
             for part in parts { continuation.yield(part) }
             if ended {
@@ -564,7 +743,11 @@ final class RPCTransportCore: Sendable {
             }
 
         case .violation(let error):
-            // Contract line 1. §O2: fails this stream only.
+            // Contract line 1. §O2: fails this stream only. The reason is truncated because a
+            // decoder's error message can embed peer-supplied field bytes verbatim -- see
+            // ``truncatedForWire(_:)``.
+            // `removeStream` truncates the reason before it reaches the wire -- there is exactly
+            // one such point, so this passes the full text and does not pre-truncate it.
             removeStream(id, failingInboundWith: error, sendingCancel: "\(error)")
         }
     }
@@ -605,7 +788,11 @@ final class RPCTransportCore: Sendable {
             return
         }
         guard let descriptor = Self.methodDescriptor(from: method) else {
-            refuseWithStatus(id, .unimplemented, "malformed method path '\(method)'")
+            // `method` is peer-supplied and can be as long as the codec's 16 MiB body cap allows,
+            // so it is truncated before it goes back out on the wire.
+            refuseWithStatus(
+                id, .unimplemented,
+                "malformed method path '\(Self.truncatedForWire(method))'")
             return
         }
 
@@ -626,16 +813,27 @@ final class RPCTransportCore: Sendable {
         }
 
         let admission: Admission = registry.withLock { registry in
-            switch registry.phase {
-            case .draining: return .draining
-            case .closed: return .closed
-            case .running: break
-            }
-            guard registry.streams.count < Self.maxConcurrentInboundStreams else {
-                return .tooMany(registry.streams.count)
+            // Advanced before the admission decision, so `goAway`'s `lastStreamID` names every id
+            // the peer actually used -- including ones this side refused. (Structurally illegal ids
+            // -- 0 and even -- are rejected above and deliberately do not advance it: they are not
+            // ids the peer could legitimately have opened.)
+            registry.highestStreamID = max(registry.highestStreamID, id)
+
+            // Note which flag is tested: `localDraining` only. An inbound `goAway` sets
+            // `peerDraining`, which says the peer will accept no more streams *from us* and says
+            // nothing about streams it may still open on us -- gating accepts on it handed a peer a
+            // one-op lever that permanently stopped this side accepting work.
+            if registry.isClosed { return .closed }
+            if registry.localDraining { return .draining }
+
+            // §O5 deviation 6. The table alone bounds nothing: `openStream(id) ; cancel(id)` in one
+            // blob inserts, yields and removes inside a single routing turn, leaving the table
+            // unchanged and the accept buffer one longer. See `maxConcurrentInboundStreams`.
+            let outstanding = registry.streams.count + registry.outstandingAccepts
+            guard outstanding < Self.maxConcurrentInboundStreams else {
+                return .tooMany(outstanding)
             }
             registry.streams[id] = entry
-            registry.highestStreamID = max(registry.highestStreamID, id)
             return .admitted
         }
 
@@ -647,10 +845,10 @@ final class RPCTransportCore: Sendable {
         case .closed:
             // The connection is gone; there is nobody to tell.
             return
-        case .tooMany(let live):
+        case .tooMany(let outstanding):
             refuseWithStatus(
                 id, .resourceExhausted,
-                "too many concurrent streams on this connection (\(live) live, limit "
+                "too many outstanding streams on this connection (\(outstanding), limit "
                     + "\(Self.maxConcurrentInboundStreams))")
             return
         case .admitted:
@@ -674,8 +872,57 @@ final class RPCTransportCore: Sendable {
         // missing stream, and activated last so it cannot fire before it is stored.
         if let timeout { installDeadline(timeout, forStream: id) }
 
-        acceptedContinuation.yield(
+        // The slot this accept occupies against `maxConcurrentInboundStreams` is claimed here and
+        // released by `acceptDidDeliver()` when the accept loop pulls the item -- not when the
+        // table entry goes away, which can happen while the item is still buffered.
+        registry.withLock { $0.outstandingAccepts += 1 }
+        let delivery = acceptedContinuation.yield(
             AcceptedRPCStream(id: id, descriptor: descriptor, timeout: timeout, stream: stream))
+
+        switch delivery {
+        case .enqueued:
+            break
+        case .dropped, .terminated:
+            // The accept sequence was finished (or, with a bounded policy, full) between this
+            // routing turn's admission check and this yield -- a `beginDraining()` or a teardown
+            // racing an accept. The item is gone, so nothing will ever pull it, and two pieces of
+            // bookkeeping would otherwise be stranded:
+            //
+            // * the slot claimed above, which no `acceptDidDeliver()` will pair with -- a permanent
+            //   reduction of the cap, benign but pointless;
+            // * **the table entry**, which no `streamHandlerFinished(_:)` will ever retire because
+            //   no handler will ever run for it. That one is contract line 7: an entry outliving
+            //   its stream. Unlike `failAll`, `beginDraining` does not sweep the table, so this is
+            //   the one path where a built-and-then-undeliverable stream has to clean up after
+            //   itself.
+            acceptDidDeliver()
+            removeStream(
+                id,
+                failingInboundWith: RPCError(
+                    code: .unavailable,
+                    message: "stream \(id) was accepted but the connection stopped accepting "
+                        + "before it could be delivered to a handler"),
+                sendingCancel: "the server stopped accepting new streams")
+        @unknown default:
+            acceptDidDeliver()
+            removeStream(
+                id,
+                failingInboundWith: RPCError(
+                    code: .unavailable,
+                    message: "stream \(id) could not be delivered to a handler"),
+                sendingCancel: "the server could not deliver the stream to a handler")
+        }
+    }
+
+    /// Releases one accept's slot. Called by ``AcceptedStreamSequence``'s iterator at the moment
+    /// the accept loop actually receives the item, which is the only point at which the value has
+    /// left this object's buffer.
+    ///
+    /// Clamped at zero rather than trusting the pairing: `failAll` resets the counter, so an item
+    /// buffered before a teardown and pulled after it would otherwise drive this negative and
+    /// silently raise the effective cap.
+    private func acceptDidDeliver() {
+        registry.withLock { $0.outstandingAccepts = max(0, $0.outstandingAccepts - 1) }
     }
 
     /// Splits a wire method path (`"pkg.Service/Method"`, no leading slash -- `CompactWireCodec`
@@ -729,20 +976,21 @@ final class RPCTransportCore: Sendable {
         let (inbound, continuation) = AsyncThrowingStream.makeStream(
             of: RPCResponsePart<GRPCSwiftData>.self)
 
-        // L7: the phase check and the id allocation are one atomic take-and-transition, so a
+        // L7: the lifecycle check and the id allocation are one atomic take-and-transition, so a
         // `beginDraining()` racing this call either loses (the stream is allocated) or wins (this
         // throws) -- never both.
         let id: RPCStreamID = try registry.withLock { registry in
-            switch registry.phase {
-            case .draining:
+            // Contract line 8: **either** direction's drain stops us opening new streams -- ours
+            // because we announced we are going away, the peer's because it announced it will not
+            // accept any more.
+            if registry.isClosed {
+                throw RPCError(
+                    code: .unavailable, message: "the connection is no longer available")
+            }
+            if registry.localDraining || registry.peerDraining {
                 throw RPCError(
                     code: .unavailable,
                     message: "the connection is draining; no new streams may be opened")
-            case .closed:
-                throw RPCError(
-                    code: .unavailable, message: "the connection is no longer available")
-            case .running:
-                break
             }
             guard registry.nextClientStreamID != 0 else {
                 throw RPCError(
@@ -864,6 +1112,32 @@ final class RPCTransportCore: Sendable {
     /// substrate is gone there is no peer to inform, and if the codec refuses one of these
     /// fixed-shape ops the connection is already being torn down by whatever produced it. Nothing
     /// on a stream's grammar path uses this -- a `write` reports its own failures.
+    /// The cap on any peer-derived text this file puts back on the wire.
+    static let maxWireReasonLength = 512
+
+    /// Bounds what a `cancel` op's `reason` (or a refusal's `message`) can carry back to the peer.
+    ///
+    /// **This is a hostile-input path, not a formatting nicety.** A decoder's error message embeds
+    /// what arrived: a `metadata` op with a `-bin` key and a non-base64 value throws with that value
+    /// interpolated into the message, and the value can be as large as `CompactWireCodec`'s 16 MiB
+    /// body cap. Interpolating that error into `cancel(id, reason:)` reflects the peer's own payload
+    /// straight back at it, at whatever size it chose, on a control op that is exempt from flow
+    /// control. A few hundred bytes is all a diagnostic needs.
+    ///
+    /// Uses `Substring.endIndex` rather than `count` to detect truncation, so the common
+    /// short-string case stays O(1) instead of walking a possibly enormous string.
+    ///
+    /// **There is exactly one truncation point for the wire**, in
+    /// ``removeStream(_:failingInboundWith:sendingCancel:)``, so callers pass their full text and
+    /// do not pre-truncate: stacking two calls would clip the first call's own marker. The other
+    /// two uses are the accept refusal's `status` message and ``cancelStream(_:reason:)``'s *local*
+    /// error text, neither of which passes through that point.
+    static func truncatedForWire(_ text: String) -> String {
+        let head = text.prefix(maxWireReasonLength)
+        guard head.endIndex != text.endIndex else { return text }
+        return String(head) + "… [truncated]"
+    }
+
     private func sendControl(_ ops: [RPCOp]) {
         do {
             try sendEncoded(ops)
@@ -926,7 +1200,7 @@ final class RPCTransportCore: Sendable {
             entry.unconsumedCharge = max(0, entry.unconsumedCharge - charge)
             streamCredit = entry.receive.consumed(charge)
             registry.streams[id] = entry
-            connectionCredit = registry.connectionReceive.consumed(charge)
+            connectionCredit = registry.creditConnection(consuming: charge)
         }
 
         var ops: [RPCOp] = []
@@ -940,7 +1214,7 @@ final class RPCTransportCore: Sendable {
     /// connection window permanently.
     private func creditConnection(_ charge: Int) {
         guard charge > 0 else { return }
-        let credit = registry.withLock { $0.connectionReceive.consumed(charge) }
+        let credit = registry.withLock { $0.creditConnection(consuming: charge) }
         if let credit { sendControl([.credit(0, bytes: credit)]) }
     }
 
@@ -970,12 +1244,27 @@ final class RPCTransportCore: Sendable {
     ///    stream ended would kill every other stream on it.
     /// 3. **The inbound sequence is ended**, with the error on abnormal paths so a consumer sees
     ///    why rather than a silent end-of-stream.
-    /// 4. **Un-consumed receive charge is flushed into the connection accountant.** This is L3
-    ///    exactly: a handler that returns without draining its request half otherwise strands
-    ///    those bytes of the peer's connection window forever, and the peer's writer parks on
-    ///    credit that is never coming (the old build measured 33 of 200 sent, then a permanent
-    ///    hang). The stream half is not credited -- the stream is gone, and an abnormal removal
-    ///    also sends `cancel`, so the peer drops its own stream window.
+    /// 4. **Un-consumed receive charge is flushed into the connection accountant, and the
+    ///    accountant is then flushed unconditionally.** This is L3 exactly: a handler that returns
+    ///    without draining its request half otherwise strands those bytes of the peer's connection
+    ///    window forever, and the peer's writer parks on credit that is never coming (the old build
+    ///    measured 33 of 200 sent, then a permanent hang). The stream half is not credited -- the
+    ///    stream is gone, and an abnormal removal also sends `cancel`, so the peer drops its own
+    ///    stream window.
+    ///
+    ///    **`flushConnection(recording:)`, not `consumed(_:)`.** Handing the bytes to the ledger is
+    ///    not the same as emitting them: `consumed(_:)` batches at half the initial window and
+    ///    returns `nil` below it, so a removal could hand over 40 000 bytes and emit nothing. That
+    ///    is safe for a long-lived ledger that will cross the threshold on a later delivery, and it
+    ///    is *not* safe here -- a removal is exactly the moment there is no later delivery for that
+    ///    stream. The flush also matters to the receive-window enforcement above: it is what brings
+    ///    `connectionUnconsumed` back under its bound after a stream-level overrun.
+    ///
+    ///    It flushes the ledger's *whole* accumulation, including a residue left by other streams,
+    ///    so a removal can emit a `credit` op that pure batching would have deferred. That is the
+    ///    intended trade: §O4 batches so that "a stream of small messages does not produce one
+    ///    control op each", and at most one extra control op per stream *removal* is nowhere near
+    ///    that, while a deferred residue is bytes the peer is owed and cannot get.
     ///
     /// The cancellation observer fires only on abnormal removal: firing it on a clean completion
     /// would tell a server handler it had been cancelled after it had already succeeded.
@@ -990,14 +1279,12 @@ final class RPCTransportCore: Sendable {
         sendingCancel reason: String?
     ) -> Bool {
         var taken: StreamEntry?
-        var connectionCredit: UInt32?
+        var connectionCredits: [UInt32] = []
 
         registry.withLock { registry in
             guard let entry = registry.streams.removeValue(forKey: id) else { return }
             taken = entry
-            if entry.unconsumedCharge > 0 {
-                connectionCredit = registry.connectionReceive.consumed(entry.unconsumedCharge)
-            }
+            connectionCredits = registry.flushConnection(recording: entry.unconsumedCharge)
         }
         guard let entry = taken else { return false }
 
@@ -1011,8 +1298,8 @@ final class RPCTransportCore: Sendable {
         if error != nil { entry.cancellationObserver?() }
 
         var ops: [RPCOp] = []
-        if let reason { ops.append(.cancel(id, reason: reason)) }
-        if let connectionCredit { ops.append(.credit(0, bytes: connectionCredit)) }
+        if let reason { ops.append(.cancel(id, reason: Self.truncatedForWire(reason))) }
+        ops.append(contentsOf: connectionCredits.map { .credit(0, bytes: $0) })
         sendControl(ops)
 
         return true
@@ -1045,11 +1332,39 @@ final class RPCTransportCore: Sendable {
     /// Aborts one stream from this side: the client's `withStream` closure exiting without a clean
     /// termination, a fired deadline, or `RPCWriter.finish(throwing:)`.
     func cancelStream(_ id: RPCStreamID, reason: String) {
+        // `removeStream` bounds what reaches the wire. The *local* error is bounded here as well,
+        // separately: this is reachable from `RPCWriter.finish(throwing:)`, whose error may be an
+        // `RPCError` whose `cause` chain carries peer-supplied field bytes, and an unbounded
+        // in-process error message is still an unbounded allocation.
         removeStream(
             id,
             failingInboundWith: RPCError(
-                code: .cancelled, message: "stream \(id) was cancelled locally: \(reason)"),
+                code: .cancelled,
+                message: "stream \(id) was cancelled locally: "
+                    + Self.truncatedForWire(reason)),
             sendingCancel: reason)
+    }
+
+    /// The client-side mirror of ``streamHandlerFinished(_:)``: the `withStream` closure returned.
+    ///
+    /// **MUST be called on every exit path of that closure**, for the same reason and with the same
+    /// force as the server-side call. Contract line 7 otherwise rests entirely on the transport's
+    /// discipline on this side while the server side has a named mandatory call, and a client
+    /// stream whose peer sent `status` but whose caller never reached `finish()` leaves an entry
+    /// behind -- exactly the one-per-RPC leak the old build had.
+    ///
+    /// Safe and free after a clean completion: both directions closing already retired the entry,
+    /// so ``removeStream(_:failingInboundWith:sendingCancel:)`` finds nothing, returns `false`, and
+    /// builds no op. The presence of an entry at this point therefore *is* the definition of "the
+    /// call did not complete", which is why this needs no `localDone`/`remoteDone` inspection of
+    /// its own.
+    func clientCallFinished(_ id: RPCStreamID) {
+        removeStream(
+            id,
+            failingInboundWith: RPCError(
+                code: .cancelled,
+                message: "the client abandoned stream \(id) before the call completed"),
+            sendingCancel: "the client abandoned the call before it completed")
     }
 
     /// **L3.** A server's `streamHandler` returned: remove the stream, release its windows, and
@@ -1132,7 +1447,9 @@ final class RPCTransportCore: Sendable {
         }
         let (total, totalOverflowed) = seconds.addingReportingOverflow(
             components.attoseconds / 1_000_000_000)
-        guard !totalOverflowed else { return .nanoseconds(seconds < 0 ? 0 : Int.max) }
+        guard !totalOverflowed else {
+            return .nanoseconds(components.seconds < 0 ? 0 : Int.max)
+        }
         return .nanoseconds(Int(clamping: max(0, total)))
     }
 
@@ -1146,10 +1463,24 @@ final class RPCTransportCore: Sendable {
     /// `withServerContextRPCCancellationHandle(_:)`, which is how an inbound cancel reaches the
     /// handler at all.
     ///
-    /// - Returns: `true` if the stream is *already* gone or the connection is no longer running,
-    ///   i.e. the observer will never fire and the caller should cancel immediately. This closes
-    ///   the race where a teardown swept the table between the stream being accepted and the
-    ///   handler task being scheduled.
+    /// - Important: **The observer must not capture this core** (L6). It is the one strong edge
+    ///   into the core that this file cannot make weak -- a closure is not a reference -- so
+    ///   `core -> registry -> entry -> observer -> core` would be a *self*-cycle, and a self-cycle
+    ///   is invisible to any external weak-reference check: `deinit` simply never runs and the XPC
+    ///   session leaks. The intended shape captures nothing that points back here:
+    ///
+    ///   ```swift
+    ///   await withServerContextRPCCancellationHandle { handle in
+    ///       core.setCancellationObserver(forStream: accepted.id) { handle.cancel() }   // no core
+    ///   }
+    ///   ```
+    ///
+    /// - Returns: `true` if the stream is *already* gone, or this side is closed or locally
+    ///   draining -- i.e. the observer will never fire, or fired before it was installed, and the
+    ///   caller should cancel immediately. This closes the race where a teardown swept the table
+    ///   between the stream being accepted and the handler task being scheduled. `peerDraining` is
+    ///   deliberately **not** part of it: the peer announcing it will open no more streams says
+    ///   nothing about the streams already running here.
     @discardableResult
     func setCancellationObserver(
         forStream id: RPCStreamID, _ observer: @escaping @Sendable () -> Void
@@ -1158,10 +1489,7 @@ final class RPCTransportCore: Sendable {
             guard var entry = registry.streams[id] else { return true }
             entry.cancellationObserver = observer
             registry.streams[id] = entry
-            switch registry.phase {
-            case .running: return false
-            case .draining, .closed: return true
-            }
+            return registry.isClosed || registry.localDraining
         }
     }
 
@@ -1192,8 +1520,8 @@ final class RPCTransportCore: Sendable {
         }
 
         let action: Action = registry.withLock { registry in
-            guard case .running = registry.phase else { return .none }
-            registry.phase = .draining
+            guard !registry.isClosed, !registry.localDraining else { return .none }
+            registry.localDraining = true
             let finishAccepted = !registry.acceptedFinished
             registry.acceptedFinished = true
             return .drain(
@@ -1208,14 +1536,23 @@ final class RPCTransportCore: Sendable {
     /// Contract line 8: an inbound `goAway` marks this connection draining, so ``openStream``
     /// throws `.unavailable` from here on.
     ///
-    /// It does **not** finish `acceptedStreams`. `goAway` is directional: the peer is saying it
-    /// will accept no more streams *from us*, which says nothing about streams it may still open
-    /// on us. Nor does it disturb streams already open -- `lastStreamID` is advisory here because
-    /// this transport's ids are allocated by one side only and the peer's own `status`/`cancel`
-    /// ops are what actually end its streams.
+    /// It sets `peerDraining` and **nothing else**. `goAway` is directional: the peer is saying it
+    /// will accept no more streams *from us*, which says nothing about streams it may still open on
+    /// us -- so this does not finish `acceptedStreams`, does not refuse inbound `openStream` ops,
+    /// and does not disturb streams already open.
+    ///
+    /// That separation is a fix, not a nicety. Until Task 6's review this set a single shared
+    /// `Phase = .draining`, which also made `openInbound` answer every subsequent inbound
+    /// `openStream` with `status(.unavailable)` -- one `goAway` op from a peer permanently stopped
+    /// this connection accepting work, contradicting both `goAway`'s meaning and this comment.
+    ///
+    /// `lastStreamID` is read and discarded: this transport's ids are allocated by one side only,
+    /// and the peer's own `status`/`cancel` ops are what actually end its streams, so there is
+    /// nothing for a "fail everything above N" rule to do here. Contract line 8 asks only that
+    /// ``openStream`` throw.
     private func peerBeganDraining() {
         registry.withLock { registry in
-            if case .running = registry.phase { registry.phase = .draining }
+            if !registry.isClosed { registry.peerDraining = true }
         }
     }
 
@@ -1234,9 +1571,14 @@ final class RPCTransportCore: Sendable {
         var finishAccepted = false
 
         registry.withLock { registry in
-            registry.phase = .closed
+            registry.isClosed = true
             taken = Array(registry.streams.values)
             registry.streams.removeAll()
+            // No credit is owed to a peer that is gone, so the receive counters are simply
+            // discarded rather than flushed; zeroing them keeps `outstandingAccepts` from being
+            // driven negative by an item pulled out of the buffer after this teardown.
+            registry.connectionUnconsumed = 0
+            registry.outstandingAccepts = 0
             finishAccepted = !registry.acceptedFinished
             registry.acceptedFinished = true
         }
@@ -1430,9 +1772,20 @@ final class OutboundOpWriter<Encoder: OutboundOpEncoding>: ClosableRPCWriterProt
 
         // §O4: only `message` bodies consume window, and the charge is
         // `FlowControl.charge(for:window:)` -- the same call the receive side makes, never a
-        // hand-inlined clamp. A zero-length message (`google.protobuf.Empty`) is charged nothing
-        // and must not reach `reserve(upTo:)`, which traps on 0.
-        let charge = Encoder.messagePayload(of: element).map { FlowControl.charge(for: $0.count) } ?? 0
+        // hand-inlined clamp.
+        //
+        // Since §O4's floor, `charge` is `>= 1` for **every** message, including a zero-length one
+        // (`google.protobuf.Empty`), so the `charge > 0` test below is "is this part
+        // flow-controlled?" and nothing else. It is not a residual guard against
+        // `reserve(upTo:)`'s "at least 1 byte" precondition: that precondition is now unreachable
+        // from here by construction, and the branch exists solely to send control parts straight
+        // through.
+        let charge: Int
+        if let payload = Encoder.messagePayload(of: element) {
+            charge = FlowControl.charge(for: payload.count)
+        } else {
+            charge = 0
+        }
         var reserved: FlowControlWindow?
         if charge > 0 {
             reserved = try await core.reserveOutboundWindow(charge, forStream: streamID)
@@ -1500,6 +1853,8 @@ final class OutboundOpWriter<Encoder: OutboundOpEncoding>: ClosableRPCWriterProt
     /// `RPCOp` for "the local side failed" other than `cancel`), so this is always safe to call.
     func finish(throwing error: any Error) async {
         state.withLock { $0.isDead = true }
+        // `cancelStream` bounds the reason before it reaches the wire; `error` can be an `RPCError`
+        // whose `cause` chain carries peer-supplied field bytes.
         core?.cancelStream(streamID, reason: "\(error)")
     }
 }
@@ -1552,6 +1907,69 @@ struct CreditingInbound<Part: Sendable>: AsyncSequence, Sendable {
 
         mutating func next() async throws -> Part? {
             try await next(isolation: nil)
+        }
+    }
+}
+
+// ===========================================================================================
+// MARK: - The accepted-stream sequence (§O5 deviation 6's second counter)
+// ===========================================================================================
+
+/// `RPCTransportCore.acceptedStreams`, wrapping the raw `AsyncStream` so that pulling an item is
+/// what releases its slot against `RPCTransportCore.maxConcurrentInboundStreams`.
+///
+/// # Why a wrapper rather than the bare `AsyncStream`
+///
+/// A table-only cap bounds nothing. `removeStream` is reachable while the `AcceptedRPCStream` is
+/// still sitting undrained in the buffer, and one blob carrying `openStream(id) ; cancel(id)` does
+/// exactly that inside a single routing turn: insert, yield, remove. The table returns to its
+/// previous size and the buffer grows by one, for about sixty wire bytes; repeat with 3, 5, 7… and
+/// the cap never engages. Counting the yield and discounting it at the *pull* is what makes the
+/// cap mean what its doc comment claims.
+///
+/// The decrement point has to be here and not anywhere in the core, because the pull is the only
+/// moment the value has provably left the core's buffer. This is the same shape ``CreditingInbound``
+/// uses to credit a message when the application takes it, for the same reason.
+///
+/// # What it deliberately does not do
+///
+/// It does not bound, drop or reorder anything: L5's one-phase accept is untouched, and no accepted
+/// stream is ever discarded. Backpressure on accepts is applied at admission (a refusal the peer
+/// can see), never by throwing away a stream that was already built.
+///
+/// `onDeliver` holds the core weakly (L6) -- the closure the core passes in captures `[weak self]`.
+/// Iterate once, as with any `AsyncStream`.
+@available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
+struct AcceptedStreamSequence: AsyncSequence, Sendable {
+    typealias Element = AcceptedRPCStream
+    typealias Failure = Never
+
+    private let base: AsyncStream<AcceptedRPCStream>
+    private let onDeliver: @Sendable () -> Void
+
+    init(base: AsyncStream<AcceptedRPCStream>, onDeliver: @escaping @Sendable () -> Void) {
+        self.base = base
+        self.onDeliver = onDeliver
+    }
+
+    func makeAsyncIterator() -> Iterator {
+        Iterator(base: base.makeAsyncIterator(), onDeliver: onDeliver)
+    }
+
+    struct Iterator: AsyncIteratorProtocol {
+        fileprivate var base: AsyncStream<AcceptedRPCStream>.AsyncIterator
+        fileprivate let onDeliver: @Sendable () -> Void
+
+        /// The slot is released **after** the element has been handed over, so an accept loop that
+        /// never comes back for the next one has still released the one it took.
+        mutating func next(isolation actor: isolated (any Actor)?) async -> AcceptedRPCStream? {
+            let element = await base.next(isolation: `actor`)
+            if element != nil { onDeliver() }
+            return element
+        }
+
+        mutating func next() async -> AcceptedRPCStream? {
+            await next(isolation: nil)
         }
     }
 }
