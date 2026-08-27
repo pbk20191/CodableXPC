@@ -130,6 +130,13 @@ struct XPCTransportPair: Sendable {
     /// *connected* in any observable sense yet: the listener's incoming-session closure does not
     /// run at dial time, it runs when the first blob arrives (Task 5 §2.1) -- which is the first
     /// write of the first RPC.
+    ///
+    /// - Important: **A `deinit`-reachability test must call this directly, not through
+    ///   ``XPCPairHarness/withPair(router:expectingRoughTeardown:_:)`` or
+    ///   ``XPCPairHarness/withTransports(streamHandler:expectingRoughTeardown:_:)``.** Both entry
+    ///   points hold the pair alive for the whole of the body, so a weak reference taken inside one
+    ///   can never nil. Measured: `make()` inside a `do { }` scope leaves both weak references nil
+    ///   on exit from that scope.
     static func make() throws -> XPCTransportPair {
         let server = try XPCServerTransport.anonymous()
         return XPCTransportPair(server: server, client: try server.connectingClient())
@@ -169,13 +176,25 @@ enum XPCPairHarness {
     /// left to wait for. Both are graceful -- nothing here cancels a task, so this path exercises
     /// the drain rather than the forceful teardown.
     ///
-    /// - Important: `body` must issue at least one RPC. `GRPCClient.beginGracefulShutdown()` on a
-    ///   client that has not started yet moves it straight to `.stopped` **without** telling the
-    ///   transport, and the `runConnections()` that follows then throws `clientIsStopped`. That is
-    ///   grpc-swift's documented "`withGRPCClient` with an empty body" hazard, not this transport's;
-    ///   a body that makes a call cannot reach it.
+    /// - Important: **`body` must issue at least one RPC.** `GRPCClient.beginGracefulShutdown()` on
+    ///   a client that has not started yet moves it straight to `.stopped` **without** telling the
+    ///   transport, and the `runConnections()` that follows then throws `clientIsStopped`.
+    ///   `GRPCServer.serve()` loses the identical race and throws `serverIsStopped`. **Which of the
+    ///   two you get is race-dependent**, and it depends on load, not on the body: measured, the
+    ///   same empty body gives `clientIsStopped` 10 out of 10 times run in isolation and
+    ///   `serverIsStopped` when run alongside four other tests in the same process. So do not match
+    ///   on the code -- there is no reliable one. This is grpc-swift's documented "`withGRPCClient`
+    ///   with an empty body" hazard on both halves, not this transport's; a body that makes a call
+    ///   cannot reach either. **``withTransports(streamHandler:expectingRoughTeardown:_:)`` has no
+    ///   equivalent and is confirmed safe with an empty body** -- use it for anything that shuts
+    ///   down with nothing in flight.
+    /// - Parameter expectingRoughTeardown: pass `true` when the body has *deliberately* left the
+    ///   pair in a state whose shutdown is not expected to be clean -- a killed peer, a forced
+    ///   cancellation, a session already closed. The teardown's error is then discarded instead of
+    ///   thrown. See the note on the default below for why this exists.
     static func withPair<Result: Sendable>(
         router: RPCRouter<XPCServerTransport>,
+        expectingRoughTeardown: Bool = false,
         _ body: @Sendable (RunningXPCPair) async throws -> Result
     ) async throws -> Result {
         let transports = try XPCTransportPair.make()
@@ -204,6 +223,14 @@ enum XPCPairHarness {
             // **The body's error wins.** A broken body usually makes the teardown fail too, and
             // the teardown's error is the derived one -- reporting it would name the symptom and
             // hide the cause.
+            //
+            // When the body *succeeded*, a teardown error is thrown by default: silently
+            // swallowing "the drain never finished" would hide a real transport defect behind a
+            // green test, which is the worse of the two failure modes for a suite whose whole job
+            // is to find them. But it does mean a test whose asserted property held can still fail
+            // with an error pointing at `waitForAll()` rather than at anything it asserted -- so a
+            // test that has deliberately made the teardown rough passes
+            // `expectingRoughTeardown: true` and gets its value regardless.
             var teardownError: (any Error)?
             do {
                 try await group.waitForAll()
@@ -211,7 +238,7 @@ enum XPCPairHarness {
                 teardownError = error
             }
             let value = try outcome.get()
-            if let teardownError { throw teardownError }
+            if let teardownError, !expectingRoughTeardown { throw teardownError }
             return value
         }
     }
@@ -220,10 +247,13 @@ enum XPCPairHarness {
     ///
     /// `body` gets the two transports, so it can call `client.withStream(descriptor:options:_:)`
     /// itself.
+    /// - Parameter expectingRoughTeardown: as on
+    ///   ``withPair(router:expectingRoughTeardown:_:)``.
     static func withTransports<Result: Sendable>(
         streamHandler: @escaping @Sendable (
             RPCStream<XPCServerTransport.Inbound, XPCServerTransport.Outbound>, ServerContext
         ) async -> Void,
+        expectingRoughTeardown: Bool = false,
         _ body: @Sendable (XPCTransportPair) async throws -> Result
     ) async throws -> Result {
         let pair = try XPCTransportPair.make()
@@ -242,6 +272,8 @@ enum XPCPairHarness {
             pair.client.beginGracefulShutdown()
             pair.server.beginGracefulShutdown()
 
+            // As above: see ``withPair(router:expectingRoughTeardown:_:)`` for why a teardown
+            // error is thrown by default and when to opt out.
             var teardownError: (any Error)?
             do {
                 try await group.waitForAll()
@@ -249,9 +281,53 @@ enum XPCPairHarness {
                 teardownError = error
             }
             let value = try outcome.get()
-            if let teardownError { throw teardownError }
+            if let teardownError, !expectingRoughTeardown { throw teardownError }
             return value
         }
+    }
+}
+
+// ===========================================================================================
+// MARK: - The harness's own contract
+// ===========================================================================================
+
+/// Two tests, both about ``XPCPairHarness`` rather than about the transport. They live here, beside
+/// the code they pin, because slices 2 and 3 build on this contract and a silent regression in it
+/// would surface as twenty unexplained failures in *their* files.
+@available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
+final class XPCPairHarnessContractTests: XCTestCase {
+
+    /// `expectingRoughTeardown` exists so a lifecycle test whose asserted property *held* is not
+    /// failed by a teardown it deliberately made messy. This pins both halves of that switch.
+    ///
+    /// The subject is the one deterministically rough teardown available: `withPair` with a body
+    /// that issues no RPC, which loses grpc-swift's start/shutdown race (see
+    /// ``XPCPairHarness/withPair(router:expectingRoughTeardown:_:)``). **Which** error that produces
+    /// is race-dependent -- `clientIsStopped` or `serverIsStopped` -- so this asserts only that one
+    /// is thrown by default and none is thrown when the caller opted out. That is exactly the
+    /// contract; matching on the code would be pinning grpc-swift's race instead.
+    func testRoughTeardownIsThrownByDefaultAndSuppressedOnRequest() throws {
+        let thrownByDefault = try runBounded("rough teardown, default") { () -> Bool in
+            do {
+                _ = try await XPCPairHarness.withPair(router: RPCRouter()) { _ in 41 }
+                return false
+            } catch {
+                return true
+            }
+        }
+        XCTAssertTrue(
+            thrownByDefault,
+            "a teardown error must not be swallowed by default: hiding 'the drain never finished' "
+                + "behind a green test is the worse of the two failure modes")
+
+        let suppressed = try runBounded("rough teardown, opted out") {
+            try await XPCPairHarness.withPair(
+                router: RPCRouter(), expectingRoughTeardown: true
+            ) { _ in 42 }
+        }
+        XCTAssertEqual(
+            suppressed, 42,
+            "expectingRoughTeardown must return the body's value rather than the teardown's error")
     }
 }
 

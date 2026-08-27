@@ -133,6 +133,10 @@ final class CallTypeTests: XCTestCase {
             deserializer: UTF8Deserializer(),
             serializer: UTF8Serializer()
         ) { request, _ in
+            // Keeps only the **last** inbound message, so a duplicated single request is
+            // invisible here. That is deliberate rather than an oversight -- this method's job is
+            // the response direction -- and `testUnaryCallRoundTripsThePayload` is what would
+            // catch a duplicated request.
             var received = ""
             for try await message in request.messages { received = message }
             // Copied into a `let` for the producer closure: capturing the `var` is a data race
@@ -148,9 +152,11 @@ final class CallTypeTests: XCTestCase {
 
         // --- bidi: genuinely interleaved. Reply to N before reading N+1. ---
         //
-        // This is the only case where both directions of one stream are live at the same time,
-        // which is why it is the most valuable of the four: it is the shape that a mux which
-        // serialises the two directions, or a flow-control window that never refills, breaks.
+        // The `for try await` + `write` inside one loop is load-bearing, not stylistic: it is the
+        // server half of the ping-pong that
+        // `testBidirectionalStreamingPingPongsBothDirections` forces. Rewriting this to drain
+        // `request.messages` fully and *then* write the replies makes that test hang, which is
+        // exactly the discrimination it exists for -- do not "simplify" it.
         router.registerHandler(
             forMethod: bidi,
             deserializer: UTF8Deserializer(),
@@ -176,6 +182,7 @@ final class CallTypeTests: XCTestCase {
         static let seenString = "x-spine-seen"
         static let seenBinary = "x-spine-seen-bin"
         static let trailerString = "x-spine-trailer"
+        static let rawSeamMarker = "x-spine-raw-seam"
     }
 
     // =======================================================================================
@@ -343,18 +350,46 @@ final class CallTypeTests: XCTestCase {
     // MARK: - Bidirectional streaming
     // =======================================================================================
 
-    /// Both directions of one stream live at the same time: the handler echoes message N before
-    /// reading N+1, and the client's producer and response handler run concurrently.
+    /// Both directions of one stream carrying traffic **at the same time**, asserted as a
+    /// **ping-pong**: the client writes message N+1 only after its response handler has *read* the
+    /// reply to N.
     ///
-    /// This is the case the old suite called its most valuable, and the one a mux that serialised
-    /// the two directions would deadlock rather than fail.
-    func testBidirectionalStreamingInterleavesBothDirections() throws {
+    /// # Why the obvious version of this test is worthless
+    ///
+    /// The first version of this case wrote all five requests through `StreamingClientRequest` and
+    /// then read all five replies, against a handler that echoed inside its `for try await`. It
+    /// passed -- and it **kept passing** when the handler was changed to drain every request before
+    /// writing anything, i.e. when the interleaving it named was removed outright. A strictly
+    /// half-duplex stack satisfies every assertion of that shape, so the name and the doc comment
+    /// were claiming a property nothing tested. (Nor does the payload mutation M8 cover it: that
+    /// only breaks the bytes.)
+    ///
+    /// The gate below is what makes the claim real. `ticks` carries one token per reply the
+    /// response handler has read; the request producer awaits a token before every write after the
+    /// first. So the wire order is forced to be
+    /// `req0, rep0, req1, rep1, …` -- and a stack that drains one direction before starting the
+    /// other **cannot complete it**: the producer waits for a reply that needs a request that the
+    /// producer is not going to send. Measured: against the real handler this passes in ~3 ms;
+    /// against the drain-all-then-write-all handler it times out at 5 s.
+    ///
+    /// `AsyncStream` rather than a semaphore or a continuation: the iterator lives entirely inside
+    /// the producer closure (single consumer, no sharing), `finish()` releases a producer parked on
+    /// a reply that is never coming, and there is no continuation to leak or double-resume.
+    func testBidirectionalStreamingPingPongsBothDirections() throws {
         let sent = (0..<Self.streamLength).map { Self.payload(100 + $0) }
-        let replies = try runBounded("bidi") {
-            try await XPCPairHarness.withPair(router: Self.router()) { pair in
+        let replies = try runBounded("bidi ping-pong") {
+            let (ticks, tick) = AsyncStream.makeStream(of: Void.self)
+            return try await XPCPairHarness.withPair(router: Self.router()) { pair in
                 try await pair.client.bidirectionalStreaming(
                     request: StreamingClientRequest(of: String.self) { writer in
-                        for message in sent { try await writer.write(message) }
+                        var replies = ticks.makeAsyncIterator()
+                        for (index, message) in sent.enumerated() {
+                            // Every message but the first waits for the previous reply to have
+                            // been *read* by the response handler below. `nil` means the response
+                            // side finished early, so there is nothing left to ping-pong with.
+                            if index > 0, await replies.next() == nil { return }
+                            try await writer.write(message)
+                        }
                     },
                     descriptor: Self.bidi,
                     serializer: UTF8Serializer(),
@@ -362,7 +397,13 @@ final class CallTypeTests: XCTestCase {
                     options: .defaults
                 ) { response in
                     var received: [String] = []
-                    for try await message in response.messages { received.append(message) }
+                    for try await message in response.messages {
+                        received.append(message)
+                        tick.yield(())
+                    }
+                    // Releases a producer still parked, so a broken run fails on the assertion
+                    // below rather than only on the bounded runner's timeout.
+                    tick.finish()
                     return received
                 }
             }
@@ -422,6 +463,10 @@ final class CallTypeTests: XCTestCase {
                         return Both(unary: "", streamed: replies)
                     }
 
+                    // Discriminating the two tasks by `isEmpty` is correct only because both
+                    // payloads are non-empty by construction. A future edit that legitimately
+                    // expects an empty reply would silently lose that observation here rather
+                    // than fail -- add a tag to `Both` if that day comes.
                     var merged = Both(unary: "", streamed: [])
                     for try await outcome in group {
                         guard let outcome else { continue }
@@ -448,10 +493,16 @@ final class CallTypeTests: XCTestCase {
     /// It is here rather than deferred because a harness API that has never been run is exactly the
     /// kind of thing the next slice would have to debug before it could write its first test. It
     /// also pins the one bidi shape the `GRPCClient` API cannot express -- **write everything, then
-    /// read** -- which with real flow control is a genuine deadlock risk rather than a formality.
+    /// read**.
+    ///
+    /// It pins the *shape*, not the risk: five bodies of ~33 bytes are three orders of magnitude
+    /// under the 65 535-byte send window, so nothing here ever parks on credit. Making
+    /// write-all-then-read actually deadlock needs payloads sized past the window, which is slice
+    /// 3's job -- this case must not be cited as evidence that backpressure was exercised.
     func testRawStreamSeamCarriesAWholeRPCWithoutTheGRPCRuntime() throws {
         let descriptor = Self.unary
         let sent = (0..<Self.streamLength).map { Self.payload(200 + $0) }
+        let rawSeamRequestMetadata = "raw-seam-request-metadata"
 
         let handler:
             @Sendable (
@@ -461,8 +512,15 @@ final class CallTypeTests: XCTestCase {
                 do {
                     for try await part in stream.inbound {
                         switch part {
-                        case .metadata:
-                            try await stream.outbound.write(.metadata([:]))
+                        case .metadata(let inbound):
+                            // Echoes **what it saw**, not a constant, so the client's assertion
+                            // below covers the request direction too. The first version wrote
+                            // `.metadata([:])` here and the client did `case .metadata: break`,
+                            // which left the whole metadata part unasserted at this layer.
+                            let seen = inbound[stringValues: Keys.requestString]
+                                .joined(separator: ",")
+                            try await stream.outbound.write(
+                                .metadata([Keys.rawSeamMarker: .string(seen)]))
                         case .message(let bytes):
                             bodies.append(String(decoding: Array(bytes), as: UTF8.self))
                         }
@@ -484,7 +542,8 @@ final class CallTypeTests: XCTestCase {
             try await XPCPairHarness.withTransports(streamHandler: handler) { pair in
                 try await pair.client.withStream(descriptor: descriptor, options: .defaults) {
                     stream, _ in
-                    try await stream.outbound.write(.metadata([:]))
+                    try await stream.outbound.write(
+                        .metadata([Keys.requestString: .string(rawSeamRequestMetadata)]))
                     for message in sent {
                         let body = GRPCSwiftData(Array(message.utf8))
                         try await stream.outbound.write(.message(body))
@@ -493,22 +552,34 @@ final class CallTypeTests: XCTestCase {
 
                     var messages: [String] = []
                     var status: Status?
+                    var marker: [String] = []
                     for try await part in stream.inbound {
                         switch part {
-                        case .metadata:
-                            break
+                        case .metadata(let metadata):
+                            marker = Array(metadata[stringValues: Keys.rawSeamMarker])
                         case .message(let bytes):
                             messages.append(String(decoding: Array(bytes), as: UTF8.self))
                         case .status(let received, _):
                             status = received
                         }
                     }
-                    return (messages, status?.code)
+                    return (messages, status?.code, marker)
                 }
             }
         }
 
         XCTAssertEqual(received.0, sent.map { "echo:" + $0 })
         XCTAssertEqual(received.1, .ok)
+        // Both directions of the metadata part at a layer with no gRPC runtime to do it for us:
+        // the handler echoes the value it *read* out of the request, so this fails if the request
+        // metadata's contents are lost as well as if the response metadata's are.
+        //
+        // Note what it cannot catch, because the transport makes it uncatchable by design: the
+        // *presence* of the leading `.metadata` part. `RequestOpDecoder` **synthesises** an empty
+        // one when the first op proves none is coming (`StreamStateMachines.swift`, ruling 2), so a
+        // client that writes no metadata part still produces one on the server. That is why this
+        // assertion had to carry a value -- with a constant marker, deleting the client's
+        // `.metadata` write left the test green.
+        XCTAssertEqual(received.2, [rawSeamRequestMetadata])
     }
 }
