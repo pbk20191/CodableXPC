@@ -34,16 +34,24 @@ import XCTest
 /// matrix enumerated which **disposals** trap, and everyone inferred that a non-disposal must
 /// therefore be fine.
 ///
-/// **The fix, and why it is not just a moved call.** Measuring the alternatives showed that the
-/// window is worse than anyone had assumed: a send or a cancel hopped onto the connection's own
-/// queue from inside the accept closure traps (matrix rows A7/A10), and so does one performed by
-/// another thread the instant the closure *returns* (A8/A9). **No instant the caller can name is
-/// safe.** So `accept` now does the admission check, the build, the publish and the yield in **one**
+/// **The fix, and why it is not just a moved call.** Measuring the alternatives ruled both obvious
+/// ones out: a send or a cancel hopped onto the connection's own queue from inside the accept
+/// closure traps (matrix rows A7/A10), and so does one performed by another thread racing the
+/// closure's return (A8/A9 at ~1 in 150, and A8b/A9b 30/30 with the window held open).
+///
+/// The window is exactly `[request.accept() … Decision reaches libxpc]` and does **not** outlive
+/// the closure -- a send right after the Decision is safe (A6, 60/60). What rules out "wait for the
+/// closure to return" is that the caller cannot *observe* the instant the Decision arrives, so **no
+/// instant it can name from inside its own closure is provably after the window.**
+///
+/// So `accept` now does the admission check, the build, the publish and the yield in **one**
 /// critical section -- which deletes the `!admitted` state rather than relocating its work -- and
 /// any connection whose accept window is not yet *provably* closed is held untouched in a separate
-/// `pending` table that no teardown path may act on. The proof is the first message libxpc delivers
-/// on the session (rows A11/A12, 200 runs each, no trap), surfaced as
-/// `XPCPipe.onFirstDelivery(_:)`.
+/// `pending` table that no teardown path may act on. The proof is a libxpc-ordered event, and there
+/// are two: the first message delivered on the session (A11/A12, 200 runs each) and the session's
+/// cancellation (N8, 40/40). Both are surfaced as `XPCPipe.onWindowProvedClosed(_:)`, and the second
+/// is what bounds how long an entry can sit in `pending` --
+/// `testAServedConnectionLeavesNothingAwaitingItsWindowProof` below is what asserts it empties.
 ///
 /// Measured, from the crash report of this very test (`EXC_BREAKPOINT` / `SIGTRAP`, exit 133):
 ///
@@ -200,5 +208,62 @@ final class AcceptRaceTests: XCTestCase {
             drainingRefusals.value + refused.value, 1,
             "no peer was turned away across the whole sweep, so the drain never raced anything "
                 + "(served: \(served.value))")
+    }
+
+    /// The `pending` table empties, and empties again at shutdown.
+    ///
+    /// `Acceptor.pending` holds an admitted connection that libxpc has not yet proved out of its
+    /// accept window, and it has exactly one exit -- ``XPCPipe/onWindowProvedClosed(_:)``. Until
+    /// this test, nothing asserted that exit ever runs: every other test in the suite passes just as
+    /// well with a connection stranded there, because a stranded connection still serves. What it
+    /// would *not* do is ever be torn down -- it would hold a live uncancelled `XPCSession`, its core
+    /// and its queue for the acceptor's lifetime, **and** park `listen()` forever, since a recorded
+    /// teardown never finishes that core's `acceptedStreams`.
+    ///
+    /// So this asserts the two facts that failure mode violates, in the order they become true:
+    ///
+    /// 1. after one completed RPC, nothing is awaiting a proof and exactly one connection is proved.
+    ///    The promotion runs on the connection's own queue *ahead of* the first op, so an RPC having
+    ///    completed means it has necessarily already happened -- no polling needed;
+    /// 2. after a graceful shutdown that `listen()` has returned from, **both** tables are empty.
+    ///    This is the assertion that fails if a connection is ever left in `pending`: `closeAll()`
+    ///    only marks such an entry, so it would still be there.
+    ///
+    /// Discriminating: with the promotion removed, (1) fails on both counts (0 proved, 1 awaiting);
+    /// with the promotion kept but `closeAll()` not clearing, (2) fails.
+    func testAServedConnectionLeavesNothingAwaitingItsWindowProof() throws {
+        try runBounded("pending drains", timeout: 20) {
+            let server = try XPCServerTransport.anonymous()
+            let listenTask = Task {
+                try await server.listen(streamHandler: RawSeamHandlers.echoing())
+            }
+
+            let client = try server.connectingClient()
+            let connectTask = Task { try await client.connect() }
+            _ = try await client.completeOneEchoRPC(payload: lifecyclePayload(301))
+
+            XCTAssertEqual(
+                server.connectionsAwaitingWindowProof, 0,
+                "a connection that has served an RPC is still waiting for its accept window to be "
+                    + "proved closed, so nothing will ever tear it down and listen() cannot return")
+            XCTAssertEqual(
+                server.provedConnectionCount, 1,
+                "the served connection was never promoted out of `pending`")
+
+            server.beginGracefulShutdown()
+            client.beginGracefulShutdown()
+            connectTask.cancel()
+            _ = try? await connectTask.value
+            _ = try? await listenTask.value
+
+            XCTAssertEqual(
+                server.provedConnectionCount, 0,
+                "a proved connection outlived the shutdown that closed it")
+            XCTAssertEqual(
+                server.connectionsAwaitingWindowProof, 0,
+                "a connection was left in `pending` across a completed shutdown -- `closeAll()` "
+                    + "only records a teardown for such an entry, so it holds its XPC session for "
+                    + "the acceptor's whole lifetime")
+        }
     }
 }

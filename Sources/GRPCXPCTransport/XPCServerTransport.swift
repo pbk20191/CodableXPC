@@ -68,23 +68,29 @@ public final class XPCServerTransport: ServerTransport {
         /// the session, but has not yet delivered anything on it, so nothing may be sent to it,
         /// cancelled on it, or -- as always -- dropped.
         ///
-        /// It is held here, strongly and untouched, until ``peerMadeFirstContact(_:)`` promotes it.
+        /// It is held here, strongly and untouched, until ``windowProvedClosed(_:)`` promotes it.
         private struct Pending {
             let core: RPCTransportCore
             /// The strongest teardown that arrived while the window was open. Applied by
-            /// ``peerMadeFirstContact(_:)`` the moment acting is legal.
+            /// ``windowProvedClosed(_:)`` the moment acting is legal.
             var deferred: DeferredTeardown = .none
         }
 
         /// What a teardown that arrived too early owes a ``Pending`` connection, ordered by force.
         ///
-        /// `failAll(_:)` maps to `.close` rather than to a case of its own, and that collapse is
-        /// exact rather than a shortcut: a pending connection has provably had **no op routed to
-        /// it** (an op requires a delivery, and a delivery is what promotes it), so it has no
-        /// streams, and `failAll`'s entire effect on a stream-less core is to mark it closed. The
-        /// only remaining difference is the `pipe.cancel()` that `close()` adds -- and `failAll` is
-        /// only ever called from `listen()`'s `onCancel`, which is followed immediately by
-        /// `closeAll()`. So `.close` is where it lands anyway, one step sooner.
+        /// `failAll(_:)` maps to `.close` rather than to a case of its own. A pending connection has
+        /// provably had **no op routed to it** (an op requires a delivery, and a delivery is what
+        /// promotes it), so it has no streams to fail, and two differences remain rather than one:
+        ///
+        /// * the `pipe.cancel()` that `close()` adds. Immaterial here: `failAll` is only ever called
+        ///   from `listen()`'s `onCancel`, which is followed immediately by `closeAll()`.
+        /// * **`failAll` finishes the core's `acceptedStreams` now; a recorded teardown finishes it
+        ///   when the proof arrives, or never.** That difference is the one with teeth, and it is
+        ///   not specific to `failAll`: it is exactly why a stranded `pending` entry parks
+        ///   `listen()` rather than merely leaking, and therefore why ``windowProvedClosed(_:)``
+        ///   needs two independent exits. Recorded here rather than left implicit, because an
+        ///   enumeration that finds "no effect applies" and drops one is how the last Critical in
+        ///   this file survived three reviews.
         private enum DeferredTeardown: Int, Sendable {
             case none = 0
             case drain = 1
@@ -106,8 +112,11 @@ public final class XPCServerTransport: ServerTransport {
             }
 
             /// The same, for every untouchable connection at once -- what the three sweepers do.
+            /// `Array(pending.keys)` rather than `pending.keys`: mutating a dictionary while
+            /// iterating its own `keys` view is correct under copy-on-write but forces a copy of the
+            /// whole dictionary per sweep, and reads like a bug to anyone who has to check.
             mutating func escalateEveryPending(to teardown: DeferredTeardown) {
-                for key in pending.keys { escalatePending(key, to: teardown) }
+                for key in Array(pending.keys) { escalatePending(key, to: teardown) }
             }
 
             /// Whether new *sessions* are admitted. Cleared by the first drain and never set
@@ -116,7 +125,7 @@ public final class XPCServerTransport: ServerTransport {
             var admitting = true
 
             /// Admitted, published for ownership, **and untouchable** -- see ``Pending``. Keyed by
-            /// core identity. Entries leave only through ``peerMadeFirstContact(_:)``.
+            /// core identity. Entries leave only through ``windowProvedClosed(_:)``.
             var pending: [ObjectIdentifier: Pending] = [:]
 
             /// Connections whose accept window is provably closed, and which every teardown path
@@ -161,10 +170,16 @@ public final class XPCServerTransport: ServerTransport {
         ///
         /// Holding the lock across `XPCPipe.accepting` (which itself blocks on the new connection
         /// queue via `queue.sync`) cannot deadlock: the only thing on that queue that takes this
-        /// lock is ``peerMadeFirstContact(_:)``, which runs from a delivery -- a `queue.async`
-        /// necessarily enqueued *behind* `accepting`'s `queue.sync` block. That same ordering is
-        /// load-bearing a second time: it is why the promotion cannot race the publish, because it
-        /// cannot even start until this lock is released.
+        /// lock is ``windowProvedClosed(_:)``, which runs from a delivery or a cancellation -- a
+        /// `queue.async` necessarily enqueued *behind* `accepting`'s `queue.sync` block. That same
+        /// ordering is load-bearing a second time: it is why the promotion cannot race the publish,
+        /// because it cannot even start until this lock is released.
+        ///
+        /// - Important: that argument is an enumeration of what runs on a connection queue *today*,
+        ///   and anything added to one that takes this lock synchronously invalidates it. Blocking
+        ///   this lock is the price of one-phase accept; if a connection queue ever needs to take it
+        ///   from a path that can be reached while `accept` holds it, the accept must be restructured
+        ///   rather than the lock narrowed.
         func accept(
             _ request: XPCListener.IncomingSessionRequest
         ) -> XPCListener.IncomingSessionRequest.Decision {
@@ -195,7 +210,10 @@ public final class XPCServerTransport: ServerTransport {
                     built = core
 
                     // The window-closed hook, registered here because here is the only place it
-                    // cannot miss the peer's triggering message (see `onFirstDelivery`'s doc).
+                    // cannot miss the peer's triggering message (see `onWindowProvedClosed`'s doc).
+                    // It fires from **either** libxpc-ordered exit -- the first delivery, or the
+                    // session's cancellation -- which is what gives `pending` two exits instead of
+                    // one and bounds how long an entry can sit in it.
                     //
                     // It captures an `ObjectIdentifier` -- a *value* -- rather than the core, so
                     // there is no `core -> pipe -> Delivery -> handler -> core` self-cycle to get
@@ -204,7 +222,7 @@ public final class XPCServerTransport: ServerTransport {
                     // retain path, so a strong acceptor would make its `deinit` unreachable and
                     // leak every session it owns.
                     let key = ObjectIdentifier(core)
-                    pipe.onFirstDelivery { [weak self] in self?.peerMadeFirstContact(key) }
+                    pipe.onWindowProvedClosed { [weak self] in self?.windowProvedClosed(key) }
                 }
                 guard let core = built else {
                     // Unreachable: `accepting` calls `building` synchronously. A trap rather than
@@ -241,24 +259,39 @@ public final class XPCServerTransport: ServerTransport {
             }
 
             // `core` is published and holds `pipe` strongly, so releasing this local reference
-            // cannot be the last release -- which is the only thing that would be fatal here. The
+            // cannot be the last release -- and the last release inside the window is row A1, a
+            // measured trap, which is what makes this worth a comment rather than a shrug. The
             // `withExtendedLifetime` is not load-bearing; it is here so that the hazard is
             // documented at the line where a future edit would reintroduce it.
             withExtendedLifetime(outcome.pipe) {}
             return outcome.decision
         }
 
-        /// libxpc has delivered the first message on this connection's session, which is the
-        /// earliest **proof** that its accept window is closed (matrix rows A11/A12 -- see
-        /// ``XPCPipe/onFirstDelivery(_:)`` for why nothing earlier will do).
+        /// libxpc has proved this connection's accept window closed -- by delivering its first
+        /// message, or by cancelling the session (matrix rows A11/A12 and N8; see
+        /// ``XPCPipe/onWindowProvedClosed(_:)`` for why nothing earlier will do).
         ///
-        /// Runs on that connection's own serial queue, ahead of the message it is proved by, so the
-        /// connection is eligible for teardown before its first op is routed.
+        /// Runs on that connection's own serial queue, ahead of the message or the peer-death
+        /// notification it is proved by, so the connection is eligible for teardown before its first
+        /// op is routed.
+        ///
+        /// **This is `pending`'s only exit, and it is what keeps `pending` from being the pending
+        /// table L5 forbids.** The difference from that table is in kind -- nothing here is
+        /// half-built, no frames are buffered, no data path runs through it, ordering is untouched,
+        /// and the exit is driven by libxpc rather than by a caller remembering to claim, which is
+        /// what made L5's table lose data. But it shared L5's *second* symptom while it had only one
+        /// exit: a single contingent path out, resting on an undocumented platform behaviour, with
+        /// nothing to detect the failure. The cancellation exit is the second, independent path, and
+        /// it is why a stranded entry is now bounded rather than merely unlikely: a stranded entry
+        /// would hold a live uncancelled `XPCSession`, its core and its queue for the acceptor's
+        /// lifetime -- process lifetime for ``XPCServerTransport/service(named:)`` -- **and** park
+        /// `listen()` forever, because a recorded teardown never finishes that core's
+        /// `acceptedStreams` and so never lets its child task return.
         ///
         /// Promotes the entry and applies whatever teardown arrived while it was untouchable. A key
         /// with no entry is an ordinary no-op: the connection has already been promoted, or closed
         /// and forgotten.
-        private func peerMadeFirstContact(_ key: ObjectIdentifier) {
+        private func windowProvedClosed(_ key: ObjectIdentifier) {
             enum Action {
                 case none
                 case drain(RPCTransportCore)
@@ -302,7 +335,7 @@ public final class XPCServerTransport: ServerTransport {
         ///
         /// A connection still inside its accept window is **not** drained here -- the `goAway`
         /// would be a send into that window, which is row A5, a process death. Its drain is
-        /// recorded and applied by ``peerMadeFirstContact(_:)``.
+        /// recorded and applied by ``windowProvedClosed(_:)``.
         func beginDraining() {
             let cores = state.withLock { state -> [RPCTransportCore] in
                 state.admitting = false
@@ -337,10 +370,11 @@ public final class XPCServerTransport: ServerTransport {
         ///
         /// A connection still inside its accept window is again left alone -- `core.close()` reaches
         /// `pipe.cancel()`, and cancelling in that window is row A1. Its close is recorded and
-        /// applied by ``peerMadeFirstContact(_:)``. If its peer never speaks at all, the entry stays
-        /// in `pending` and is released when this acceptor is, by which time the window is many
-        /// turns closed and the release-then-cancel is row A3. A late close is a delayed release;
-        /// an early one is a trap.
+        /// applied by ``windowProvedClosed(_:)``, which fires from the first delivery **or** the
+        /// session's cancellation, so "the peer never speaks again" no longer strands it. A peer
+        /// that connects without ever sending cannot occur at all: such a peer never reaches the
+        /// incoming-session closure (row N2, 40/40), so no `pending` entry exists without a blob
+        /// already in flight. A late close is a delayed release; an early one is a trap.
         func closeAll() {
             let cores = state.withLock { state -> [RPCTransportCore] in
                 state.admitting = false
@@ -352,6 +386,15 @@ public final class XPCServerTransport: ServerTransport {
             continuation.finish()
             for core in cores { core.close() }
         }
+
+        /// How many admitted connections are still waiting for their accept window to be proved
+        /// closed, and how many have been proved. **Diagnostics, and they have to be**, on the same
+        /// rationale as `RPCTransportCore.liveStreamCount`: "`pending` empties" is a claim about a
+        /// private dictionary with exactly one exit, and until these existed it was invisible from
+        /// every other part of the surface -- which is why finding 1 of round 5 arrived as a review
+        /// argument instead of a test failure. Nothing in the transport branches on either.
+        var pendingCount: Int { state.withLock { $0.pending.count } }
+        var provedCount: Int { state.withLock { $0.connections.count } }
 
         /// One connection is finished -- its accept loop ended and every handler on it has
         /// returned. Drops it and releases its session.
@@ -386,6 +429,15 @@ public final class XPCServerTransport: ServerTransport {
     /// same process (or one handed the endpoint over an existing session) dials an anonymous
     /// listener; a named-service listener is dialled by name instead and has none.
     let endpoint: XPCEndpoint?
+
+    /// Admitted connections still waiting for libxpc to prove their accept window closed. Should
+    /// be 0 in any steady state: the proof arrives with the peer's first blob, which is the blob
+    /// that caused the accept. See ``Acceptor/pendingCount``.
+    var connectionsAwaitingWindowProof: Int { acceptor.pendingCount }
+
+    /// Connections whose accept window is proved closed and which teardown may act on. See
+    /// ``Acceptor/provedCount``.
+    var provedConnectionCount: Int { acceptor.provedCount }
 
     /// `listen()`'s state, made explicit for the same reason `XPCClientTransport.ConnectState`
     /// is: every transition must be unambiguous rather than inferred from side effects.
@@ -422,18 +474,20 @@ public final class XPCServerTransport: ServerTransport {
 
     /// Releases every connection still open, then the listener.
     ///
-    /// **That order, in all three places this pair appears.** Cancelling the listener also tears
-    /// down every session it vended, which would put each pipe's session into a state
-    /// `XPCPipe`'s disposal matrix has no measured row for by the time `close()` reached it.
-    /// Closing the connections first cancels each session on the path the matrix does cover, and
-    /// leaves the listener with nothing to tear down. (`closeAll()` stops admitting first, so no
-    /// session can slip in between the two calls -- a peer arriving there is refused outright, and
-    /// `rejecting` creates no session at all.)
+    /// **This is the only place the listener is cancelled**, and that is a fix rather than a
+    /// simplification: doing it at the end of `listen()` made a peer that dialled as the server
+    /// drained vanish, never accepted and never refused (round 4 §2). Cancelling here is what makes
+    /// libxpc drop the incoming-session closure, and with it the acceptor; until it happens, a late
+    /// peer gets a definite answer from ``XPCPipe/rejecting(_:reason:)``.
     ///
-    /// Cancelling the listener is what makes libxpc drop the incoming-session closure, and with it
-    /// the acceptor. It is done here, at the end of `listen()`, and by a `beginGracefulShutdown()`
-    /// that has no `listen()` to wait for -- but *not* by a `beginGracefulShutdown()` during
-    /// `listen()`, which would kill the very connections the drain is waiting for.
+    /// Connections are closed first, and the reason has changed with the measurements. It used to be
+    /// stated as an invariant -- close them first so the listener never tears down a session the
+    /// disposal matrix has no row for -- and **that invariant is no longer kept**: a connection
+    /// still in `pending` survives `closeAll()` untouched, so `listener.cancel()` below can and does
+    /// reach one. Rows N6/N7 (80/80) measured that case safe -- cancelling *or* releasing an
+    /// accepted session after its listener has been cancelled -- so the order is now a preference
+    /// (close on the path the matrix covers where we can) rather than a requirement. Recorded this
+    /// way because the previous wording claimed a property the code stopped having.
     deinit {
         acceptor.closeAll()
         listener.cancel()
@@ -662,9 +716,17 @@ public final class XPCServerTransport: ServerTransport {
     /// Idempotent: a second call finds `.draining`/`.shutDown` and does nothing.
     ///
     /// The one asymmetry: called before any `listen()`, there is no accept loop to drain and no
-    /// handler that could be in flight, so this *is* the whole shutdown and it finishes the job --
-    /// listener cancelled, connections closed. Called while `listen()` is running, that final step
-    /// belongs to `listen()`, which is the only thing that knows when the last handler returned.
+    /// handler that could be in flight, so this *is* the whole shutdown and it closes the
+    /// connections itself. Called while `listen()` is running, that step belongs to `listen()`,
+    /// which is the only thing that knows when the last handler returned.
+    ///
+    /// **Neither arm cancels the listener** -- `deinit` is the only place that happens, so that a
+    /// peer mid-dial is refused rather than ignored. A consequence worth naming for
+    /// ``XPCServerTransport/service(named:)``: the Mach service name stays claimed until this
+    /// transport is released, where it used to be given up at the end of `listen()`. That is
+    /// deliberate (a name that answers "shutting down" is more useful than one that answers
+    /// nothing), but it means a replacement server cannot claim the name until the old transport is
+    /// gone.
     public func beginGracefulShutdown() {
         enum Action { case none, drain, drainAndClose }
 
