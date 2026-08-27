@@ -79,6 +79,47 @@ final class HTTP2FrameTests: XCTestCase {
         XCTAssertEqual(try HTTP2FrameCodec.decodeAll(blob), frames)
     }
 
+    // MARK: - Non-rebased indices
+
+    /// `GRPCSwiftData`'s indices are `Data`'s and do NOT rebase to zero on slicing (see the
+    /// contract comment on `GRPCDispatchData.swift`). Every other test in this file decodes from
+    /// a buffer whose `startIndex` is 0 -- either `HTTP2FrameCodec.encode`'s own fresh `Data`, or
+    /// an array literal -- so none of them would catch a regression that reintroduces a
+    /// hardcoded `0` in place of `data.startIndex`/`cursor`. This one decodes from a slice whose
+    /// `startIndex` is genuinely non-zero, and checks not just the frame count but every field
+    /// -- including payload *contents* -- since a wrong base offset can still produce the right
+    /// number of frames while reading shifted bytes.
+    func testDecodeFromANonZeroOffsetBuffer() throws {
+        let headers = HTTP2Frame(kind: .headers, flags: .endHeaders, streamID: 7,
+                                  payload: GRPCSwiftData([0xAA, 0xBB, 0xCC]))
+        let data = HTTP2Frame(kind: .data, flags: .endStream, streamID: 7,
+                               payload: GRPCSwiftData([0x10, 0x20, 0x30, 0x40]))
+        var wire = Data([0xFF])                      // junk byte ahead of the real frames
+        wire.append(HTTP2FrameCodec.encode([headers, data]).data)
+        // A slice starting at index 1: `sliced.startIndex == 1`, not 0. Reading this correctly
+        // requires computing every offset from `startIndex`, never from a literal `0`.
+        let sliced = wire[1...]
+        XCTAssertEqual(sliced.startIndex, 1)
+
+        let decoded = try HTTP2FrameCodec.decodeAll(GRPCSwiftData(viewing: sliced))
+        XCTAssertEqual(decoded, [headers, data])
+
+        XCTAssertEqual(decoded[0].streamID, 7)
+        XCTAssertEqual(decoded[0].flags, .endHeaders)
+        XCTAssertEqual([UInt8](decoded[0].payload), [0xAA, 0xBB, 0xCC])
+
+        XCTAssertEqual(decoded[1].streamID, 7)
+        XCTAssertEqual(decoded[1].flags, .endStream)
+        XCTAssertEqual([UInt8](decoded[1].payload), [0x10, 0x20, 0x30, 0x40])
+
+        // Re-slice a decoded frame's own payload downstream (as the LPM reassembler and per-
+        // stream codecs will), proving a slice of a slice of an already-offset buffer still
+        // reads the right bytes rather than compounding a wrong base offset.
+        let dataPayload = decoded[1].payload
+        let reSliced = dataPayload[dataPayload.startIndex.advanced(by: 1)...]
+        XCTAssertEqual([UInt8](reSliced), [0x20, 0x30, 0x40])
+    }
+
     // MARK: - Unknown types and flags (RFC 9113 §4.1: MUST ignore and discard)
 
     /// An unknown frame type (0x6, PING, which this codec's `Kind` does not model) between two

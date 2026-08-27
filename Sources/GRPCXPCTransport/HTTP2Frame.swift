@@ -127,6 +127,10 @@ enum HTTP2FrameCodec {
             let streamID = ((UInt32(data[cursor + 5]) << 24) | (UInt32(data[cursor + 6]) << 16)
                           | (UInt32(data[cursor + 7]) << 8)  |  UInt32(data[cursor + 8])) & 0x7FFF_FFFF
 
+            // Checked before the type is even looked up, and for unknown types too: a length
+            // this large can't be trusted regardless of frame type (FRAME_SIZE_ERROR in RFC 9113
+            // §4.2 is a type-independent connection error), so there is nothing to gain by
+            // deferring this to a known-type frame only.
             guard length <= maxFramePayload else {
                 throw RPCError(
                     code: .internalError,
