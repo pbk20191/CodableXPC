@@ -204,6 +204,21 @@ defaults — not because we are HTTP/2 but because those numbers and that shape 
   was introduced to prevent.
 - A credit that would take a window above 2³¹−1 is a protocol error. Applying credit is **O(1)
   arithmetic** — never a loop over a peer-supplied count (see lesson L2).
+- **The receiver ENFORCES the window; it does not merely account for it.** Everything above
+  described the sender's obligation and the receiver's bookkeeping, and Task 6's review found the
+  hole that left: a peer that simply ignores `credit` can push 16 MiB `message` ops (the codec's
+  cap) on up to 256 streams as fast as the substrate accepts them, and every byte is retained until
+  an application that will never read it does. An accountant with no debit side is not flow control.
+  So: track received-but-uncredited bytes per stream and for the connection. A stream exceeding its
+  65 535 is a **stream-level** violation — fail that stream, send `cancel`. The connection total
+  exceeding its own is **connection-level** — fail the connection. This is what HTTP/2 spends
+  `FLOW_CONTROL_ERROR` on, and O4 already borrows HTTP/2's shape deliberately.
+- **A `message` op costs at least one byte of window**, even when its payload is empty. `charge`
+  clamps to the window above; it must also floor at 1. Otherwise a zero-length `message` — legal,
+  and `google.protobuf.Empty` makes it common — is a 10-byte wire op that buys unbounded receiver
+  buffering for free, and it survives the enforcement rule above because a correct implementation
+  still charges it nothing. Flooring the charge keeps enforcement meaningful without a second
+  counter. Both peers must land this together: it changes what a byte of window buys.
 - A reservation is **spent, not lent**. A sender that reserves and then does not send must hand the
   bytes back with `release(_:)`, which is not `grant`: those bytes were already inside the window,
   so they cannot breach the ceiling and must not be validated against the peer's contract. `fail`
