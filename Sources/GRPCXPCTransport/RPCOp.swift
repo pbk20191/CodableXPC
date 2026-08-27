@@ -1,4 +1,5 @@
 import Dispatch
+import GRPCCore
 
 // ===========================================================================================
 // MARK: - Field lists
@@ -77,6 +78,47 @@ enum RPCOp: Sendable {
 }
 
 // ===========================================================================================
+// MARK: - Per-op decode results (§O2)
+// ===========================================================================================
+
+/// One entry in a decoded blob. §O2 (as amended): `decode(_:)` parses each op's 10-byte header --
+/// including its stream id -- before it ever touches the body, so a body-level rejection can
+/// always name the stream it belongs to. `WireCodec.decode(_:)` returns an array of these instead
+/// of `[RPCOp]` directly so that a body this codec rejects can surface as `.streamFailure` naming
+/// that stream, rather than as a thrown error that would hand the core nothing to fail but the
+/// whole connection -- exactly the hole §O2's amendment closes (a malformed `:path`, a
+/// stray-metadata `openStream`, and a non-empty `halfClose` body were each found killing every
+/// other stream on the connection).
+///
+/// Deliberately a two-case enum, not three. A separate "failures" array was rejected: it would
+/// lose each failure's position relative to the ops around it, and the core has to see a stream's
+/// failure at the position it occurred -- not batched at the end -- to keep per-connection
+/// ordering meaningful. Stopping at the first failure was also rejected: it would hand a hostile
+/// peer a cheap truncation lever, since appending one malformed op to a blob would silently
+/// discard every op after it, including other streams' legitimate traffic. So `decode(_:)` is
+/// skip-and-continue: a rejected op's own header already gave up its `bodyLength`, and the framing
+/// stays intact past it, so the codec advances past the rejected body exactly as it already
+/// advances past a body whose `kind` it doesn't recognise (§O3's unknown-kind skip), and keeps
+/// decoding.
+///
+/// A **header**-level failure -- a truncated 10-byte header, or a declared body length over the
+/// 16 MiB cap or past the bytes actually remaining -- has no representation here: `decode(_:)`
+/// still `throw`s for those, unchanged. The header carrying the stream id is the thing that failed
+/// to parse, so there is no id to attribute a `.streamFailure` to and no framing left to
+/// resynchronise to.
+@available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
+enum WireDecodeItem: Sendable {
+    /// One op that decoded cleanly.
+    case op(RPCOp)
+    /// One op whose body this codec rejected. The `RPCStreamID` comes from the op's own header --
+    /// decoded before the body ever was -- so it is trustworthy even though the body was not. The
+    /// core fails exactly this stream and sends `cancel`, the same path a state-machine grammar
+    /// violation already takes; any later op addressed to this id then hits the ordinary
+    /// unknown-stream drop, because the core has already removed the stream.
+    case streamFailure(RPCStreamID, RPCError)
+}
+
+// ===========================================================================================
 // MARK: - The wire-encoding seam
 // ===========================================================================================
 
@@ -91,8 +133,14 @@ protocol WireCodec: Sendable {
     /// Encodes one or more ops into a single blob. The inverse of `decode(_:)`.
     func encode(_ ops: [RPCOp]) throws -> GRPCSwiftData
     /// Decodes a blob produced by `encode(_:)` (this conformer's own, or a wire-compatible peer's)
-    /// back into the ops it carries, in the order they were encoded.
-    func decode(_ blob: GRPCSwiftData) throws -> [RPCOp]
+    /// back into the items it carries, in the order they were encoded -- see `WireDecodeItem` for
+    /// why an item, not always an `RPCOp`.
+    ///
+    /// - Throws: only for a **header-level** failure (truncated framing, or a declared body
+    ///   length this codec cannot trust). Those leave no stream id to name in a `.streamFailure`
+    ///   and no framing left to resynchronise past, so they stay connection-fatal; everything
+    ///   `WireDecodeItem` covers does not.
+    func decode(_ blob: GRPCSwiftData) throws -> [WireDecodeItem]
 }
 
 // ===========================================================================================

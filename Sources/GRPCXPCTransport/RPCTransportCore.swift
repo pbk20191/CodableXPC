@@ -85,9 +85,27 @@ import Synchronization
 //   the entirely ordinary race where a stream was retired while the peer's last ops were in
 //   flight. Their flow-control charge is still returned to the connection window, so dropping
 //   costs no window (see ``deliver(_:toStream:)``).
-// * **An accept is refused, never trapped.** A stream id of 0, an even id, a malformed method
-//   path, a draining connection or too many concurrent streams all produce a `status` or `cancel`
-//   op for that id and no table entry.
+// * **A body-level rejection fails only its stream, not the connection** (§O2, amended after a
+//   review found the opposite -- a malformed `:path`, a stray-metadata `openStream`, or a
+//   non-empty `halfClose` body each used to kill every other stream on the connection).
+//   `CompactWireCodec.decode(_:)` parses each op's 10-byte header, including its stream id, before
+//   it ever touches the body, so a body it rejects still yields a `WireDecodeItem.streamFailure`
+//   naming that stream; `receive(_:)` fails exactly that stream through ``failStream(_:dueTo:)``,
+//   the same path a state-machine grammar violation already takes (see ``deliver(_:toStream:)``'s
+//   `.violation` case) -- not a parallel one. A rejected `openStream` never got a table entry, so
+//   it gets no reply either, same as the bullet above and for the same anti-amplification reason.
+//   Only a **header**-level failure (framing this codec cannot parse at all) and a malformed
+//   `goAway` body (connection-scoped by its own nature -- there is no stream to name) still fail
+//   the whole connection; see `CompactWireCodec.decode(_:)`'s doc for why `goAway` is the one
+//   exception.
+// * **An accept is refused, never trapped.** A stream id of 0, an even id, a draining connection
+//   or too many concurrent streams all produce a `status` or `cancel` op for that id and no table
+//   entry. A malformed method **path** is caught earlier still, in the codec (the bullet above) --
+//   it never reaches this refusal path. `methodDescriptor(from:)`'s `nil` branch re-validates the
+//   same shape `GRPCWireHeaders.parseRequest` (via `validateMethodPath`) already enforced
+//   upstream, byte for byte, so nothing that reaches this guard can still fail it; it is
+//   unreachable by construction and stays only as defense in depth, not as the thing that
+//   rejects a malformed path today.
 // * **The receive window is ENFORCED, not merely accounted for** (§O4, amended). Received-but-
 //   uncredited bytes are tracked per stream (`StreamEntry.unconsumedCharge`) and for the
 //   connection (`Registry.connectionUnconsumed`), and a peer that pushes past either bound is
@@ -563,12 +581,17 @@ final class RPCTransportCore: Sendable {
     /// `pipe.queue`, serially, in send order -- which is the entire licence for the per-stream
     /// machines to be lock-free (L4) and for the op model to carry no sequence numbers (§O2).
     ///
-    /// A blob that will not decode fails the **connection**, not a stream. This is the one place
-    /// the file departs from §O2's "a violation fails that stream", and deliberately: a framing
-    /// error is not attributable to any stream (the header that would name one is the thing that
-    /// did not parse) and every op after it in the same blob is unrecoverable, so there is nothing
-    /// to resynchronise to. Contrast a *grammar* violation, which arrives on a well-formed op with
-    /// a known stream id and fails only that stream.
+    /// `codec.decode(_:)` throwing still fails the **connection**, not a stream, and that is
+    /// unchanged by `WireDecodeItem`'s introduction -- but what can still throw has narrowed. A
+    /// **header**-level failure (truncated framing, an untrustworthy declared body length) is not
+    /// attributable to any stream, because the header that would name one is the thing that did
+    /// not parse, and every op after it in the same blob is unrecoverable, so there is nothing to
+    /// resynchronise to. `CompactWireCodec` also throws for a malformed `goAway` body specifically
+    /// (see its `decode(_:)` doc) -- connection-scoped by its own nature, not a per-stream
+    /// exception carved out of this rule. Everything else that used to reach here as a thrown
+    /// error -- every **body**-level rejection §O2's amendment covers -- now arrives as a
+    /// `.streamFailure` item instead and is handled below exactly like a state-machine grammar
+    /// violation: fail that one stream, leave the rest of the blob's ops routed normally.
     private func receive(_ blob: GRPCSwiftData) {
         // L4 tripwire. Measured caveat from Task 5: `.onQueue` is target-chain permissive, so this
         // catches "delivered from an unrelated queue" but would not catch "delivered from a child
@@ -576,9 +599,9 @@ final class RPCTransportCore: Sendable {
         // regression, so it stays -- as a tripwire, not as proof.
         dispatchPrecondition(condition: .onQueue(pipe.queue))
 
-        let ops: [RPCOp]
+        let items: [WireDecodeItem]
         do {
-            ops = try codec.decode(blob)
+            items = try codec.decode(blob)
         } catch {
             failConnection(
                 RPCError(
@@ -589,7 +612,18 @@ final class RPCTransportCore: Sendable {
             return
         }
 
-        for op in ops { route(op) }
+        for item in items {
+            switch item {
+            case .op(let op):
+                route(op)
+            case .streamFailure(let streamID, let error):
+                // §O2's codec-binding amendment: a body-level rejection fails only the stream the
+                // codec already read off the op's own header -- see `WireDecodeItem`. This takes
+                // exactly the path `deliver(_:toStream:)`'s `.violation` case already takes, not a
+                // parallel one, because it is the same kind of failure caught one layer earlier.
+                failStream(streamID, dueTo: error)
+            }
+        }
     }
 
     /// Dispatches one op. **Kind first, always.**
@@ -629,6 +663,20 @@ final class RPCTransportCore: Sendable {
             .status(let streamID, _, _, _):
             deliver(op, toStream: streamID)
         }
+    }
+
+    /// Fails one stream because of a protocol violation attributed to it -- a state-machine
+    /// grammar violation (§O2, `deliver(_:toStream:)`'s `.violation` case) or a codec-level
+    /// body-level rejection (§O2's codec-binding amendment, `receive(_:)`'s `.streamFailure`
+    /// case). Both callers hand this the same two things -- the stream id and the error that
+    /// doomed it -- and both want the same outcome, so they share this one path rather than two
+    /// that could drift apart.
+    ///
+    /// The reason is truncated because a decoder's or codec's error message can embed
+    /// peer-supplied field bytes verbatim -- see ``truncatedForWire(_:)``. `removeStream` is where
+    /// that truncation happens, so this passes the full text and does not pre-truncate it.
+    private func failStream(_ id: RPCStreamID, dueTo error: any Error) {
+        removeStream(id, failingInboundWith: error, sendingCancel: "\(error)")
     }
 
     /// Feeds one stream-scoped op to its machine and delivers whatever parts come out.
@@ -768,12 +816,10 @@ final class RPCTransportCore: Sendable {
             }
 
         case .violation(let error):
-            // Contract line 1. §O2: fails this stream only. The reason is truncated because a
-            // decoder's error message can embed peer-supplied field bytes verbatim -- see
-            // ``truncatedForWire(_:)``.
-            // `removeStream` truncates the reason before it reaches the wire -- there is exactly
-            // one such point, so this passes the full text and does not pre-truncate it.
-            removeStream(id, failingInboundWith: error, sendingCancel: "\(error)")
+            // Contract line 1. §O2: fails this stream only. See ``failStream(_:dueTo:)``, shared
+            // with `receive(_:)`'s `.streamFailure` handling for the codec-level counterpart of
+            // this same failure.
+            failStream(id, dueTo: error)
         }
     }
 

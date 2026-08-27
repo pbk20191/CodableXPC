@@ -71,11 +71,34 @@ struct CompactWireCodec: WireCodec {
         return GRPCSwiftData(viewing: out)
     }
 
-    func decode(_ blob: GRPCSwiftData) throws -> [RPCOp] {
+    /// §O2 (as amended): a body-level rejection never takes the rest of the blob with it. Each
+    /// op's 10-byte header -- including its stream id -- is parsed before its body ever is, so a
+    /// body this codec rejects still yields a `.streamFailure` naming that stream, and decoding
+    /// resumes at the next op using the same `bodyLength`-derived `cursor` advance this method
+    /// already uses to step over a `kind` it doesn't recognise. See `WireDecodeItem`'s doc for why
+    /// this is skip-and-continue rather than stop-at-first-failure or a separate failures array.
+    ///
+    /// **`goAway` is the one kind whose body failure still `throw`s**, and deliberately so:
+    /// `goAway` is already a connection-scoped signal (§O1: "no new streams above `lastStreamID`"),
+    /// not a per-stream one, and this codec writes its header's `streamID` as 0 on encode --
+    /// meaningless, not a real stream id (see `encodeOne`) -- so there is no stream to attribute a
+    /// `.streamFailure` to. Manufacturing `.streamFailure(0, …)` anyway would force the core to
+    /// special-case id 0 as "fail the connection," and `0` is never a legal client-allocated
+    /// stream id (§O1: odd, non-zero) -- so that special case would be indistinguishable at the
+    /// core from a hostile peer forging streamID 0 onto some *other* kind's malformed body, which
+    /// must NOT be connection-fatal (that forgery is exactly the amplification this task closes).
+    /// Throwing here keeps that special case out of the core entirely. The cost -- losing whatever
+    /// this call already decoded from the same blob -- is bounded and one-time: `failConnection`
+    /// (this error's eventual destination) fails every live stream in the same synchronous call
+    /// regardless of whether they got one more op processed first, so nothing decoded from this
+    /// blob would have survived past that call either way. A hostile peer gains no leverage over
+    /// any *other* blob or connection by corrupting a `goAway`'s body, only over the one
+    /// connection it was already entitled to end.
+    func decode(_ blob: GRPCSwiftData) throws -> [WireDecodeItem] {
         let data = blob.data
         let end = data.endIndex
         var cursor = data.startIndex
-        var ops: [RPCOp] = []
+        var items: [WireDecodeItem] = []
 
         while cursor < end {
             guard end - cursor >= Self.headerLength else {
@@ -113,10 +136,27 @@ struct CompactWireCodec: WireCodec {
             }
 
             let body = GRPCSwiftData(viewing: data[bodyStart..<bodyEnd])
-            ops.append(try Self.decodeOne(kind: kind, streamID: streamID, body: body))
+            do {
+                items.append(.op(try Self.decodeOne(kind: kind, streamID: streamID, body: body)))
+            } catch let error as RPCError {
+                if kind == .goAway {
+                    // See this method's doc: goAway has no stream to fail, so its body rejection
+                    // stays connection-fatal instead of becoming a `.streamFailure`.
+                    throw error
+                }
+                items.append(.streamFailure(streamID, error))
+            } catch {
+                // Every throw site in `decodeOne` (and everything it calls: `decodeFieldList`,
+                // `GRPCWireHeaders.parseRequest`) constructs `RPCError`, so this is unreachable in
+                // practice. If it is ever reached, it is a codec bug, not peer input, and deserves
+                // the loud connection-fatal treatment a header failure gets rather than being
+                // silently folded into a `.streamFailure` that would misrepresent it as an
+                // ordinary per-stream rejection.
+                throw error
+            }
         }
 
-        return ops
+        return items
     }
 
     // =======================================================================================
