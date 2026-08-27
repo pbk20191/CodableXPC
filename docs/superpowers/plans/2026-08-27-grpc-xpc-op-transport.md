@@ -278,10 +278,29 @@ public enum RPCResponsePart<Bytes> { case metadata(Metadata); case message(Bytes
 - Read `Sources/XPCActors/XPCRawTransport.swift` — the repo's reviewed reference for anonymous
   `XPCListener` accept, `XPCSession(endpoint:)` dialing with `options: .inactive`, target queues,
   and cancellation handlers.
-- **Lifecycle traps (measured):** cancelling a never-activated `XPCSession` traps in libxpc, and so
-  does releasing an activated-but-uncancelled one. Track activation: accepted (server) sessions are
-  already live and must NOT be re-activated; client sessions are created inactive and activated
-  exactly once by a factory that constructs-and-activates; `deinit` cancels only when activated.
+- **Lifecycle traps — the complete measured matrix.** An earlier, shorter version of this note said
+  only that cancelling a never-activated session traps and that releasing an activated-uncancelled
+  one traps. That was incomplete in the way that matters, and Task 5's review found the gap with
+  lldb: **`sessionIsLive == false` does NOT imply safe-to-release.**
+
+  | disposal | result |
+  |---|---|
+  | construct inactive, never activate, release | **TRAPS** `_xpc_api_misuse` |
+  | cancel a never-activated session | **TRAPS** |
+  | activated, released uncancelled | **TRAPS** |
+  | `activate()` **threw**, then release | safe — a failed activation self-invalidates |
+  | activated → cancelled → released | **safe — the only safe disposal** |
+
+  So the rule is **activate-then-cancel**, always, with a failed `activate()` as the only other
+  safe terminal state. A path that decides to skip activation because the pipe was already
+  cancelled must still activate and then cancel. Accepted (server) sessions are already live and
+  must NOT be re-activated; client sessions are created inactive and activated exactly once by a
+  factory that constructs-and-activates; `deinit` cancels only when activated.
+- **`dispatchPrecondition(condition: .onQueue(q))` is target-chain permissive (measured):** it
+  passes from a serial queue that merely *targets* `q`. It therefore cannot prove queue identity.
+  Where L4's lock-free entitlement depends on identity, assert `pipe.queue === q` and compare
+  `__dispatch_queue_get_label(nil)` — a precondition alone will keep passing through a refactor
+  that inserts a child queue.
 - **Zero-copy facts (measured, already implemented and pinned in `GRPCDispatchData.swift` +
   `GRPCSwiftDataTests.swift` — keep them):** `GRPCSwiftData.init(from: xpc_object_t)` wraps the
   buffer via `DispatchData(bytesNoCopy:)` with a deallocator holding the xpc object alive; `Data`
