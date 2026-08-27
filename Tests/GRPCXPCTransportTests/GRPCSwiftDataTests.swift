@@ -1,7 +1,6 @@
 import XCTest
 import Foundation
 import XPC
-import CodableXPC
 @testable import GRPCXPCTransport
 
 /// `GRPCSwiftData` exists for one reason: to carry a gRPC payload without copying it in or out of
@@ -38,39 +37,51 @@ final class GRPCSwiftDataTests: XCTestCase {
         XCTAssertEqual(Array(survived), [9, 8, 7, 6])
     }
 
-    /// The `Codable` path goes through `XPCNativeObject`, so a decoded payload must still reference
-    /// the received buffer. Decoding through `Data` instead would hit `XPCDecoder`'s
-    /// `Data(bytes:count:)` and copy the whole message.
-    func testDecodingKeepsReferencingTheReceivedBuffer() throws {
+    /// The two libxpc crossings, back to back: `createXPCRepresentation()` out and
+    /// ``GRPCSwiftData/init(from:)`` back in. The value that comes back must still *reference* the
+    /// `xpc_data` rather than duplicate it.
+    ///
+    /// This case used to go through `Codable`/`XPCNativeObject`, which was the outbound path while
+    /// the payload rode inside an encoded value. It no longer does — the wire is now raw
+    /// `xpc_data` under one dictionary key — so the same property is asserted over the crossings
+    /// that survive.
+    func testTheOutboundRepresentationIsStillBorrowableOnTheWayBackIn() {
         let payload = GRPCSwiftData(Array(0..<200))
-        let encoded = try XPCEncoder().encode(payload)
-        let receivedBase = xpc_data_get_bytes_ptr(encoded)
+        let crossed = payload.createXPCRepresentation()
+        let receivedBase = xpc_data_get_bytes_ptr(crossed)
 
-        let decoded = try XPCDecoder().decode(GRPCSwiftData.self, from: encoded)
-        let decodedBase = decoded.withUnsafeBytes { $0.baseAddress }
+        let received = GRPCSwiftData(from: crossed)
+        let receivedViewBase = received.withUnsafeBytes { $0.baseAddress }
 
-        XCTAssertEqual(decodedBase, receivedBase, "decoding copied the payload")
-        XCTAssertEqual(Array(decoded), Array(0..<200))
+        XCTAssertEqual(receivedViewBase, receivedBase, "the crossing copied the payload")
+        XCTAssertEqual(Array(received), Array(0..<200))
     }
 
-    /// Unframing slices, so the payload handed to gRPC is still a view onto the received frame.
+    /// A message body sliced out of a received blob is still a view onto that blob — the property
+    /// `CompactWireCodec.decode` depends on when it hands each op's body out as
+    /// `GRPCSwiftData(viewing: data[bodyStart..<bodyEnd])`.
     ///
     /// The payload here is deliberately larger than `Data`'s 14-byte inline-storage threshold
     /// (measured): below it `Data` copies the value into the struct regardless of what it is given,
     /// so a small-payload version of this test would fail for a reason that has nothing to do with
     /// the transport. `testASmallPayloadIsCopiedIntoInlineStorage` pins that boundary instead.
-    func testUnframingSlicesRatherThanCopying() throws {
-        let payload = GRPCSwiftData(Array(0..<64))
-        let object = GRPCMessageFraming.frame(payload).createXPCRepresentation()
+    ///
+    /// This case used to drive the same property through `GRPCMessageFraming.unframe`, whose
+    /// 5-byte length prefix the op wire format replaced with a 10-byte op header.
+    func testSlicingABodyOutOfABlobDoesNotCopyIt() {
+        let headerLength = 10
+        let blobBytes = [UInt8](repeating: 0xEE, count: headerLength) + Array<UInt8>(0..<64)
+        let object = GRPCSwiftData(blobBytes).createXPCRepresentation()
         let received = GRPCSwiftData(from: object)
-        let frameBase = received.withUnsafeBytes { $0.baseAddress }
+        let blobBase = received.withUnsafeBytes { $0.baseAddress }
 
-        let sliced = try GRPCMessageFraming.unframe(received)
-        let payloadBase = sliced.withUnsafeBytes { $0.baseAddress }
+        let bodyStart = received.startIndex + headerLength
+        let sliced = GRPCSwiftData(viewing: received.data[bodyStart..<received.endIndex])
+        let bodyBase = sliced.withUnsafeBytes { $0.baseAddress }
 
-        XCTAssertEqual(payloadBase, frameBase?.advanced(by: GRPCMessageFraming.prefixLength),
-                       "the payload was copied out of the frame instead of sliced")
-        XCTAssertEqual(Array(sliced), Array(0..<64))
+        XCTAssertEqual(bodyBase, blobBase?.advanced(by: headerLength),
+                       "the body was copied out of the blob instead of sliced")
+        XCTAssertEqual(Array(sliced), Array<UInt8>(0..<64))
     }
 
     /// The boundary, measured rather than assumed: at 15 bytes and above the wrapper references
@@ -87,20 +98,22 @@ final class GRPCSwiftDataTests: XCTestCase {
         XCTAssertTrue(referencesLibxpc(byteCount: 64 * 1024))
     }
 
-    /// An empty payload has nothing to borrow; it must still round-trip rather than trap.
-    func testAnEmptyPayloadRoundTrips() throws {
+    /// An empty payload has nothing to borrow; it must still cross libxpc rather than trap.
+    /// `init(from:)`'s `count > 0` guard is what makes this a copy of nothing instead of a buffer
+    /// over a null pointer.
+    func testAnEmptyPayloadRoundTrips() {
         let empty = GRPCSwiftData([])
-        let decoded = try XPCDecoder().decode(
-            GRPCSwiftData.self, from: try XPCEncoder().encode(empty))
-        XCTAssertEqual(decoded.count, 0)
-        XCTAssertEqual(Array(try GRPCMessageFraming.unframe(GRPCMessageFraming.frame(empty))), [])
+        let received = GRPCSwiftData(from: empty.createXPCRepresentation())
+        XCTAssertEqual(received.count, 0)
+        XCTAssertEqual(Array(received), [])
     }
 
-    /// A slice does not rebase to zero — the type documents this, so pin it.
-    func testAnUnframedPayloadKeepsItsParentIndices() throws {
-        let payload = try GRPCMessageFraming.unframe(
-            GRPCMessageFraming.frame(GRPCSwiftData([1, 2, 3])))
-        XCTAssertEqual(payload.startIndex, GRPCMessageFraming.prefixLength)
-        XCTAssertEqual(Array(payload), [1, 2, 3])
+    /// A slice does not rebase to zero — the type documents this, so pin it. Subscripting a
+    /// decoded body from a hardcoded `0` therefore traps, which is `Data`'s own contract.
+    func testASlicedBodyKeepsItsParentIndices() {
+        let blob = GRPCSwiftData([0xEE, 0xEE, 1, 2, 3])
+        let body = GRPCSwiftData(viewing: blob.data[2..<5])
+        XCTAssertEqual(body.startIndex, 2)
+        XCTAssertEqual(Array(body), [1, 2, 3])
     }
 }

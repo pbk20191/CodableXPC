@@ -96,11 +96,17 @@ let package = Package(
         // gRPC transport over XPC. The only target in this package that depends on
         // grpc-swift-2 (GRPCCore) -- everything else stays dependency-free. Adopts
         // the Swift 6 language mode locally; the package-level default stays .v5.
+        //
+        // `XPCDispatchDataBridge` is named directly, and `CodableXPC` is gone: the
+        // payload no longer travels as a `Codable` value. `GRPCSwiftData` crosses to
+        // libxpc through exactly two calls -- `createXPCRepresentation()`, which is
+        // `DispatchDataBridge.xpcData(for:)`, and `init(from:)` -- so the bridge is a
+        // direct dependency rather than something inherited through the coder.
         .target(
             name: "GRPCXPCTransport",
             dependencies: [
                 .product(name: "GRPCCore", package: "grpc-swift-2"),
-                "CodableXPC",
+                "XPCDispatchDataBridge",
             ],
             swiftSettings: [
                 .swiftLanguageMode(.v6)

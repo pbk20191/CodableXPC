@@ -23,10 +23,10 @@ typealias HTTPField = (name: String, value: String)
 /// Identifies one RPC's stream of ops. Client-allocated, odd, monotonically increasing --
 /// mirrors HTTP/2's client-initiated stream IDs without being one.
 ///
-/// **Deliberately not named `StreamID`.** `Sources/GRPCXPCTransport/XPCFrame.swift` (the legacy
-/// custom-protocol stack this plan replaces) already owns that name for its own, differently
-/// sized identifier, and stays compiling until the swap task deletes it. `RPCStreamID` avoids the
-/// collision now and needs no rename later.
+/// **Deliberately not named `StreamID`.** The legacy custom-protocol stack this plan replaced
+/// owned that name for its own, differently sized identifier, and stayed compiling alongside this
+/// file until Task 7 deleted it (`XPCFrame.swift`). `RPCStreamID` avoided the collision then and
+/// needed no rename at the swap.
 @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
 typealias RPCStreamID = UInt32
 

@@ -168,10 +168,10 @@ import Synchronization
 
 /// One inbound RPC, fully built, as handed to a server transport's accept loop.
 ///
-/// **Deliberately not named `AcceptedStream`.** `Sources/GRPCXPCTransport/XPCConnection.swift`
-/// (the legacy custom-protocol stack this plan replaces) already owns that name in this module and
-/// stays compiling until Task 7 deletes it. This is the same collision `RPCStreamID` avoided by
-/// the same means, for the same reason: no rename churn at the swap.
+/// **Deliberately not named `AcceptedStream`.** The legacy custom-protocol stack this plan
+/// replaced owned that name in this module and stayed compiling alongside this file until Task 7
+/// deleted it (`XPCConnection.swift`). This is the same collision `RPCStreamID` avoided by the
+/// same means, for the same reason: no rename churn at the swap.
 ///
 /// Every field is final by the time this value exists -- L5. `timeout` is the deadline the client
 /// asked for on its `openStream` op, surfaced here because `RPCRequestPart` has no case for it;

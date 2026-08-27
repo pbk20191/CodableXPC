@@ -502,14 +502,14 @@ final class FlowControlWindow: Sendable {
     /// to reach from the *peer* (``grant(_:)`` validates every byte the peer sends), so a careless
     /// in-process caller is the only way in.
     ///
-    /// # Not to be confused with `CreditWindow.release(_:)`
+    /// # Not to be confused with the legacy `CreditWindow.release(_:)`
     ///
-    /// `Backpressure.swift`'s legacy ``CreditWindow`` -- live in this module until Task 7 retires
-    /// the reply-as-credit stack -- also has a `release(_:)`, and it means the **opposite** end of
-    /// the exchange: "a credit reply arrived from the peer", i.e. the equivalent of this type's
-    /// ``grant(_:)``, not of this method. `credit.release(permits)` in `XPCOutboundWriter` is that
-    /// one. This `release` never touches peer input at all; it only hands back bytes this side
-    /// reserved and did not spend.
+    /// `Backpressure.swift`'s `CreditWindow` -- deleted by Task 7 with the rest of the
+    /// reply-as-credit stack, and named here because the confusion outlived the code -- also had a
+    /// `release(_:)`, and it meant the **opposite** end of the exchange: "a credit reply arrived
+    /// from the peer", i.e. the equivalent of this type's ``grant(_:)``, not of this method. This
+    /// `release` never touches peer input at all; it only hands back bytes this side reserved and
+    /// did not spend.
     func release(_ bytes: Int) {
         precondition(bytes >= 0, "release(_:) takes a byte count; got \(bytes)")
         guard bytes > 0 else { return }

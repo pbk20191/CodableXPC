@@ -10,7 +10,6 @@ import GRPCCore
 import Dispatch
 import XPCDispatchDataBridge
 import XPC
-import CodableXPC
 
 /// The transport's `Bytes` type: gRPC's `GRPCContiguousBytes` over a `Data` that can be a **no-copy
 /// view onto an `xpc_data` payload**.
@@ -87,10 +86,9 @@ public struct GRPCSwiftData: GRPCContiguousBytes, Sendable, Equatable {
             return
         }
 
-        let dispatch = DispatchData(bytesNoCopy: .init(start: head, count: count), deallocator: .custom(nil, {
+        self.data = Data(bytesNoCopy: .init(mutating: head), count: count, deallocator: .custom({ _, _ in
             withExtendedLifetime(xpc, {})
         }))
-        self.data = Data(referencing: ((dispatch as __DispatchData) as! NSData))
     }
 }
 
@@ -120,34 +118,5 @@ extension GRPCSwiftData: RandomAccessCollection {
 extension GRPCSwiftData: ExpressibleByArrayLiteral {
     public init(arrayLiteral elements: UInt8...) {
         self.data = Data(elements)
-    }
-}
-
-// ===========================================================================================
-// MARK: - Codable, without a copy
-// ===========================================================================================
-
-/// The payload rides the wire as a raw `xpc_data`, not as a re-encoded `Data`.
-///
-/// `CodableXPC` special-cases ``XPCNativeObject``: the encoder passes the underlying
-/// `xpc_object_t` through untouched, and the decoder hands the received one back **as-is**. That is
-/// what makes the round trip copy-free in both directions — decoding through `Data` instead would
-/// hit `XPCDecoder`'s `Data(bytes:count:)`, which duplicates the whole message on arrival.
-@available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
-extension GRPCSwiftData: Codable {
-
-    public func encode(to encoder: any Encoder) throws {
-        var container = encoder.singleValueContainer()
-        try container.encode(XPCNativeObject(createXPCRepresentation()))
-    }
-
-    public init(from decoder: any Decoder) throws {
-        let native = try decoder.singleValueContainer().decode(XPCNativeObject.self)
-        guard xpc_get_type(native.object) == XPC_TYPE_DATA else {
-            throw DecodingError.dataCorruptedError(
-                in: try decoder.singleValueContainer(),
-                debugDescription: "a gRPC payload must arrive as xpc_data")
-        }
-        self.init(from: native.object)
     }
 }
