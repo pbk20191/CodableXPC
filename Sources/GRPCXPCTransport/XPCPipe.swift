@@ -38,23 +38,69 @@ import XPC
 //    callback. Every callback body is `queue.async { ... }` against the very same
 //    `DispatchSerialQueue` object that the `queue` property returns (`delivery.queue` in both
 //    cases -- one stored property, not two queues configured alike). `setTargetQueue(queue)` is
-//    still called, so the hop is usually a same-queue re-enqueue rather than a thread switch, but
-//    correctness does not depend on it having taken effect. (L4.)
+//    still called, so the hop is usually a same-queue re-enqueue rather than a thread switch.
+//    **Affinity** does not depend on that call having taken effect -- the hop alone guarantees it.
+//    **Ordering does**, and the two must not be conflated: order survives only because libxpc
+//    issues one session's inbound callbacks serially, and pointing the session at a
+//    `DispatchSerialQueue` is what makes that explicit. If those callbacks ever ran concurrently
+//    the `async` hops could be enqueued out of order -- which is exactly the failure shape a
+//    sabotage run produced when the hop was swapped for a global concurrent queue. (L4.)
 //
-// # Lifecycle: the two libxpc traps
+// # Lifecycle: the XPCSession disposal matrix
 //
-// Both are measured, both are fatal, and they point in opposite directions:
+// There is exactly **one** safe way to dispose of an `XPCSession`, and it is narrower than the
+// obvious reading of "don't cancel what you didn't activate". Measured row by row, each in its own
+// process so a trap shows as a process death (`EXC_BREAKPOINT`, exit 133):
 //
-//   - cancelling an `XPCSession` that was **never activated** traps (`_xpc_api_misuse`), and
-//   - releasing an `XPCSession` that **was** activated and never cancelled traps as well.
+//     | disposal                                          | result                        |
+//     |---------------------------------------------------|-------------------------------|
+//     | construct `.inactive`, NEVER activate, release     | TRAPS `_xpc_api_misuse`       |
+//     | cancel a never-activated session, then release     | TRAPS                         |
+//     | activate, then release UNCANCELLED                 | TRAPS                         |
+//     | `activate()` THREW, then release                   | safe                          |
+//     | activate -> cancel -> release                      | safe -- the ONLY safe disposal|
 //
-// So "always cancel" and "never cancel" are both wrong, and the pipe has to actually know. That
-// knowledge is `State.sessionIsLive`: seeded `true` for an accepted (server) session -- which
+// (Both `XPCSession(endpoint:)` and `XPCSession(machService:)` behave identically. The trap is
+// `_xpc_api_misuse <- -[OS_xpc_session _xref_dispose] <- XPCSession.__deallocating_deinit`, i.e.
+// it fires from the session's own `deinit`, not from anything this file calls.)
+//
+// An **accepted** session -- one handed back by `IncomingSessionRequest.accept` -- follows
+// different rules, and they are not the ones you would guess from the table above:
+//
+//     | disposal of an accepted session                          | result                  |
+//     |----------------------------------------------------------|-------------------------|
+//     | cancel INSIDE the incoming-session closure, before the    | TRAPS `_xpc_api_misuse` |
+//     |   accept Decision has been returned to libxpc             |                         |
+//     | release uncancelled inside that closure                   | safe                    |
+//     | cancel after the Decision returned, then release          | safe                    |
+//     | release UNCANCELLED after the Decision returned           | safe (dealloc confirmed |
+//     |                                                           | by a weak reference)    |
+//
+// So an accepted session is *not* "activated" in the sense the first table means until the accept
+// decision has gone back to libxpc: until then it may not be cancelled, and after then it does not
+// have to be. `sessionIsLive` therefore starts **false** for an accepted pipe and is flipped by
+// ``XPCPipe/acceptWindowClosed()`` once `building` returns -- which is what makes
+// `accepting(_:queue:) { $0.cancel() }` a safe no-op instead of a process death.
+//
+// The one hazard this file cannot close: if the *caller* drops the pipe `accepting` returned
+// before returning the accept Decision from the listener's closure, `deinit` cancels a session
+// still inside its accept window and the process dies. "Publish before you return" is not a
+// tidiness rule; that is the penalty. Use ``XPCPipe/rejecting(_:reason:)`` to refuse a peer -- it
+// never creates a session, so there is nothing to dispose of.
+//
+// So the rule is **activate-then-cancel, always**, with a *failed* `activate()` as the only other
+// safe terminal state -- a failed activation self-invalidates the session, which is why releasing
+// it is fine there and nowhere else. In particular, "we never activated it, so releasing it is
+// safe" is **false**; that mistake is a process death, not a leak.
+//
+// `State.sessionIsLive` is the predicate "this session is activated and not yet cancelled", i.e.
+// "a cancel is owed". It is seeded `true` for an accepted (server) session -- which
 // `IncomingSessionRequest.accept` hands back already live -- and `false` for a dialled (client)
-// session, which is created `.inactive` and flips to `true` only after `session.activate()`
-// returns *without throwing*. A dial whose `activate()` throws therefore leaves `sessionIsLive`
-// false and `deinit` releases the session without cancelling it, which is the only non-trapping
-// move on that path. See ``XPCPipe/deinit``.
+// session, which is created `.inactive`. It flips to `true` only after `session.activate()`
+// returns without throwing, and back to `false` only in the code path that performs the cancel.
+// The other half of the obligation lives in ``XPCPipe/activate()``: **no path may release a
+// constructed session without activating it first**, so a pipe that was cancelled before it could
+// be activated is activated anyway, purely so that it can be cancelled. See ``XPCPipe/deinit``.
 //
 // # Timers
 //
@@ -268,22 +314,33 @@ final class XPCPipe: MessagePipe {
         self.delivery = delivery
         switch origin {
         case .accepted:
-            // Already live. Nothing to activate, and a cancel is already owed.
-            self.state = Mutex(State(phase: .running, sessionIsLive: true))
+            // Already live, so nothing to activate -- but `sessionIsLive` starts **false** and is
+            // flipped by ``acceptWindowClosed()`` once `building` has returned. An accepted
+            // session cannot be cancelled while the listener's incoming-session closure is still
+            // running (measured: it traps), so the "a cancel is owed" flag must not be set until
+            // that window has closed. See the accept-window row of the matrix at the top of this
+            // file.
+            self.state = Mutex(State(phase: .running, sessionIsLive: false))
         case .dialled:
             // Inactive. Cancelling it now would trap; only a successful `activate()` earns that.
+            session.setTargetQueue(delivery.queue)
             self.state = Mutex(State(phase: .idle, sessionIsLive: false))
         }
     }
 
-    /// The RAII half of the lifecycle: release the native session without tripping either libxpc
-    /// trap.
+    /// The RAII half of the lifecycle: release the native session along the one disposal the
+    /// matrix at the top of this file shows to be safe.
     ///
-    /// `sessionIsLive` is exactly the predicate "this session was activated (or arrived already
-    /// activated) and has not been cancelled yet". Cancelling when it is false traps
-    /// (`_xpc_api_misuse` on a never-activated session); *not* cancelling when it is true traps on
-    /// release. Both directions are measured, so this is a two-sided obligation and not a
-    /// best-effort tidy-up.
+    /// `sessionIsLive` is exactly the predicate "this session is activated and not yet cancelled",
+    /// i.e. "a cancel is owed". Cancelling when it is false traps (`_xpc_api_misuse` on a
+    /// never-activated session); *not* cancelling when it is true traps on release. Both
+    /// directions are measured, so this is a two-sided obligation and not a best-effort tidy-up.
+    ///
+    /// `sessionIsLive == false` does **not** by itself make release safe -- releasing a session
+    /// that was constructed and never activated traps too. What makes it safe here is that the
+    /// only way to reach `deinit` with a constructed session and `sessionIsLive == false` is a
+    /// *failed* `session.activate()`, which self-invalidates the session. ``activate()`` is what
+    /// guarantees that; see its `.shutDown` arm.
     ///
     /// Taken and cleared under the lock so that a `cancel()` racing this cannot double-cancel --
     /// though in practice `deinit` implies no other reference exists.
@@ -380,9 +437,12 @@ final class XPCPipe: MessagePipe {
     /// **outside** it, because it is a libxpc call that synchronously reaches the session's
     /// cancellation handler and a lock held across it would be held across foreign code.
     ///
-    /// A pipe cancelled before it was ever activated (`.idle`) still reaches `.shutDown` and still
-    /// does **not** cancel the session -- `sessionIsLive` is false there, and cancelling a
-    /// never-activated session traps.
+    /// A pipe cancelled before it was ever activated (`.idle`) reaches `.shutDown` without
+    /// touching the session: `sessionIsLive` is false there, and cancelling a never-activated
+    /// session traps. That is **not** the end of the obligation -- releasing that session would
+    /// trap as well. The debt is settled by ``activate()``, which sees `.shutDown`, activates the
+    /// session anyway and cancels it immediately. Deferring rather than skipping is the only
+    /// arrangement that satisfies every row of the disposal matrix at the top of this file.
     func cancel() {
         let owesCancel = state.withLock { st -> Bool in
             guard st.phase != .shutDown else { return false }
@@ -403,6 +463,24 @@ final class XPCPipe: MessagePipe {
     // MARK: Activation
     // ---------------------------------------------------------------------------------------
 
+    /// Called by ``accepting(_:queue:building:)`` once `building` has returned -- i.e. once the
+    /// pipe is fully built and the accept decision is about to go back to libxpc.
+    ///
+    /// Until this runs, an accepted pipe deliberately believes no cancel is owed, because
+    /// cancelling an accepted session from inside the listener's incoming-session closure traps
+    /// (`_xpc_api_misuse`). After it runs, the ordinary rule applies and ``cancel()`` / ``deinit``
+    /// will hang the peer up.
+    ///
+    /// If `building` cancelled the pipe, the phase is `.shutDown` and the flag is deliberately
+    /// left false: the session is then released uncancelled, which for an *accepted* session is
+    /// measured safe (unlike a dialled one). The peer is dropped when the pipe is released.
+    private func acceptWindowClosed() {
+        state.withLock { st in
+            guard st.phase == .running else { return }
+            st.sessionIsLive = true
+        }
+    }
+
     /// Activates a dialled session exactly once. Private: ``connecting(to:queue:building:)`` and
     /// its siblings are the only callers, and they construct-and-activate in one step so there is
     /// no window in which a caller holds an unactivated pipe.
@@ -412,21 +490,31 @@ final class XPCPipe: MessagePipe {
     ///   call is refused **deterministically** rather than racing into a second
     ///   `session.activate()` (which libxpc would trap on);
     /// - `session.activate()` runs outside the lock;
-    /// - a throw lands the pipe in `.shutDown` with `sessionIsLive` still false, which is exactly
-    ///   what `deinit` needs on the failed-dial path;
-    /// - a success that finds the phase no longer `.activating` (someone cancelled meanwhile)
-    ///   honours the cancel: the now-live session is cancelled immediately rather than leaking.
+    /// - a throw from `session.activate()` self-invalidates the session, so the pipe lands in
+    ///   `.shutDown` with `sessionIsLive` false and `deinit` may simply release it -- the one and
+    ///   only case in which releasing an uncancelled session is safe;
+    /// - **every other exit still activates first.** A pipe already `.shutDown` when this runs
+    ///   (the `building` closure cancelled it) does *not* get to skip activation: an
+    ///   `XPCSession` that is merely constructed and released traps exactly as hard as an
+    ///   activated-and-uncancelled one. It is activated, then cancelled, then the throw is
+    ///   reported. Same for the `.activating -> someone cancelled` window after a successful
+    ///   activate. Both windows funnel through the one safe disposal -- see the matrix at the top
+    ///   of this file.
     private func activate() throws {
-        try state.withLock { st in
+        let cancelledBeforeActivation = try state.withLock { st -> Bool in
             switch st.phase {
             case .idle:
                 st.phase = .activating
+                return false
             case .activating, .running:
                 throw RPCError(code: .failedPrecondition,
                                message: "the XPC pipe has already been activated")
             case .shutDown:
-                throw RPCError(code: .unavailable,
-                               message: "the XPC pipe was cancelled before it could be activated")
+                // Cancelled by the `building` closure, before this ran. We must STILL activate:
+                // the session exists, and the only non-trapping way to dispose of an existing,
+                // non-self-invalidated session is activate-then-cancel. Returning early here is
+                // what used to turn `building { $0.cancel() }` into `_xpc_api_misuse` at release.
+                return true
             }
         }
         do {
@@ -434,13 +522,21 @@ final class XPCPipe: MessagePipe {
         } catch {
             state.withLock { st in
                 st.phase = .shutDown
-                // Deliberately left false: this session never activated, so cancelling it in
-                // `deinit` would trap. Releasing it is the only safe move.
+                // Deliberately left false, and this is the ONLY safe "false" for an existing
+                // session: a failed `activate()` self-invalidates it, so releasing it is fine and
+                // cancelling it is not. Every other path must have activated first.
                 st.sessionIsLive = false
             }
             delivery.shutDown()
             throw RPCError(code: .unavailable,
                            message: "could not activate the XPC session: \(error)")
+        }
+        if cancelledBeforeActivation {
+            // Activated purely so that it can be cancelled. `cancel()` already ran `shutDown()`
+            // on the delivery, so nothing is reported to the (departing) owner.
+            session.cancel(reason: "XPCPipe cancelled before activation")
+            throw RPCError(code: .unavailable,
+                           message: "the XPC pipe was cancelled before it could be activated")
         }
         let cancelledMeanwhile = state.withLock { st -> Bool in
             guard st.phase == .activating else { return true }   // a concurrent cancel() won
@@ -472,8 +568,11 @@ extension XPCPipe {
     ///     let queue = DispatchSerialQueue(label: "…")
     ///     let (decision, pipe) = XPCPipe.accepting(request, queue: queue) { pipe in
     ///         let core = RPCTransportCore(pipe: pipe, codec: CompactWireCodec())
-    ///         pipe.onReceive { core.receive($0) }      // installed here, not later
-    ///         pipe.onPeerDeath { core.peerDied() }
+    ///         // Installed here, not later -- and `[weak core]`, not by style but because `core`
+    ///         // holds `pipe`: a strong capture closes the retain cycle described on
+    ///         // `onReceive(_:)` and leaks the XPC session.
+    ///         pipe.onReceive   { [weak core] blob in core?.receive(blob) }
+    ///         pipe.onPeerDeath { [weak core] in      core?.peerDied()    }
     ///     }
     ///     …publish `pipe` (or the core built from it) to whoever will own it…
     ///     return decision
@@ -511,6 +610,34 @@ extension XPCPipe {
     /// - Returns: the listener decision to return, and the pipe. **The returned pipe is the only
     ///   strong reference** -- nothing in libxpc holds one (L6) -- so whoever calls this owns the
     ///   connection's lifetime.
+    ///
+    /// - Important: **publish the returned pipe before returning the decision, and do not drop
+    ///   it.** Releasing it while still inside the listener's closure runs `deinit`, which cancels
+    ///   a session that is still inside its accept window -- and that is an `_xpc_api_misuse`
+    ///   trap, i.e. a process death, not a leak. To turn a peer away use ``rejecting(_:reason:)``
+    ///   *instead of* calling this, rather than accepting and then discarding.
+    ///
+    /// - Note: `building` calling `pipe.cancel()` is safe (the session is left to be released
+    ///   uncancelled, which for an accepted session is measured safe) but pointless -- the peer
+    ///   has already been admitted at that point. ``rejecting(_:reason:)`` is what you want.
+    /// Refuses an inbound session. **This is the correct way to turn a peer away** -- e.g. while
+    /// the server is draining, or when a peer requirement fails.
+    ///
+    /// Refusing is not the same as accepting and then cancelling. `reject` never creates an
+    /// `XPCSession` at all, so there is nothing to dispose of and none of the accept-window
+    /// hazards in the matrix at the top of this file apply. Accepting first and cancelling inside
+    /// the listener's closure traps; accepting first and dropping the pipe inside the closure
+    /// traps. This does neither.
+    ///
+    /// It exists here rather than being left to the caller so that the whole accept-side decision
+    /// surface (admit / refuse) lives in the one file allowed to `import XPC`.
+    static func rejecting(
+        _ request: XPCListener.IncomingSessionRequest,
+        reason: String
+    ) -> XPCListener.IncomingSessionRequest.Decision {
+        request.reject(reason: reason)
+    }
+
     static func accepting(
         _ request: XPCListener.IncomingSessionRequest,
         queue: DispatchSerialQueue,
@@ -533,6 +660,7 @@ extension XPCPipe {
             session.setTargetQueue(queue)
             let pipe = XPCPipe(session: session, origin: .accepted, delivery: delivery)
             build(pipe)
+            pipe.acceptWindowClosed()
             return (decision, pipe)
         }
     }
