@@ -124,6 +124,11 @@ final class TestPipe: MessagePipe, @unchecked Sendable {
     /// proved this suite could not otherwise see.
     var deliveredBlobCount: Int { state.withLock { $0.deliveredBlobs } }
 
+    /// Makes every subsequent ``send(_:)`` throw `error` instead of recording the blob.
+    ///
+    /// The substrate being gone is a state the core has to survive without a caller to report to:
+    /// `sendControl(_:)` is documented as dropping its failure "here and only here". Read by
+    /// `WireProtocolTests.testARefusalThatCannotBeSentIsDroppedNotFatal`.
     func failNextSends(with error: any Error) { state.withLock { $0.sendFailure = error } }
 
     /// Encodes `ops` into one blob and delivers it, exactly as a peer's single XPC message would.
@@ -145,7 +150,10 @@ final class TestPipe: MessagePipe, @unchecked Sendable {
         queue.sync { handler(blob) }
     }
 
-    /// Fires the peer-death handler, on `queue`, as `XPCPipe` would.
+    /// Fires the peer-death handler, on `queue`, exactly as `XPCPipe` does when libxpc reports the
+    /// peer gone. The only reader of ``onPeerDeath(_:)``'s stored handler, and therefore the only
+    /// thing that keeps this pipe's peer-death path from being dead support code: read by
+    /// `ReceiveWindowTests.testPeerDeathSweepsTheTableAndWakesAParkedWriter`.
     func killPeer() {
         guard let handler = state.withLock({ $0.onPeerDeath }) else { return }
         queue.sync { handler() }
@@ -167,9 +175,6 @@ final class TestPipe: MessagePipe, @unchecked Sendable {
         }
         return Self.ops(in: blobs)
     }
-
-    /// Everything sent so far, without clearing.
-    var sentOps: [RPCOp] { Self.ops(in: sentBlobs) }
 
     private static func ops(in blobs: [GRPCSwiftData]) -> [RPCOp] {
         let codec = CompactWireCodec()
@@ -215,19 +220,6 @@ extension RPCOp {
             return "credit(\(id), bytes: \(bytes))"
         case .goAway(let last):
             return "goAway(lastStreamID: \(last))"
-        }
-    }
-
-    /// The op's stream id as the *header* carries it. `goAway` has none -- the codec writes 0 there
-    /// and the decoder ignores it -- so this reports `nil` for it rather than a fake 0 that a
-    /// filter would then confuse with a connection-level `credit`.
-    var testStreamID: RPCStreamID? {
-        switch self {
-        case .openStream(let id, _, _), .metadata(let id, _), .message(let id, _),
-            .halfClose(let id), .status(let id, _, _, _), .cancel(let id, _), .credit(let id, _):
-            return id
-        case .goAway:
-            return nil
         }
     }
 }
@@ -409,13 +401,26 @@ enum RawOpBytes {
         return out
     }
 
-    /// A minimal legal `openStream` body for `method`, with no metadata.
-    static func openStreamBody(method: String, timeout: String? = nil) -> Data {
+    /// A legal `openStream` body for `method`: §O3's reserved field set, and nothing else unless
+    /// `extraFields` asks for it.
+    ///
+    /// - Parameter timeout: a `grpc-timeout` value, e.g. `"1500000u"`.
+    /// - Parameter extraFields: appended verbatim. §O2 says user metadata travels in its own
+    ///   `metadata` op and never inside `openStream`'s field list, so anything passed here makes the
+    ///   body **illegal** -- which is exactly what
+    ///   `WireProtocolTests.testAnOpenStreamCarryingStrayMetadataIsRejected` needs, and it must be
+    ///   built by adding a field to an otherwise-valid body rather than by hand, or the test could
+    ///   be failing for some unrelated reason.
+    static func openStreamBody(
+        method: String, timeout: String? = nil,
+        extraFields: [(name: String, value: String)] = []
+    ) -> Data {
         var fields: [(name: String, value: String)] = [
             (":method", "POST"), (":scheme", "https"), (":path", "/" + method),
             ("te", "trailers"), ("content-type", "application/grpc"),
         ]
         if let timeout { fields.append(("grpc-timeout", timeout)) }
+        fields.append(contentsOf: extraFields)
         return fieldList(fields)
     }
 

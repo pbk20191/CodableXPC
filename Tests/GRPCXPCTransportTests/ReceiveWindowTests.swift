@@ -371,6 +371,164 @@ final class ReceiveWindowTests: XCTestCase {
     }
 
     // =======================================================================================
+    // MARK: - The send side, with the window at zero
+    // =======================================================================================
+
+    /// One accepted server stream whose **stream and connection send windows are both exhausted**,
+    /// with a second write parked on them.
+    ///
+    /// Deterministic, and that is the point of doing it over a ``TestPipe`` rather than real XPC: no
+    /// `credit` op can arrive unless this test sends one, so "the window is at zero" is a fact for as
+    /// long as the test wants it, rather than a race against the peer's consumption.
+    ///
+    /// - Returns: the core, the stream, and a box that stays `nil` for as long as the second write is
+    ///   still parked. The caller owns `core.shutDown()`, which is also what releases the parked
+    ///   write (`failAll` fails both windows).
+    private static func withExhaustedSendWindows(
+        label: String
+    ) async throws -> (
+        core: CoreUnderTest, stream: RPCTransportCore.ServerRPCStream,
+        parkedOutcome: Observed<String?>
+    ) {
+        let core = CoreUnderTest(role: .server, label: label)
+        try Self.open(core, 1)
+        try await core.waitForAccepts(1)
+        let accepted = try XCTUnwrap(core.acceptedStream(1))
+
+        // A control op: no flow control, so it always goes straight out.
+        try await accepted.stream.outbound.write(.metadata([:]))
+
+        // Exactly one window's worth, which empties the stream's window *and* the connection's --
+        // §O4 reserves the stream then the connection, both for the same charge.
+        try await accepted.stream.outbound.write(
+            .message(WindowSizes.payload(FlowControl.initialWindow)))
+
+        // A second message now has nothing to reserve from and must park.
+        let parkedOutcome = Observed<String?>(nil)
+        let stream = accepted.stream
+        Task.detached {
+            do {
+                try await stream.outbound.write(.message(WindowSizes.payload(100)))
+                parkedOutcome.mutate { $0 = "completed" }
+            } catch {
+                parkedOutcome.mutate { $0 = "\((error as? RPCError)?.code.description ?? "\(type(of: error))")|\((error as? RPCError)?.message ?? "")" }
+            }
+        }
+        try await Task.sleep(for: negativeAssertionSettleWindow)
+        XCTAssertNil(
+            parkedOutcome.value,
+            "\(label): the second write must still be parked -- if it completed, the windows were "
+                + "not actually exhausted and everything this helper sets up is void")
+        return (core, accepted.stream, parkedOutcome)
+    }
+
+    /// **§O4's terminal-op clause, on the op that matters most: `status`.**
+    ///
+    /// "Control ops are never flow-controlled, so a stalled window can never starve a stream's
+    /// terminal op" is load-bearing, not incidental: if `status` had to wait for credit, a peer that
+    /// stopped reading could make a stream **unclosable**. Only `halfClose` and `metadata` were
+    /// proven before this -- `BackpressureTests.testAGatedReaderBoundsTheWritersInFlightBytes` covers
+    /// the client's terminator; the server's is `status`, and it is the one a stuck handler is
+    /// blocked on.
+    ///
+    /// Both terminal ops are covered here, because §O5.3 makes `cancel` the abort op in both
+    /// directions and it goes out through a different path (`cancelStream`, not the writer):
+    ///
+    /// 1. with both send windows at zero and a message write parked on them, `status` reaches the
+    ///    wire;
+    /// 2. and on a second, independently exhausted stream, `finish(throwing:)` puts a `cancel` on the
+    ///    wire from the same state.
+    func testATerminalStatusAndCancelGetThroughWithTheSendWindowAtZero() throws {
+        try runBounded("terminal ops with the window at zero", timeout: 60) {
+            // ---- 1. `status` ----
+            let statusCase = try await Self.withExhaustedSendWindows(label: "terminal-status")
+            defer { statusCase.core.shutDown() }
+            _ = statusCase.core.pipe.takeSentOps()
+
+            try await statusCase.stream.outbound.write(
+                .status(Status(code: .ok, message: ""), [:]))
+
+            let afterStatus = statusCase.core.pipe.takeSentOps()
+            XCTAssertEqual(
+                afterStatus.statuses(forStream: 1).map { "\($0.code)|\($0.message)" },
+                ["\(Status.Code.ok.rawValue)|"],
+                "the `status` op must reach the wire with both send windows at zero; got "
+                    + "\(afterStatus.testDescriptions)")
+            XCTAssertNil(
+                statusCase.parkedOutcome.value,
+                "and the parked *message* write must still be parked -- otherwise the window was "
+                    + "not at zero when the status went out and this proves nothing")
+
+            // ---- 2. `cancel` ----
+            let cancelCase = try await Self.withExhaustedSendWindows(label: "terminal-cancel")
+            defer { cancelCase.core.shutDown() }
+            _ = cancelCase.core.pipe.takeSentOps()
+
+            await cancelCase.stream.outbound.finish(
+                throwing: RPCError(code: .aborted, message: "the handler gave up"))
+
+            let afterCancel = cancelCase.core.pipe.takeSentOps()
+            XCTAssertEqual(
+                afterCancel.cancels(forStream: 1).count, 1,
+                "the `cancel` op must reach the wire with both send windows at zero; got "
+                    + "\(afterCancel.testDescriptions)")
+            XCTAssertEqual(
+                cancelCase.core.core.liveStreamCount, 0,
+                "and the stream is removed, which is what wakes its parked writer")
+        }
+    }
+
+    /// Contract line 9 at the mux: **peer death sweeps the table, fails every stream's inbound, and
+    /// wakes a writer parked on the send windows.**
+    ///
+    /// Slice 2 proved the waking half over real XPC (`TeardownTests.testPeerDeathWakesWritersParked
+    /// OnBothWindows`). What it could not see is the table: `liveStreamCount` and the accept
+    /// sequence's termination are only reachable from a core the test built, and the server's
+    /// per-connection core is private two layers down. This case is that half, and it is also the
+    /// only reader of ``TestPipe/killPeer()`` -- without it the pipe's whole `onPeerDeath` path is
+    /// dead support code that looks like coverage.
+    func testPeerDeathSweepsTheTableAndWakesAParkedWriter() throws {
+        try runBounded("peer death at the mux", timeout: 60) {
+            let subject = try await Self.withExhaustedSendWindows(label: "mux-peer-death")
+            defer { subject.core.shutDown() }
+            XCTAssertEqual(subject.core.core.liveStreamCount, 1)
+
+            subject.core.pipe.killPeer()
+
+            // The parked writer is woken, with the peer-death error rather than a generic one.
+            try await waitUntil("the parked writer to be woken") {
+                subject.parkedOutcome.value != nil
+            }
+            let outcome = try XCTUnwrap(subject.parkedOutcome.value)
+            XCTAssertTrue(
+                outcome.hasPrefix("unavailable|"),
+                "a writer parked on credit that can no longer arrive must be failed, not left "
+                    + "suspended forever; got '\(outcome)'")
+            XCTAssertTrue(
+                outcome.contains("the peer process is no longer available"),
+                "and it must be failed with the peer-death reason, so a coincidental "
+                    + "`.unavailable` from something else cannot pass this; got '\(outcome)'")
+
+            // The table is swept -- the half slice 2's real-XPC case cannot observe.
+            XCTAssertEqual(
+                subject.core.core.liveStreamCount, 0,
+                "`failAll` must remove every entry: a core that kept them would leak one per "
+                    + "disconnected peer")
+
+            // And the stream's inbound is failed with the same error rather than ended cleanly.
+            var thrown: (any Error)?
+            do {
+                for try await _ in subject.stream.inbound {}
+            } catch {
+                thrown = error
+            }
+            let error = try XCTUnwrap(thrown as? RPCError, "the inbound must have been failed")
+            XCTAssertEqual(error.code, .unavailable)
+            XCTAssertTrue(error.message.contains("the peer process is no longer available"))
+        }
+    }
+
+    // =======================================================================================
     // MARK: - Hostile control ops
     // =======================================================================================
 

@@ -214,6 +214,21 @@ final class WireProtocolTests: XCTestCase {
     /// cores, same stream id, one fed a 12-byte malformed `openStream` and the other fed one whose
     /// `:path` fills the entire 16 MiB body cap. A reply whose size depended on the input in any
     /// way at all -- including through a truncation that kept a prefix -- fails this.
+    ///
+    /// # And the gate order, which was verified by reading only until this test grew two arms
+    ///
+    /// §O2 requires `refuseOpen(_:dueTo:)` to run the same gates `openInbound` does, in the same
+    /// order: **role, then id legality, then the fixed literal.** The byte-identity arms above use a
+    /// server core and stream id 1, which passes both gates, so they cannot see the order at all.
+    /// The two arms at the end of this test enter each gate:
+    ///
+    /// * a **client** core must answer with `cancel`, never `status` -- a client never accepts, so a
+    ///   `status` would tell the peer an RPC it never agreed to had failed;
+    /// * a **reserved** id (0, or any even id) must be refused on the id, before the `status` its
+    ///   malformed body would otherwise earn;
+    /// * and a **client** receiving a **reserved** id -- the only shape in which both gates apply at
+    ///   once, and therefore the only one that can see which runs *first*. The first two arms cannot:
+    ///   measured, swapping the two guards survives them both (P31).
     func testAMalformedOpenStreamRefusalIsAFixedLiteral() throws {
         // Twelve bytes total: a 10-byte header and a 2-byte body declaring 65 535 fields, which
         // cannot possibly fit. The cheapest malformed `openStream` there is.
@@ -242,8 +257,10 @@ final class WireProtocolTests: XCTestCase {
             ["streamOpenFailure(1)"],
             "a malformed `:path` must be a stream-open failure, not a connection failure")
 
-        func refusal(for input: Data, label: String) throws -> [GRPCSwiftData] {
-            let core = CoreUnderTest(role: .server, label: label)
+        func refusal(
+            for input: Data, label: String, role: RPCTransportCore.Role = .server
+        ) throws -> [GRPCSwiftData] {
+            let core = CoreUnderTest(role: role, label: label)
             defer { core.shutDown() }
             core.pipe.deliverRaw(RawOpBytes.offsetBlob(input))
             XCTAssertEqual(
@@ -268,6 +285,367 @@ final class WireProtocolTests: XCTestCase {
             Self.describe(decoded),
             ["op(status(1, code: \(Status.Code.invalidArgument.rawValue), message: malformed openStream, trailers: 0))"],
             "the refusal must be `status(.invalidArgument, \"malformed openStream\")`")
+
+        // -------------------------------------------------------------------------------
+        // The gate order: ROLE first, then id legality. Neither gate is reached above.
+        // -------------------------------------------------------------------------------
+        //
+        // `refuseOpen(_:dueTo:)` deliberately mirrors `openInbound`'s own gate order for the two
+        // checks it can make without a successfully-decoded `method`, and §O2 says **the role gate
+        // must run first**: a malformed `openStream` arriving at a *client* transport must get
+        // `openInbound`'s treatment -- a client never accepts, so `cancel`, not `status` -- and
+        // checking id legality or answering with `status` before checking role would have a client
+        // transport answer an `openStream` it must never accept.
+        //
+        // Everything above this line uses a **server** core and stream id **1**, which passes both
+        // gates, so until these two arms existed the ordering was verified by reading only.
+
+        // Arm 1: the role gate. A client core must answer with the fixed-literal `cancel`.
+        let atAClient = try refusal(for: tiny, label: "refuse-at-a-client", role: .client)
+        XCTAssertEqual(atAClient.count, 1, "a client must still answer -- silently dropping hangs the peer")
+        let clientOps = try Self.codec.decode(try XCTUnwrap(atAClient.first))
+        XCTAssertEqual(
+            Self.describe(clientOps),
+            ["op(cancel(1, reason: a client transport does not accept streams))"],
+            "a client transport must refuse with `cancel`, never `status`: a `status` says 'your RPC "
+                + "failed', which presumes an RPC a client never agreed to accept")
+
+        // Arm 2: the id-legality gate, on a server, for the ids §O1/§O4 reserve. These must be
+        // refused with `cancel` too -- there is no legitimate RPC to answer with a status -- and
+        // they must be refused *because of the id*, before the `status` reply the body's own
+        // rejection would otherwise produce.
+        for illegalID: RPCStreamID in [0, 2, 4_294_967_294] {
+            let body = RawOpBytes.fieldList([], declaredCount: 0xFFFF)
+            let reply = try refusal(
+                for: RawOpBytes.op(.openStream, streamID: illegalID, body: body),
+                label: "refuse-illegal-id-\(illegalID)")
+            XCTAssertEqual(reply.count, 1, "id \(illegalID): exactly one blob goes back")
+            XCTAssertEqual(
+                Self.describe(try Self.codec.decode(try XCTUnwrap(reply.first))),
+                [
+                    "op(cancel(\(illegalID), reason: stream id \(illegalID) is not a legal "
+                        + "client-allocated id (must be odd and non-zero)))"
+                ],
+                "id \(illegalID) is reserved (0 is the connection window per §O4; even ids are not "
+                    + "client-allocated per §O1), so it must be refused with `cancel` on the id, "
+                    + "not with the `status` its malformed body would otherwise earn")
+        }
+
+        // Arm 3: **the order itself, which arms 1 and 2 cannot see.**
+        //
+        // Each of them enters one gate and then falls straight through to the answer, so swapping
+        // the two guards changes nothing for either: for a legal odd id only the role gate can
+        // fire, and for a server core the role gate never fires. **Measured -- without this arm,
+        // swapping the two guards survives the entire target (mutation P31).**
+        //
+        // Only a **client** receiving an **illegal** id makes both gates applicable at once, and
+        // then the reason on the wire says which one ran. §O2 says role wins, and the reason it
+        // gives is not stylistic: the id is irrelevant to a transport that accepts nothing, so
+        // reporting it would tell the peer to retry with a different id on a connection where no id
+        // will ever work.
+        for illegalID: RPCStreamID in [0, 2] {
+            let reply = try refusal(
+                for: RawOpBytes.op(
+                    .openStream, streamID: illegalID,
+                    body: RawOpBytes.fieldList([], declaredCount: 0xFFFF)),
+                label: "refuse-client-illegal-\(illegalID)", role: .client)
+            XCTAssertEqual(
+                Self.describe(try Self.codec.decode(try XCTUnwrap(reply.first))),
+                ["op(cancel(\(illegalID), reason: a client transport does not accept streams))"],
+                "both gates apply to id \(illegalID) at a client, and §O2 puts role first: the peer "
+                    + "must be told this transport does not accept streams, not that its id was "
+                    + "illegal")
+        }
+    }
+
+    // =======================================================================================
+    // MARK: - What user metadata may put on the wire
+    // =======================================================================================
+
+    /// **No pseudo-header reaches the wire from user metadata.** Task 4's report calls this "exactly
+    /// the assertion that would have caught it" about a fix that shipped, and it did not exist -- no
+    /// test file targets `StreamStateMachines.swift` at all.
+    ///
+    /// A caller can put anything in `Metadata`, including `:path` or `content-type`. Those names
+    /// belong to the transport: `openStream`'s field list carries the real ones, and a `metadata` op
+    /// that also carried them would either be ignored by a conforming peer or -- worse -- override
+    /// the method the call is actually for. So the reserved set is stripped on the way out.
+    ///
+    /// Both directions are asserted, and only one of them is mutation-proven:
+    ///
+    /// * **a non-reserved key survives byte-exact**, which is discriminating by construction -- an
+    ///   encoder that dropped or mangled values fails it;
+    /// * **every reserved key is stripped.** The mutation that would prove this half (removing the
+    ///   `isReservedName` filter in `GRPCWireHeaders.userMetadataFields`) lands in a file carrying
+    ///   the user's live typed-throws WIP, so it was **not run** -- recorded rather than claimed.
+    ///
+    /// The `openStream` op in the same blob is asserted to keep its own pseudo-headers, so the test
+    /// cannot pass by stripping them everywhere.
+    func testNoPseudoHeaderReachesTheWireFromUserMetadata() throws {
+        try runBounded("user metadata on the wire", timeout: 20) {
+            let core = CoreUnderTest(role: .client, label: "pseudo-headers")
+            defer { core.shutDown() }
+
+            let opened = try core.core.openStream(
+                descriptor: MethodDescriptor(fullyQualifiedService: "pkg.Svc", method: "Real"),
+                timeout: nil)
+
+            var metadata = Metadata()
+            metadata.addString("kept", forKey: "x-user-key")
+            for reserved in [
+                ":method", ":scheme", ":path", ":status", "te", "content-type", "grpc-timeout",
+                "grpc-status", "grpc-message",
+            ] {
+                metadata.addString("smuggled", forKey: reserved)
+            }
+            try await opened.stream.outbound.write(.metadata(metadata))
+
+            let ops = core.pipe.takeSentOps()
+
+            // `openStream` is prepended by `RequestOpEncoder` on the first write, and it *must* keep
+            // its pseudo-headers -- they are how the peer learns the method.
+            XCTAssertEqual(
+                ops.compactMap { if case .openStream = $0 { return $0.testDescription } else { return nil } },
+                ["openStream(1, method: pkg.Svc/Real, timeout: nil)"],
+                "the deferred openStream must still name the real method")
+
+            let metadataFields: [HTTPField] = ops.compactMap {
+                if case .metadata(_, let fields) = $0 { return fields }
+                return nil
+            }.first ?? []
+
+            XCTAssertEqual(
+                metadataFields.map { "\($0.name)=\($0.value)" }, ["x-user-key=kept"],
+                "the metadata op may carry the user's own field and nothing else: every reserved "
+                    + "name must be stripped, or a caller can override the method the call is for")
+        }
+    }
+
+    // =======================================================================================
+    // MARK: - The byte layout, kind by kind
+    // =======================================================================================
+
+    /// **Every one of §O3's eight op kinds, encoded and decoded back.** No such test existed for any
+    /// of them: the codec's round trip was exercised only incidentally, by ops the transport happened
+    /// to send in other tests, which covers `openStream`/`metadata`/`message`/`halfClose`/`status`/
+    /// `cancel`/`credit` in the shapes the transport itself produces and nothing else.
+    ///
+    /// The values are chosen to sit on the edges the encoding actually has:
+    ///
+    /// * `credit` at **0** and at **`UInt32.max`** -- both legal *at this layer*. The 4-byte body is
+    ///   the whole encoding, so there is nothing for the codec to reject; it is `FlowControlWindow`
+    ///   that refuses an over-ceiling credit and `RPCTransportCore` that fails the connection for it
+    ///   (`ReceiveWindowTests.testAnOverflowingCreditFailsTheConnection`). A codec that clamped or
+    ///   rejected here would silently change the protocol.
+    /// * a `grpc-timeout` on `openStream`, which is the only field that is *interpreted* rather than
+    ///   copied -- it goes out as an 8-digit-max unit string and has to come back the same `Duration`.
+    /// * an empty-named, empty-valued metadata field, and a multi-byte UTF-8 value: the field-list
+    ///   encoding is length-prefixed, so a zero length and a length that is not the character count
+    ///   are the two ways to get it wrong.
+    /// * a `status` with a code, a message and trailers, since the op carries `code`/`message` split
+    ///   out of the field list and has to reassemble them.
+    func testEveryOpKindRoundTripsThroughTheWire() throws {
+        let cases: [(label: String, op: RPCOp)] = [
+            ("openStream, no timeout", .openStream(1, method: "pkg.Svc/Method", timeout: nil)),
+            (
+                "openStream, with a timeout",
+                .openStream(3, method: "pkg.Svc/Method", timeout: .milliseconds(1_500))
+            ),
+            (
+                "metadata, including an empty field and multi-byte UTF-8",
+                .metadata(5, fields: [("a", "b"), ("", ""), ("k", "안녕 hello")])
+            ),
+            ("metadata, empty field list", .metadata(5, fields: [])),
+            ("message", .message(7, payload: GRPCSwiftData(Array(0..<40).map { UInt8($0) }))),
+            ("message, empty payload", .message(7, payload: GRPCSwiftData([]))),
+            ("halfClose", .halfClose(9)),
+            (
+                "status with a message and trailers",
+                .status(11, code: 5, message: "no such method", trailers: [("t", "1")])
+            ),
+            ("status, ok and bare", .status(11, code: 0, message: "", trailers: [])),
+            ("cancel", .cancel(13, reason: "because")),
+            ("cancel, empty reason", .cancel(13, reason: "")),
+            ("credit at zero", .credit(15, bytes: 0)),
+            ("credit at UInt32.max", .credit(15, bytes: .max)),
+            ("credit on the connection window", .credit(0, bytes: 32_767)),
+            ("goAway", .goAway(lastStreamID: 12_345)),
+            ("goAway at zero", .goAway(lastStreamID: 0)),
+        ]
+
+        for (label, op) in cases {
+            let blob = try Self.codec.encode([op])
+            XCTAssertEqual(
+                Self.describe(try Self.codec.decode(blob)), ["op(\(op.testDescription))"], label)
+        }
+
+        // And all of them in one blob, in order: a blob carries several ops back to back, and the
+        // per-op advance is what keeps them separable.
+        let everything = try Self.codec.encode(cases.map(\.op))
+        XCTAssertEqual(
+            Self.describe(try Self.codec.decode(everything)),
+            cases.map { "op(\($0.op.testDescription))" },
+            "one blob carrying all sixteen ops must decode to exactly those ops, in order")
+    }
+
+    /// `goAway` is connection-scoped, so **the header's `streamID` field is meaningless for it**: the
+    /// codec writes 0 there on encode and must ignore whatever it reads on decode. The real payload
+    /// is the 4-byte body.
+    ///
+    /// Worth its own case because the header id is the one field a hostile peer can set freely on an
+    /// op whose body-level rejection is *connection-fatal*: if the decoder read `lastStreamID` from
+    /// the header instead of the body, a peer could drain a connection to an id of its choosing and
+    /// the body would go unread.
+    func testGoAwayIgnoresTheHeadersOwnStreamID() throws {
+        var body = Data()
+        RawOpBytes.appendBE(UInt32(12_345), to: &body)
+
+        for headerID: RPCStreamID in [0, 1, 777, .max] {
+            XCTAssertEqual(
+                Self.describe(
+                    try Self.codec.decode(
+                        RawOpBytes.offsetBlob(
+                            RawOpBytes.op(.goAway, streamID: headerID, body: body)))),
+                ["op(goAway(lastStreamID: 12345))"],
+                "the body decides `lastStreamID`, not the header (header id \(headerID))")
+        }
+
+        // Encode writes 0 into that field, so a wire-compatible peer sees the documented shape.
+        let encoded = try Self.codec.encode([.goAway(lastStreamID: 12_345)])
+        let bytes = Array(encoded)
+        XCTAssertEqual(bytes.count, RawOpBytes.headerLength + 4)
+        XCTAssertEqual(
+            Array(bytes[2..<6]), [0, 0, 0, 0],
+            "encode must write the header's streamID as 0 for goAway; it is meaningless there and "
+                + "writing a real id would invite a decoder to read it")
+    }
+
+    /// A `status` op's field list may legally carry only one `grpc-status`; a peer can send more.
+    /// **The first wins, and the rest fall through to `trailers`** -- they are not an error, and they
+    /// do not overwrite the code.
+    ///
+    /// The second half of the case is what makes the first half safe: a duplicate reserved field
+    /// landing in `trailers` would reach the application as trailing metadata under a reserved name,
+    /// which gRPC forbids. It does not, because `ResponseOpDecoder` runs the trailers through
+    /// `GRPCWireHeaders.parseUserMetadata`, which excludes reserved names -- so the codec's
+    /// permissiveness is contained one layer up. Both layers are asserted, because the containment is
+    /// the reason the permissiveness is acceptable.
+    func testADuplicateGrpcStatusTakesTheFirstAndTheRestBecomeTrailers() throws {
+        let blob = RawOpBytes.offsetBlob(
+            RawOpBytes.op(
+                .status, streamID: 1,
+                body: RawOpBytes.fieldList([
+                    ("grpc-status", "5"),
+                    ("grpc-status", "7"),
+                    ("grpc-message", "first wins"),
+                    ("grpc-message", "second does not"),
+                    ("x-trailer", "kept"),
+                ])))
+
+        let items = try Self.codec.decode(blob)
+        guard items.count == 1, case .op(.status(let id, let code, let message, let trailers)) = items[0]
+        else {
+            return XCTFail("expected one status op; got \(Self.describe(items))")
+        }
+        XCTAssertEqual(id, 1)
+        XCTAssertEqual(code, 5, "the first `grpc-status` wins")
+        XCTAssertEqual(message, "first wins", "the first `grpc-message` wins")
+        XCTAssertEqual(
+            trailers.map { "\($0.name)=\($0.value)" },
+            ["grpc-status=7", "grpc-message=second does not", "x-trailer=kept"],
+            "the duplicates fall through to trailers in wire order, alongside the real trailer")
+
+        // And they are contained one layer up: the application never sees a reserved name.
+        try runBounded("a duplicate grpc-status at the mux", timeout: 20) {
+            let core = CoreUnderTest(role: .client, label: "duplicate-status")
+            defer { core.shutDown() }
+            let opened = try core.core.openStream(
+                descriptor: MethodDescriptor(fullyQualifiedService: "pkg.Svc", method: "M"),
+                timeout: nil)
+            core.pipe.deliverRaw(blob)
+
+            var seen: [String] = []
+            var status: Status?
+            for try await part in opened.stream.inbound {
+                if case .status(let received, let metadata) = part {
+                    status = received
+                    seen = metadata.map(\.key).sorted()
+                }
+            }
+            XCTAssertEqual(status?.code, .notFound, "grpc-status 5 is notFound")
+            XCTAssertEqual(status?.message, "first wins")
+            XCTAssertEqual(
+                seen, ["x-trailer"],
+                "the duplicated reserved fields must not reach the application as trailing "
+                    + "metadata; only the real trailer may")
+        }
+    }
+
+    /// §O2: **user metadata travels in its own `metadata` op and never inside `openStream`'s field
+    /// list**, and an `openStream` whose field list carries anything outside the reserved set is
+    /// rejected -- loudly, because the alternative is a peer smuggling up to 16 MiB of extra
+    /// field-list bytes into every call it opens, and a silent skip would destroy the only evidence.
+    ///
+    /// Built by adding one field to an otherwise-valid body, so the rejection cannot be for some
+    /// unrelated reason: the same body without `extraFields` is asserted to decode cleanly first.
+    func testAnOpenStreamCarryingStrayMetadataIsRejected() throws {
+        let clean = RawOpBytes.op(
+            .openStream, streamID: 1, body: RawOpBytes.openStreamBody(method: "pkg.Svc/Method"))
+        XCTAssertEqual(
+            Self.describe(try Self.codec.decode(RawOpBytes.offsetBlob(clean))),
+            ["op(openStream(1, method: pkg.Svc/Method, timeout: nil))"],
+            "the control: the same body without the stray field must decode")
+
+        let stray = RawOpBytes.op(
+            .openStream, streamID: 1,
+            body: RawOpBytes.openStreamBody(
+                method: "pkg.Svc/Method", extraFields: [("x-smuggled", "1")]))
+        let items = try Self.codec.decode(RawOpBytes.offsetBlob(stray))
+        XCTAssertEqual(
+            Self.describe(items), ["streamOpenFailure(1)"],
+            "a stray field must fail that stream's open, not be skipped and not fail the connection")
+        guard case .streamOpenFailure(_, let error) = items[0] else { return XCTFail() }
+        XCTAssertTrue(
+            error.message.contains("x-smuggled"),
+            "the rejection must name the stray field -- that name is the only evidence the "
+                + "smuggling happened; got '\(error.message)'")
+    }
+
+    /// `sendControl(_:)` drops its failure **"here and only here"**, per its own doc comment: a
+    /// control op has no caller to report to, and if the substrate is gone there is no peer to
+    /// inform.
+    ///
+    /// The reachable consequence, and the one worth pinning: **a refusal that cannot be sent must not
+    /// take the connection down or trap.** A peer can provoke a refusal at zero state cost (no table
+    /// entry is created), so if a failed send on that path were fatal, a peer racing a teardown would
+    /// have a lever on it.
+    func testARefusalThatCannotBeSentIsDroppedNotFatal() throws {
+        let core = CoreUnderTest(role: .server, label: "unsendable-refusal")
+        defer { core.shutDown() }
+
+        core.pipe.failNextSends(
+            with: RPCError(code: .unavailable, message: "the substrate is gone"))
+
+        // A malformed `openStream`, which `refuseOpen` answers through `sendControl`.
+        core.pipe.deliverRaw(
+            RawOpBytes.offsetBlob(
+                RawOpBytes.op(
+                    .openStream, streamID: 1,
+                    body: RawOpBytes.fieldList([], declaredCount: 0xFFFF))))
+
+        XCTAssertEqual(
+            core.pipe.sentBlobs.count, 0, "the send failed, so nothing reached the wire")
+        XCTAssertFalse(
+            core.pipe.isCancelled,
+            "a refusal that could not be sent must not fail the connection: the peer would "
+                + "otherwise have a one-op lever on a connection that is merely losing its "
+                + "substrate")
+        XCTAssertEqual(core.core.liveStreamCount, 0)
+
+        // And the core still routes afterwards rather than being wedged by the swallowed error.
+        core.pipe.deliverRaw(
+            RawOpBytes.offsetBlob(RawOpBytes.op(.halfClose, streamID: 9_999, body: Data())))
+        XCTAssertFalse(core.pipe.isCancelled)
     }
 
     // =======================================================================================
