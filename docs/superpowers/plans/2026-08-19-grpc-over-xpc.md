@@ -1,5 +1,10 @@
 # gRPC over XPC Implementation Plan
 
+> **SUPERSEDED (2026-08-27):** execution of this plan was stopped after Task 9 by the
+> project owner (non-standard wire encoding, invented mechanisms). The replacement is
+> `docs/superpowers/plans/2026-08-27-grpc-xpc-http2-transport.md`, which redesigns the wire
+> as binary HTTP/2 and carries forward this run's verified API facts and lessons.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Carry a standard grpc-swift v2 service over Apple's `XPCSession`/`XPCListener` by implementing `GRPCCore.ClientTransport` and `ServerTransport`.

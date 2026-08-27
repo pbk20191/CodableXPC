@@ -1,5 +1,10 @@
 # gRPC over XPC — design
 
+> **PARTIALLY SUPERSEDED (2026-08-27):** the wire format, backpressure and
+> lifecycle sections (§4–§8, deviations D1–D6) are superseded by the normative wire
+> specification embedded in `docs/superpowers/plans/2026-08-27-grpc-xpc-http2-transport.md`
+> (binary HTTP/2 frames over XPC). §1–§3 (goals, GRPCCore contract, packaging) still apply.
+
 **Status:** design, awaiting review. **Branch:** `feature/grpc-over-xpc`.
 **Date:** 2026-08-19.
 
