@@ -291,8 +291,24 @@ public enum RPCResponsePart<Bytes> { case metadata(Metadata); case message(Bytes
   | `activate()` **threw**, then release | safe — a failed activation self-invalidates |
   | activated → cancelled → released | **safe — the only safe disposal** |
 
-  So the rule is **activate-then-cancel**, always, with a failed `activate()` as the only other
-  safe terminal state. A path that decides to skip activation because the pipe was already
+  So the rule for a **dialled** session is **activate-then-cancel**, always, with a failed
+  `activate()` as the only other safe terminal state.
+
+  An **accepted** session's rules are the inverse, and they are not about activation at all:
+
+  | accepted-session disposal | result |
+  |---|---|
+  | cancel **inside** the incoming-session closure, before the `Decision` returns | **TRAPS** |
+  | release uncancelled inside that closure | safe |
+  | cancel after the `Decision` returned | safe |
+  | release uncancelled after the `Decision` returned | safe |
+
+  One rule explains all four: **libxpc still holds a reference for the duration of the accept
+  window**, so a release inside it is never the last one — measured, the session does not dealloc
+  until the closure returns. That is why the two "release" rows are safe. The trap in row 1 is not
+  a refcount problem at all: `xpc_session_cancel` is simply illegal inside the window, whatever the
+  refcount. And an accepted session never *requires* cancelling to be released safely, which is the
+  opposite of a dialled one. A path that decides to skip activation because the pipe was already
   cancelled must still activate and then cancel. Accepted (server) sessions are already live and
   must NOT be re-activated; client sessions are created inactive and activated exactly once by a
   factory that constructs-and-activates; `deinit` cancels only when activated.
