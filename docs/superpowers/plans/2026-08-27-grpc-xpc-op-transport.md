@@ -83,7 +83,7 @@ the task must report it rather than importing.
 |---|---|
 | `Sources/GRPCXPCTransport/GRPCDispatchData.swift` (`GRPCSwiftData`) | **Keep, central.** The byte type everywhere. Zero-copy `init(from: xpc_object_t)` and `createXPCRepresentation()` are the ONLY two crossings to libxpc. Its `Codable`/`XPCNativeObject` extension is deleted at the swap. |
 | `Sources/GRPCXPCTransport/GRPCWireHeaders.swift` (Task 3) | **Keep, reused.** Metadata ↔ name/value fields, `grpc-timeout`, `grpc-status`/`grpc-message`, `-bin` base64, reserved-name stripping. Encoding-agnostic. **Correction to the superseded plan: `grpc-timeout` rounds UP, never truncates** — truncating tells the server a shorter deadline than the caller asked for, so it can abandon a call the client would still have accepted; grpc-swift's own `Timeout.swift` rounds up for the same reason. |
-| `HTTP2Frame.swift`, `HPACKLiteralCodec.swift` (+ their 37 tests) | **Keep, unused for now.** They are the basis of a future optional `HTTP2Codec` conforming to `WireCodec`. Do not delete; do not wire them in. |
+| `HTTP2Frame.swift`, `HPACKLiteralCodec.swift` (+ their 37 tests) | **DELETE (revised 2026-08-27).** HTTP/2 is not coming, so these are unreachable code — and the module-level `StreamID` they sit beside is what blocked Task 1. The `WireCodec` seam preserves the option; the code stays recoverable from git (dd647c1, 205316c, dbe3edf). `HTTPField` moves to `RPCOp.swift`, since `GRPCWireHeaders` needs it. |
 | `XPCFrame.swift`, `StreamChannel.swift`, `XPCOutboundWriter.swift`, `XPCConnection.swift`, `Backpressure.swift`, `GRPCMessageFraming.swift` + their tests | **Legacy.** Stay compiling until the swap task deletes them. |
 
 ## Normative op + wire specification
@@ -91,7 +91,7 @@ the task must report it rather than importing.
 ### O1. Ops
 
 ```
-StreamID = UInt32, client-allocated, odd, monotonically increasing.
+RPCStreamID = UInt32, client-allocated, odd, monotonically increasing.
 
 Op:
   openStream(streamID, method: String, timeout: Duration?)   // client: initial metadata + path
@@ -348,7 +348,7 @@ the target in `Package.swift` (add `XPCDispatchDataBridge` as a direct dependenc
 
 **Files:** create `Sources/GRPCXPCTransport/RPCOp.swift`.
 
-Define, per §O1: `RPCOp` (an enum of the eight ops — this one *is* a sum type, because an op stream
+Define, per §O1: `HTTPField`, `RPCStreamID` (`UInt32` — **not** `StreamID`, which the legacy stack still owns until the swap), `RPCOp` (an enum of the eight ops — this one *is* a sum type, because an op stream
 genuinely is a tagged union and the alternative is a struct with seven optional fields), `StreamID`,
 and the two protocols:
 
@@ -363,7 +363,6 @@ protocol MessagePipe: Sendable {
     func onReceive(_ handler: @escaping @Sendable (GRPCSwiftData) -> Void)   // set once, pre-activation
     func onPeerDeath(_ handler: @escaping @Sendable () -> Void)
     func cancel()
-    var peerAttestation: (any PeerAttestation)? { get }  // nil is acceptable
 }
 ```
 
@@ -382,7 +381,7 @@ needs a sequencing adapter, not a weakened core.
 Implement §O3 exactly: the 10-byte op header, the field-list format, the per-kind bodies, unknown-
 kind skipping via the body length, and the 16 MiB body cap. Reuse `GRPCWireHeaders` for building and
 parsing field lists (it already handles `-bin`, `grpc-timeout`, `grpc-status`/`grpc-message`,
-reserved names) and `HTTPField` from `HPACKLiteralCodec.swift` as the field type.
+reserved names) and `HTTPField` from `RPCOp.swift` as the field type.
 
 Do **not** add LPM framing (§O1). Decode must never trust a length: every length is checked against
 the remaining buffer before slicing, and every offset derives from `startIndex` (indices do not
