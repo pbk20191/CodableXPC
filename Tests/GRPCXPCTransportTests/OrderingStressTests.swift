@@ -80,6 +80,16 @@ final class OrderingStressTests: XCTestCase {
         var globalTags: [Int] = []
         /// Bodies that did not parse: a corruption, not a reorder, and worth separating.
         var unparseable = 0
+        /// Parts that arrived on a stream whose *earlier* parts carried a different tag -- i.e. a
+        /// part routed to the wrong stream.
+        ///
+        /// `perStream` is keyed by the **payload's** tag, so on its own it proves "each writer's
+        /// sequence was reassembled in order *somewhere*", not "on its own stream": a part routed to
+        /// the wrong `RequestOpDecoder` would still land in the right bucket here and would only
+        /// show up indirectly, as an apparent reordering. This is the direct observable. Each
+        /// handler latches the tag of its first message and every later part on that stream must
+        /// match it.
+        var crossRouted: [String] = []
         var liveHandlers = 0
         var maxLiveHandlers = 0
 
@@ -125,25 +135,44 @@ final class OrderingStressTests: XCTestCase {
     /// # What the interleaving measurement can and cannot establish
     ///
     /// Ten writer tasks share one blob channel, so the *wire* is genuinely interleaved -- but a test
-    /// cannot observe wire order from up here, only consumption order, and consumption order is also
-    /// a function of handler scheduling. So the two numbers this case reports are **evidence, not
-    /// proof**: `maxLiveHandlers` (how many streams were open on the one connection at once) and
-    /// `streamSwitches` (how often consumption crossed from one stream to another). Both are
-    /// asserted, because a run where they collapsed to 1 and 9 would be ten streams executed
-    /// end-to-end one after another -- a valid RPC test and a worthless ordering test, and it must
-    /// fail loudly rather than pass quietly.
+    /// cannot observe wire order from up here, only **consumption** order, and consumption order is
+    /// taken downstream of ten buffered inbound sequences. With ~21-byte messages, roughly 3 100 can
+    /// sit received-but-unconsumed inside the 65 535-byte connection window, so **a wire that
+    /// delivered long contiguous per-stream runs would still yield ~9 900 consumption switches.**
+    /// The number is therefore evidence that this test exercised a shared, concurrently-consumed
+    /// channel -- not a measurement of wire interleaving, and it must not be quoted as one.
+    ///
+    /// What is asserted is exactly what that supports: `maxLiveHandlers == 10` (ten streams really
+    /// were open on one connection at once) and a `streamSwitches` floor an order of magnitude under
+    /// every observed run. Both exist to make the *worthless* shape fail loudly -- ten streams run
+    /// end to end, one after another, which is a valid RPC test and no ordering test at all.
     ///
     /// ``testInterleavedBlobsPreserveEveryStreamsOrderThroughTheMux()`` is where the interleaving is
-    /// by construction instead.
+    /// present by construction instead, and where `deliveredBlobCount` can say so.
     ///
-    /// # Flow control is in the loop, not bypassed
+    /// # Flow control is in the loop, not bypassed -- and that is asserted, not asserted-in-a-comment
     ///
-    /// 10 000 x ~20 bytes is ~200 000 bytes per direction against a 65 535-byte connection window,
-    /// so credit really does have to flow for this to finish at all. A reorder introduced by the
-    /// credit path -- a `credit` op overtaking a `message`, say -- is inside this case's reach.
+    /// The **connection** window is where it bites, not any one stream's: 10 x 1 000 x 19 bytes is
+    /// ~190 000 bytes against 65 535, so the shared window turns over roughly three times and credit
+    /// has to flow for this case to finish at all. (One stream's 19 000 bytes on its own would fit
+    /// inside its per-stream window with room to spare -- which is why the premise below is written
+    /// against the total, and why it is asserted rather than left in a comment: shrinking either
+    /// dimension could otherwise take credit out of the loop silently.) A reorder introduced by the
+    /// credit path -- a `credit` op overtaking a `message` -- is inside this case's reach.
     func testTenThousandMessagesArriveInExactOrderThroughTheMux() throws {
         let arrivals = Observed<Arrivals>(Arrivals())
         let expected = Array(0..<Self.messagesPerStream)
+
+        // The premise, measured from the real payload rather than a remembered constant. It is
+        // written against the **connection** window, which all ten streams share -- one stream's
+        // 19 000 bytes would fit inside its own 65 535-byte window and prove nothing.
+        let bodySize = Self.payload(tag: 0, seq: 0).count
+        let totalCharge = Self.totalMessages * FlowControl.charge(for: bodySize)
+        XCTAssertGreaterThan(
+            totalCharge, 2 * FlowControl.initialWindow,
+            "\(Self.totalMessages) x \(bodySize) bytes = \(totalCharge) must turn the shared "
+                + "\(FlowControl.initialWindow)-byte connection window over at least twice, or "
+                + "credit barely has to flow and this case stops exercising the credit path")
 
         let handler: RawSeamHandler = { stream, _ in
             arrivals.mutate {
@@ -151,10 +180,25 @@ final class OrderingStressTests: XCTestCase {
                 $0.maxLiveHandlers = max($0.maxLiveHandlers, $0.liveHandlers)
             }
             defer { arrivals.mutate { $0.liveHandlers -= 1 } }
+            // Latched from this handler's *first* message. Every later part on this stream must
+            // carry the same tag, or a part was routed to the wrong stream -- see
+            // `Arrivals.crossRouted`.
+            var handlerTag: Int?
             do {
                 for try await part in stream.inbound {
                     guard case .message(let body) = part else { continue }
                     if let parsed = Self.parse(body) {
+                        if let expected = handlerTag {
+                            if parsed.tag != expected {
+                                arrivals.mutate {
+                                    $0.crossRouted.append(
+                                        "a part tagged \(parsed.tag) (seq \(parsed.seq)) arrived on "
+                                            + "the stream whose earlier parts were tagged \(expected)")
+                                }
+                            }
+                        } else {
+                            handlerTag = parsed.tag
+                        }
                         arrivals.mutate { $0.record(tag: parsed.tag, seq: parsed.seq) }
                     } else {
                         arrivals.mutate { $0.unparseable += 1 }
@@ -211,6 +255,11 @@ final class OrderingStressTests: XCTestCase {
                 + "make this pass -- STOP and report.")
         XCTAssertEqual(
             seen.unparseable, 0, "a message body was corrupted, which is not the same as reordered")
+        XCTAssertEqual(
+            seen.crossRouted, [],
+            "a part was routed to the wrong stream. `perStream` is keyed by the payload's tag, so "
+                + "it would have reassembled that part into the right bucket and shown this only "
+                + "indirectly; this is the direct observable.")
 
         XCTAssertEqual(
             seen.perStream.count, Self.streamCount,
@@ -230,13 +279,18 @@ final class OrderingStressTests: XCTestCase {
         // ---------------------------------------------------------------------------------
         // L9: the channel must actually have interleaved, or this measured nothing.
         // ---------------------------------------------------------------------------------
+        // `maxLiveHandlers` is nearly free -- all ten handlers start together whatever the wire
+        // does -- so it is asserted at its full value rather than at 2, and the real guard is the
+        // switch count below.
+        XCTAssertEqual(
+            seen.maxLiveHandlers, Self.streamCount,
+            "only \(seen.maxLiveHandlers) of \(Self.streamCount) stream(s) were open on the "
+                + "connection at once, so this test measured sequential RPCs sharing nothing")
+        // Measured minimum across six runs: 9 849 of a possible 9 999. A floor of 1 000 is an
+        // order of magnitude under every observed run and still rules out the shape that would make
+        // this case worthless -- ten streams drained one after another.
         XCTAssertGreaterThanOrEqual(
-            seen.maxLiveHandlers, 2,
-            "only \(seen.maxLiveHandlers) stream(s) were ever open on the connection at once, so "
-                + "no two streams' ops ever shared the blob channel and this test measured "
-                + "\(Self.streamCount) sequential RPCs")
-        XCTAssertGreaterThanOrEqual(
-            seen.streamSwitches, 100,
+            seen.streamSwitches, 1_000,
             "consumption crossed between streams only \(seen.streamSwitches) time(s) in "
                 + "\(Self.totalMessages) arrivals, so the streams were effectively drained one "
                 + "after another. Re-tune the concurrency; do not lower this bound.")
@@ -249,12 +303,20 @@ final class OrderingStressTests: XCTestCase {
     /// **The same 10 000 ops through the mux, delivered in 1 000 blobs that each carry one op for
     /// every one of the 10 streams.**
     ///
-    /// The real-XPC case above has emergent interleaving, which means a scheduler change could
-    /// quietly turn it into ten sequential RPCs -- it asserts against that, but the assertion is a
-    /// threshold rather than a construction. Here the interleaving is in the input: **every blob
-    /// carries ops for all ten streams**, so `receive(_:)` routes ten different streams' ops inside
-    /// a single routing turn, 1 000 times over. That is exactly the shape §O2 relies on ordering for
-    /// and the shape a sequence number would exist to repair.
+    /// The real-XPC case above has emergent interleaving, and its switch count is a *consumption*
+    /// measurement taken downstream of ten buffered sequences -- so it cannot say what the wire did.
+    /// Here the interleaving is in the input: **every blob carries ops for all ten streams**, so
+    /// `receive(_:)` routes ten different streams' ops inside a single routing turn, 1 000 times
+    /// over. That is exactly the shape §O2 relies on ordering for and the shape a sequence number
+    /// would exist to repair.
+    ///
+    /// **The observable that carries that claim is `TestPipe.deliveredBlobCount`, and nothing else
+    /// can.** No assertion on the decoded parts distinguishes ten ops in one blob from the same ten
+    /// ops in ten blobs -- a mutation proved it (M5), which is why that counter exists.
+    ///
+    /// Cross-routing is also a *direct* assertion here, unlike in the real-XPC case: the stream each
+    /// part arrived on is known, so a part carrying another stream's tag is caught as itself rather
+    /// than as apparent reordering.
     ///
     /// # Lock-step, and why
     ///
@@ -315,6 +377,14 @@ final class OrderingStressTests: XCTestCase {
                     iterators[index] = iterator
 
                     if let parsed = Self.parse(body) {
+                        // Here the stream a part arrived on is *known*, so cross-routing is a
+                        // direct assertion rather than an inference from apparent reordering: this
+                        // stream may only ever carry the tag it was seeded with.
+                        if parsed.tag != index {
+                            arrivals.crossRouted.append(
+                                "stream \(ids[index]) (tag \(index)) received a part tagged "
+                                    + "\(parsed.tag) at seq \(parsed.seq)")
+                        }
                         arrivals.record(tag: parsed.tag, seq: parsed.seq)
                     } else {
                         arrivals.unparseable += 1
@@ -349,6 +419,9 @@ final class OrderingStressTests: XCTestCase {
             "A REORDERING WAS OBSERVED THROUGH THE MUX with ten streams' ops interleaved in every "
                 + "blob. §O2 has no sequence number. Do not add one -- STOP and report.")
         XCTAssertEqual(outcome.unparseable, 0)
+        XCTAssertEqual(
+            outcome.crossRouted, [],
+            "a part was routed to a stream it does not belong to")
         for tag in 0..<Self.streamCount {
             XCTAssertEqual(
                 outcome.perStream[tag] ?? [], Array(0..<Self.messagesPerStream),
@@ -356,12 +429,20 @@ final class OrderingStressTests: XCTestCase {
         }
         XCTAssertEqual(outcome.globalTags.count, Self.totalMessages)
 
-        // By construction, consumption crosses streams on every single arrival except where a round
-        // wraps. Asserting it anyway is what keeps the *construction* honest: if the blob builder
-        // were ever changed to send one stream at a time, this is the assertion that notices.
+        // **This is a tautology of this case's own round-robin consumption loop, and it is kept as
+        // one deliberately -- it is not the construction guard.** A blob builder changed to send one
+        // stream at a time does not change consumption order at all (measured: under that mutation
+        // only `deliveredBlobCount` fired), and a builder changed to send *fewer* streams per round
+        // deadlocks the lock-step loop, which `runBounded` reports. What this assertion actually
+        // guards is the consumption loop itself: if it were ever rewritten to drain one stream
+        // before moving to the next, the case would silently stop consuming in round-robin and this
+        // is what notices.
+        //
+        // The construction claim -- that ten streams' ops really shared one routing turn -- is
+        // carried entirely by `deliveredBlobCount` below.
         XCTAssertEqual(
             outcome.streamSwitches, Self.totalMessages - 1,
-            "every adjacent pair of arrivals must belong to different streams; \(outcome.streamSwitches)"
-                + " of \(Self.totalMessages - 1) did, so the blobs were not interleaved as intended")
+            "the consumption loop must still be round-robin: \(outcome.streamSwitches) of "
+                + "\(Self.totalMessages - 1) adjacent arrival pairs crossed streams")
     }
 }

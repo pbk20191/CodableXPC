@@ -437,12 +437,31 @@ final class WireProtocolTests: XCTestCase {
                                 .credit, streamID: 9, body: Data(repeating: 0, count: length))))),
                 ["streamFailure(9)"],
                 "a \(length)-byte credit body must be rejected")
-            XCTAssertThrowsError(
-                try Self.codec.decode(
+            // The shape, not merely "it threw": the `credit` rows beside this check which item came
+            // back, and a bare `XCTAssertThrowsError` here would accept any error at all --
+            // including one from a codec that had started rejecting the *framing* rather than the
+            // body, which is a different rule.
+            var goAwayFailure: (any Error)?
+            do {
+                let items = try Self.codec.decode(
                     RawOpBytes.offsetBlob(
                         RawOpBytes.op(
-                            .goAway, streamID: 0, body: Data(repeating: 0, count: length)))),
-                "a \(length)-byte goAway body has no stream to fail and must be connection-fatal")
+                            .goAway, streamID: 0, body: Data(repeating: 0, count: length))))
+                XCTFail(
+                    "a \(length)-byte goAway body must be connection-fatal; decode returned "
+                        + "\(Self.describe(items))")
+            } catch {
+                goAwayFailure = error
+            }
+            let goAwayError = goAwayFailure as? RPCError
+            XCTAssertEqual(
+                goAwayError?.code, .internalError,
+                "a \(length)-byte goAway body must fail as RPCError(.internalError); got "
+                    + "\(goAwayFailure.map { "\($0)" } ?? "no error")")
+            XCTAssertTrue(
+                goAwayError?.message.contains("goAway") ?? false,
+                "the failure must name goAway's own body rule -- otherwise this passes on a framing "
+                    + "rejection, which is a different rule; got '\(goAwayError?.message ?? "")'")
         }
     }
 

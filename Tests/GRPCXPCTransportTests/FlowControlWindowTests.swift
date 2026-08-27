@@ -16,8 +16,14 @@ import XCTest
 // that were then deleted. These are the load-bearing ones, plus the charge rule, which is the one
 // definition both sides of the transport must call.
 //
-// Everything here is bounded (L8) by `runBounded`; the two stress cases get a larger budget than
-// the default because they are stress cases, not because they are expected to be slow.
+// **Every case here is bounded (L8) by `runBounded`, including the two that are otherwise wholly
+// synchronous.** That was not true of the first version, and it mattered: the L2/O(1) case's only
+// failure mode against a restored `0..<addition` loop is a hang (measured at 2 m 54 s), so an
+// unbounded version of it reported *zero failures* while the mutation ran. A synchronous body with
+// no suspension point still needs the bound whenever "it took far too long" is the failure.
+//
+// Budgets above the 5 s default are for size, not for expected slowness: measured, the whole file
+// runs in ~150 ms.
 
 @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
 final class FlowControlWindowTests: XCTestCase {
@@ -142,51 +148,78 @@ final class FlowControlWindowTests: XCTestCase {
     /// one credit of `UInt32.max` spent a measured **450 seconds inside the mutex**, blocking every
     /// sender and the connection's own teardown, for the price of a single op.
     ///
-    /// Three separate claims, because three separate things could break:
+    /// Four separate claims, because four separate things could break:
     ///
     /// 1. `grant(UInt32.max)` **throws** rather than wrapping or saturating;
     /// 2. it leaves the window **byte-for-byte unchanged** -- the check runs before `available` is
     ///    touched, so a rejected credit is not half-applied;
-    /// 3. it is **O(1)**, asserted as wall-clock, which is the only way the 450-second failure mode
-    ///    is observable at all.
+    /// 3. **banking an *accepted* 2³¹−1 is O(1)**, asserted as wall clock;
+    /// 4. the ceiling is exact at the boundary: to 2³¹−1 is legal and the very next byte is not.
     ///
-    /// Then the boundary: a credit taking the window to exactly 2³¹−1 is legal and the very next
-    /// byte is not.
+    /// # Claim 3 has to be timed on the ACCEPTED call, and the first version of this test was not
+    ///
+    /// It timed `grant(UInt32.max)` only -- which `guard total <= maxWindow` **rejects before
+    /// `State.bank(_:)` is ever reached**, so the timed call does no banking work at all. Measured
+    /// by review: a literal `for _ in 0..<addition` loop inside `bank` -- L2's exact historical
+    /// shape -- **survived the entire target**, because the one call that reaches `bank` with the
+    /// peer's full magnitude (`grant(UInt32(maxWindow))`, below) was untimed. Under that loop it
+    /// took **2 m 54 s** and the suite still reported zero failures.
+    ///
+    /// So the timing that matters is on the call that *succeeds*, and the case is now wrapped in
+    /// `runBounded` as well: an O(n) `bank` blows the 100 ms assertion if it is slow, and the L8
+    /// bound if it is catastrophic. Both instruments, because a loop's cost depends on the number
+    /// the peer chose and the historical one was fatal at both scales.
     func testAHugeCreditIsRejectedInConstantTimeAndTheCeilingIsExact() throws {
-        let window = FlowControlWindow(initial: 0)
+        try runBounded("the huge-credit ceiling", timeout: 20) {
+            let window = FlowControlWindow(initial: 0)
+            let clock = ContinuousClock()
 
-        let clock = ContinuousClock()
-        let start = clock.now
-        var rejection: (any Error)?
-        do {
-            try window.grant(UInt32.max)
-        } catch {
-            rejection = error
-        }
-        let elapsed = clock.now - start
-        XCTAssertEqual(
-            (rejection as? RPCError)?.code, .internalError,
-            "a credit above §O4's ceiling is a protocol error by the peer; got "
-                + "\(rejection.map { "\($0)" } ?? "no error at all")")
-        XCTAssertEqual(
-            window.available, 0,
-            "a rejected credit must leave the window exactly as it was; this one was half-applied")
-        // The old design's equivalent took 450 s. Anything under a millisecond is O(1) by any
-        // reading; 100 ms is a bound loose enough to survive a loaded CI machine and still three
-        // and a half orders of magnitude short of a loop over 4 294 967 295.
-        XCTAssertLessThan(
-            elapsed, .milliseconds(100),
-            "grant(UInt32.max) took \(elapsed); the peer's magnitude is driving a loop (L2)")
+            // Claims 1 and 2: rejected, and the window untouched.
+            let rejectStart = clock.now
+            var rejection: (any Error)?
+            do {
+                try window.grant(UInt32.max)
+            } catch {
+                rejection = error
+            }
+            let rejectElapsed = clock.now - rejectStart
+            XCTAssertEqual(
+                (rejection as? RPCError)?.code, .internalError,
+                "a credit above §O4's ceiling is a protocol error by the peer; got "
+                    + "\(rejection.map { "\($0)" } ?? "no error at all")")
+            XCTAssertEqual(
+                window.available, 0,
+                "a rejected credit must leave the window exactly as it was; this one was "
+                    + "half-applied")
+            // A rejection must also be O(1) -- validating in `Int64` is two operations -- but note
+            // this call never reaches `bank`, so it cannot see a loop *there*. That is claim 3.
+            XCTAssertLessThan(
+                rejectElapsed, .milliseconds(100),
+                "rejecting grant(UInt32.max) took \(rejectElapsed); even the validation is not O(1)")
 
-        // The ceiling is exact at the boundary, from both sides.
-        XCTAssertNoThrow(try window.grant(UInt32(FlowControl.maxWindow)))
-        XCTAssertEqual(window.available, FlowControl.maxWindow)
-        XCTAssertThrowsError(try window.grant(1)) { error in
-            XCTAssertEqual((error as? RPCError)?.code, .internalError)
+            // **Claim 3: the accepted call.** This is the one that reaches `State.bank(_:)` with
+            // 2³¹−1, and therefore the only place an O(peer's number) loop in the wake-up path is
+            // observable. The old design's equivalent spent 450 s inside the mutex; a `bank` loop
+            // measures 2 m 54 s. 100 ms is loose enough for a loaded machine and three orders of
+            // magnitude short of either.
+            let acceptStart = clock.now
+            XCTAssertNoThrow(try window.grant(UInt32(FlowControl.maxWindow)))
+            let acceptElapsed = clock.now - acceptStart
+            XCTAssertLessThan(
+                acceptElapsed, .milliseconds(100),
+                "banking \(FlowControl.maxWindow) byte(s) took \(acceptElapsed); it must be one "
+                    + "addition plus a walk over the *waiters*, never a loop over the peer's "
+                    + "number (L2)")
+            XCTAssertEqual(window.available, FlowControl.maxWindow)
+
+            // Claim 4: the boundary, from the other side.
+            XCTAssertThrowsError(try window.grant(1)) { error in
+                XCTAssertEqual((error as? RPCError)?.code, .internalError)
+            }
+            XCTAssertEqual(
+                window.available, FlowControl.maxWindow,
+                "the one-byte overshoot must not have been banked")
         }
-        XCTAssertEqual(
-            window.available, FlowControl.maxWindow,
-            "the one-byte overshoot must not have been banked")
     }
 
     // =======================================================================================
@@ -450,7 +483,8 @@ final class FlowControlWindowTests: XCTestCase {
     /// Batching is why `consumed(_:)` returns `nil` most of the time; a test that only ever fed it
     /// large values would never see that. The threshold is half the initial window, the remainder is
     /// carried, and `flush()` is the escape for the one moment there is no later delivery.
-    func testTheAccountantBatchesAtHalfTheWindowAndCarriesTheRemainder() {
+    func testTheAccountantBatchesAtHalfTheWindowAndCarriesTheRemainder() throws {
+        try runBounded("the accountant's batching", timeout: 10) {
         var accountant = WindowAccountant()
         let threshold = FlowControl.initialWindow / 2   // 32 767
 
@@ -474,5 +508,6 @@ final class FlowControlWindowTests: XCTestCase {
         // A degenerate window still makes progress rather than emitting zero-byte credits.
         var tiny = WindowAccountant(initial: 1)
         XCTAssertEqual(tiny.consumed(1), 1)
+        }
     }
 }

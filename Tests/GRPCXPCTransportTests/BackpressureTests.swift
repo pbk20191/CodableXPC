@@ -247,6 +247,10 @@ final class BackpressureTests: XCTestCase {
         }
 
         struct Measured: Sendable {
+            /// Set once stream B has written its (unflow-controlled) `metadata` part, which is what
+            /// distinguishes "B parked on the connection window" from "B parked earlier, on
+            /// something this case says nothing about".
+            var smallReachedItsMessageWrite = false
             var smallCompletedWhileBlocked = false
             var smallCompletedAfterRelease = false
         }
@@ -256,6 +260,7 @@ final class BackpressureTests: XCTestCase {
             try await XPCPairHarness.withTransports(streamHandler: handler) { pair in
                 let bigSent = Observed<Bool>(false)
                 let smallSent = Observed<Bool>(false)
+                let smallOpened = Observed<Bool>(false)
                 var measured = Measured()
 
                 try await withThrowingTaskGroup(of: Void.self) { group in
@@ -280,7 +285,12 @@ final class BackpressureTests: XCTestCase {
                         try await pair.client.withStream(
                             descriptor: Self.push, options: .defaults
                         ) { stream, _ in
+                            // A control op: never flow-controlled, and it carries the deferred
+                            // `openStream` with it. So this returning means B is past stream
+                            // creation and past its own leading metadata, and the only thing left
+                            // for it to park on is the *message*'s window reservation.
                             try await stream.outbound.write(.metadata([:]))
+                            smallOpened.set()
                             try await stream.outbound.write(
                                 .message(WindowSizes.payload(small, seed: 0x42)))
                             smallSent.set()
@@ -289,8 +299,10 @@ final class BackpressureTests: XCTestCase {
                         }
                     }
 
-                    // The negative assertion, behind the shared settle window.
+                    // The negative assertion, behind the shared settle window -- plus the
+                    // positive one that gives it its meaning.
                     try await Task.sleep(for: negativeAssertionSettleWindow)
+                    measured.smallReachedItsMessageWrite = smallOpened.isSet
                     measured.smallCompletedWhileBlocked = smallSent.isSet
 
                     release.open()
@@ -301,6 +313,12 @@ final class BackpressureTests: XCTestCase {
             }
         }
 
+        // Without this, the negative below is satisfied by B parking *anywhere* -- on stream
+        // creation, on its own metadata write, on scheduling -- none of which is the claim.
+        XCTAssertTrue(
+            measured.smallReachedItsMessageWrite,
+            "stream B never got as far as its message write, so the negative assertion below would "
+                + "be satisfied by B parking on something other than the connection window")
         XCTAssertFalse(
             measured.smallCompletedWhileBlocked,
             "a \(small)-byte message on a *different* stream completed while one oversize message "
@@ -333,14 +351,16 @@ final class BackpressureTests: XCTestCase {
     ///
     /// # Why this shape
     ///
-    /// * **Batched credit is exercised, not bypassed.** Five 8 191-byte bodies per RPC is 40 955
-    ///   bytes against a 32 767-byte batching threshold, so every RPC crosses it and the run crosses
-    ///   it hundreds of times, in both directions. A test with tiny payloads would emit almost no credit at all and could
+    /// * **Batched credit is exercised, not bypassed.** Five 8 191-byte bodies per RPC is
+    ///   **40 955** bytes against a 32 767-byte batching threshold, so every RPC crosses it and the
+    ///   run crosses it hundreds of times, in both directions. A test with tiny payloads would emit almost no credit at all and could
     ///   not distinguish an emitted-based debit from a consumption-based one.
     /// * **Concurrency is what puts the *connection* counter near its bound.** Eight streams each
-    ///   demanding 32 764 bytes is 262 112 bytes of demand against one 65 535-byte connection
-    ///   window, so `charged − credited` really does sit at the top of its range, repeatedly, for
-    ///   the whole run (eight streams x 40 955 bytes = 327 640 bytes of demand). One stream at a time would never approach it and the connection bound would
+    ///   demanding **40 955** bytes is **327 640** bytes of demand against one 65 535-byte
+    ///   connection window -- five times over -- so writers really do park on it and
+    ///   `charged − credited` sits at the top of its range, repeatedly, for the whole run. (Both
+    ///   figures are the ones the two premise assertions below check, so they cannot drift from the
+    ///   code.) One stream at a time would never approach it and the connection bound would
     ///   go untested.
     /// * **Every RPC's payload is asserted**, so "nothing was failed" cannot pass by everything
     ///   quietly returning nothing.
