@@ -226,7 +226,7 @@ enum GRPCWireHeaders {
     /// silently emitting binary bytes as if they were printable ASCII, which would corrupt the
     /// header block for every field after it -- the same "caller bug traps" convention this
     /// module's `WireCodec` conformers use for their own encode-side preconditions.
-    private static func userMetadataFields(_ metadata: Metadata) -> [HTTPField] {
+    static func userMetadataFields(_ metadata: Metadata) -> [HTTPField] {
         var fields: [HTTPField] = []
         fields.reserveCapacity(metadata.count)
         for (key, value) in metadata {
@@ -257,7 +257,7 @@ enum GRPCWireHeaders {
     /// already guarantees by construction) but has no way to reject bad *bytes*, so the base64
     /// decode failure has to be caught on this side of the boundary or it doesn't get caught at
     /// all.
-    private static func parseUserMetadata(_ fields: [HTTPField]) throws -> Metadata {
+    static func parseUserMetadata(_ fields: [HTTPField]) throws -> Metadata {
         var metadata = Metadata()
         for field in fields {
             let loweredKey = field.name.lowercased()

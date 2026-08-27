@@ -54,30 +54,26 @@ import GRPCCore
 /// `RPCOp.metadata` op or an `RPCOp.status` op's `trailers` carries -- used by all four state
 /// machines below, so the conversion lives in one place rather than four.
 ///
-/// Routes through `GRPCWireHeaders.initialResponse(metadata:)` / `.parseResponse(_:endStream:
-/// false)` -- **not** because either side of this file is response-specific, but because that is
-/// the one public `GRPCWireHeaders` shape that already does exactly "user metadata in, plain
-/// field list out" (and back) with no other pseudo-header required. `GRPCWireHeaders.request`
-/// needs a `:path`, which neither a bare `metadata` op nor a `status` op's trailers have; the
-/// reserved-name stripping and `-bin` base64 handling that actually matter here
-/// (`userMetadataFields`/`parseUserMetadata`) are `private` to `GRPCWireHeaders`, so this is the
-/// only way to reach them without re-deriving that logic -- which the brief explicitly forbids.
-/// The two harmless extra fields `initialResponse` adds (`:status`, `content-type`) round-trip
-/// away for free: `parseResponse`'s reserved-name filter discards them on the way back, on
-/// *either* direction's traffic, since reserved-name stripping doesn't care which side sent it.
+/// Routes directly through `GRPCWireHeaders.userMetadataFields(_:)` /
+/// `.parseUserMetadata(_:)` -- the two functions that actually do "user metadata in, plain field
+/// list out" (and back), with no pseudo-header added on either side. An earlier version of this
+/// type went through the public `initialResponse(metadata:)` / `parseResponse(_:endStream:)`
+/// instead, because `userMetadataFields`/`parseUserMetadata` were `private` -- but that silently
+/// prepended `:status: 200` and a *second* `content-type` onto every `metadata` op (both
+/// directions) and every `status` op's trailers: 50 bytes of stray HTTP/2 pseudo-header on the
+/// wire that happened to round-trip away only because `parseResponse`'s reserved-name filter
+/// discarded them again on decode -- a §O3 violation (this op model carries no HTTP/2 frames to
+/// have pseudo-headers on) papered over by a filter, not actually absent. Fixed by widening
+/// `userMetadataFields`/`parseUserMetadata` to internal (same module) instead of re-deriving
+/// their reserved-name/`-bin`/base64 logic here, which the brief forbids.
 @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
 private enum MetadataFieldCoding {
     static func fields(from metadata: Metadata) -> [HTTPField] {
-        GRPCWireHeaders.initialResponse(metadata: metadata)
+        GRPCWireHeaders.userMetadataFields(metadata)
     }
 
     static func metadata(from fields: [HTTPField]) throws -> Metadata {
-        switch try GRPCWireHeaders.parseResponse(fields, endStream: false) {
-        case .initial(let metadata):
-            return metadata
-        case .trailers:
-            preconditionFailure("GRPCWireHeaders.parseResponse(_:endStream: false) never returns .trailers")
-        }
+        try GRPCWireHeaders.parseUserMetadata(fields)
     }
 }
 
@@ -172,10 +168,11 @@ struct RequestOpDecoder: Sendable {
         case .metadata(_, let fields):
             switch position {
             case .pendingMetadata:
+                let metadata = try decodeMetadata(fields)
                 position = .open
-                return [.metadata(try MetadataFieldCoding.metadata(from: fields))]
+                return [.metadata(metadata)]
             case .open:
-                try fail("received a second 'metadata' op after the first 'message'")
+                try fail("received a second 'metadata' op; metadata may appear only once, before the first message")
             case .halfClosed:
                 try fail("received 'metadata' after 'halfClose'")
             }
@@ -204,6 +201,20 @@ struct RequestOpDecoder: Sendable {
             case .halfClosed:
                 try fail("received a second 'halfClose'")
             }
+        }
+    }
+
+    /// Converts a `metadata` op's field list to `Metadata`, routing a malformed field list (e.g.
+    /// bad `-bin` base64) through `fail(_:)` rather than letting `GRPCWireHeaders`' own thrown
+    /// `RPCError` (`.invalidArgument`) escape directly -- §O2 says every violation surfaced by
+    /// this type is `.internalError`, and `position` must not have already advanced past
+    /// `.pendingMetadata` by the time that error is thrown (see `fail(_:)`'s "once thrown, dead"
+    /// contract in the file overview).
+    private mutating func decodeMetadata(_ fields: [HTTPField]) throws -> Metadata {
+        do {
+            return try MetadataFieldCoding.metadata(from: fields)
+        } catch {
+            try fail("malformed metadata field list: \(error)")
         }
     }
 
@@ -435,15 +446,18 @@ struct ResponseOpEncoder: Sendable {
 /// flag the way `RequestOpDecoder.remoteEnded` is one (there is no `RPCResponsePart` case a
 /// terminating `halfClose`-equivalent could be missing here; `status` already *is* that case).
 ///
-/// **No leading-metadata synthesis (unlike `RequestOpDecoder`).** This is deliberate, not an
-/// oversight: grpc-swift's client (`ClientStreamExecutor._waitForFirstResponsePart`) accepts
-/// *either* `.metadata` or `.status` as a valid first response part, and the only path that can
-/// ever produce ops for this decoder to read is this transport's own `ResponseOpEncoder`, which
-/// already guarantees a `.metadata` op (real or synthesised) precedes any `.message` op before
-/// either ever reaches the wire. A `.message` arriving here with no metadata yet is therefore
-/// spec-legal per §O2's grammar (`metadata` is optional) and is passed straight through as
-/// `.message`, not rejected and not padded with a synthesised part -- there is nothing on the
-/// consuming side that needs it.
+/// **Synthesises leading metadata on `.message`, but not on `.status` -- an asymmetric rule,
+/// deliberately.** grpc-swift's client (`ClientStreamExecutor._waitForFirstResponsePart`) accepts
+/// *either* `.metadata` or `.status` as a valid first response part, but rejects a bare
+/// `.message` as its first part ("expected metadata... likely to be a transport-specific bug").
+/// §O2 makes response-direction `metadata` optional, so a `.message`-first response is spec-legal
+/// *input* even though this transport's own `ResponseOpEncoder` never produces that shape on the
+/// wire (it already synthesises on its side). Trusting that "only our own encoder ever writes
+/// these ops" was tried and rejected on review -- this decoder does not get to assume the peer
+/// behaved, only that the grammar was followed, and §O2's grammar permits a bare `.message`
+/// first. So: `.message` before any `.metadata` synthesises an empty one, exactly like
+/// `RequestOpDecoder`. `.status` before any `.metadata` does **not** synthesise -- the client
+/// tolerates that shape directly, so there is nothing on the consuming side that needs it.
 @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
 struct ResponseOpDecoder: Sendable {
     private enum Position {
@@ -490,10 +504,11 @@ struct ResponseOpDecoder: Sendable {
         case .metadata(_, let fields):
             switch position {
             case .pending:
+                let metadata = try decodeMetadata(fields)
                 position = .open
-                return [.metadata(try MetadataFieldCoding.metadata(from: fields))]
+                return [.metadata(metadata)]
             case .open:
-                try fail("received a second 'metadata' op after the first 'message'")
+                try fail("received a second 'metadata' op; metadata may appear only once, before the first message")
             case .afterStatus:
                 try fail("received 'metadata' after 'status'; status is the single terminator")
             }
@@ -501,8 +516,17 @@ struct ResponseOpDecoder: Sendable {
         case .message(_, let payload):
             switch position {
             case .pending:
+                // §O2 makes response-direction `metadata` optional, and the client
+                // (`ClientStreamExecutor._waitForFirstResponsePart`) rejects a bare `.message` as
+                // its first response part ("expected metadata"). A real, non-synthesising
+                // `ResponseOpEncoder` on the other end already guarantees metadata precedes any
+                // message before either reaches the wire -- but this decoder must not assume that
+                // guarantee holds, since a `.message`-first response is spec-legal *input* per
+                // §O2 even if this transport's own encoder never produces it. Synthesising here,
+                // not just trusting the peer, is what keeps spec-legal input from turning into
+                // grpc-swift's own "this is likely a transport-specific bug" error.
                 position = .open
-                return [.message(payload)]
+                return [.metadata(Metadata()), .message(payload)]
             case .open:
                 return [.message(payload)]
             case .afterStatus:
@@ -515,12 +539,25 @@ struct ResponseOpDecoder: Sendable {
                 guard let statusCode = Status.Code(rawValue: code) else {
                     try fail("'status' op carries an unrecognized grpc-status code \(code)")
                 }
+                let metadata = try decodeMetadata(trailers)
                 position = .afterStatus
-                let metadata = try MetadataFieldCoding.metadata(from: trailers)
                 return [.status(Status(code: statusCode, message: message), metadata)]
             case .afterStatus:
                 try fail("received a second 'status'; status is the single terminator")
             }
+        }
+    }
+
+    /// Converts a field list (a `metadata` op's, or a `status` op's `trailers`) to `Metadata`,
+    /// routing a malformed field list through `fail(_:)` rather than letting `GRPCWireHeaders`'
+    /// own thrown `RPCError` (`.invalidArgument`) escape directly -- see the identically-purposed
+    /// helper on `RequestOpDecoder` for the full rationale (§O2 violations are `.internalError`;
+    /// `position` must not advance past the state that guarded this call before the throw).
+    private mutating func decodeMetadata(_ fields: [HTTPField]) throws -> Metadata {
+        do {
+            return try MetadataFieldCoding.metadata(from: fields)
+        } catch {
+            try fail("malformed metadata field list: \(error)")
         }
     }
 
