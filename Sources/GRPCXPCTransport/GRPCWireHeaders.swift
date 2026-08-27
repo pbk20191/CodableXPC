@@ -280,61 +280,99 @@ enum GRPCWireHeaders {
     private static let maxTimeoutDigits: Int64 = 99_999_999
 
     /// Encodes `d` as a `grpc-timeout` value: the finest unit (nanoseconds first, hours last)
-    /// whose truncated amount still fits in 8 digits. Truncating -- never rounding up -- is
-    /// deliberate: rounding up would silently hand the peer more time than the caller's deadline
-    /// allows; truncating can only make the wire timeout equal to or shorter than the real one.
+    /// whose amount, **rounded up**, still fits in 8 digits.
     ///
-    /// A non-positive `Duration` (already-expired or malformed deadline) encodes as `"0n"`: the
-    /// finest unit, truncated down to its floor. An amount so large it doesn't fit even in hours
-    /// saturates at `"99999999H"` (~11,415 years) rather than overflowing -- the same
-    /// truncate-not-round-up direction, just at the coarse end.
+    /// Rounding up (never truncating) is deliberate, and is the opposite of this file's first
+    /// draft -- truncating was tried and rejected on review. The two directions are not
+    /// symmetric in their failure mode: a truncated wire value is `<=` the real deadline, so a
+    /// server enforcing it can abandon work and return `DEADLINE_EXCEEDED` for a call the
+    /// client's own (longer, real) deadline would still have accepted -- a client-visible
+    /// functional failure caused purely by this encoding step. A value rounded up is `>=` the
+    /// real deadline; the worst case is bounded extra server-side work after the client's own
+    /// precise local timer has already fired and moved on -- wasted resources, not a wrong
+    /// answer, and specifically not wrong *because the client enforces its real deadline itself*
+    /// regardless of what it advertised on the wire. grpc-swift-2's own `Timeout.swift` reaches
+    /// the same conclusion (`quotientRoundedUp`). Do not "fix" this back to truncation -- it
+    /// looks like a precision improvement but reintroduces the client-visible failure mode above.
+    ///
+    /// A non-positive `Duration` (already-expired or malformed deadline) encodes as `"0n"` --
+    /// there is no shorter unit to round up into, and zero is itself already an upper bound on a
+    /// non-positive duration's wire representation. An amount so large it doesn't fit even in
+    /// hours saturates at `"99999999H"` (~11,415 years) rather than overflowing; that clamp still
+    /// rounds toward being the *larger* number a coarser unit could have expressed, so it stays on
+    /// the safe (over-, not under-, estimating) side of the client's real deadline.
     static func encodeTimeout(_ d: Duration) -> String {
         guard d > .zero else { return "0n" }
 
         let (seconds, attoseconds) = d.components
 
-        if seconds == 0 {
-            let nanoseconds = attoseconds / 1_000_000_000
-            if nanoseconds <= maxTimeoutDigits {
-                return "\(nanoseconds)n"
-            }
+        if let nanoseconds = roundedUpAmount(
+            seconds: seconds, attoseconds: attoseconds,
+            secondsMultiplier: 1_000_000_000, attosecondDivisor: 1_000_000_000)
+        {
+            return "\(nanoseconds)n"
         }
-        if let microseconds = truncatedAmount(
+        if let microseconds = roundedUpAmount(
             seconds: seconds, attoseconds: attoseconds,
             secondsMultiplier: 1_000_000, attosecondDivisor: 1_000_000_000_000)
         {
             return "\(microseconds)u"
         }
-        if let milliseconds = truncatedAmount(
+        if let milliseconds = roundedUpAmount(
             seconds: seconds, attoseconds: attoseconds,
             secondsMultiplier: 1_000, attosecondDivisor: 1_000_000_000_000_000)
         {
             return "\(milliseconds)m"
         }
-        if seconds <= maxTimeoutDigits {
-            return "\(seconds)S"
+        let roundedSeconds = ceilingUnits(seconds: seconds, attoseconds: attoseconds, secondsPerUnit: 1)
+        if roundedSeconds <= maxTimeoutDigits {
+            return "\(roundedSeconds)S"
         }
-        let minutes = seconds / 60
+        let minutes = ceilingUnits(seconds: seconds, attoseconds: attoseconds, secondsPerUnit: 60)
         if minutes <= maxTimeoutDigits {
             return "\(minutes)M"
         }
-        let hours = min(seconds / 3600, maxTimeoutDigits)
+        let hours = min(ceilingUnits(seconds: seconds, attoseconds: attoseconds, secondsPerUnit: 3600), maxTimeoutDigits)
         return "\(hours)H"
     }
 
-    /// `seconds * secondsMultiplier + attoseconds / attosecondDivisor`, truncating, computed
+    /// Ceiling of `seconds * secondsMultiplier + attoseconds / attosecondDivisor` -- the real
+    /// elapsed duration expressed in a sub-second unit (nanoseconds through seconds) -- computed
     /// without risking `Int64` overflow for absurdly large durations. Returns `nil` (rather than a
     /// too-large or overflowed value) whenever the result wouldn't fit in 8 digits, so callers can
     /// just fall through to the next coarser unit.
-    private static func truncatedAmount(
+    ///
+    /// Ceiling, not floor: `secondsPart` is exact (both operands are integers), so the only
+    /// fractional contribution is `attoseconds / attosecondDivisor`; rounding that division up by
+    /// one whenever there's a nonzero remainder is what makes the whole sum an upper bound on the
+    /// real duration instead of a lower one.
+    private static func roundedUpAmount(
         seconds: Int64, attoseconds: Int64, secondsMultiplier: Int64, attosecondDivisor: Int64
     ) -> Int64? {
         let (secondsPart, multiplyOverflowed) = seconds.multipliedReportingOverflow(by: secondsMultiplier)
         guard !multiplyOverflowed else { return nil }
-        let fractionalPart = attoseconds / attosecondDivisor
+        let fractionalPart = ceilingDivide(attoseconds, by: attosecondDivisor)
         let (total, addOverflowed) = secondsPart.addingReportingOverflow(fractionalPart)
         guard !addOverflowed, total <= maxTimeoutDigits else { return nil }
         return total
+    }
+
+    /// Ceiling of the real elapsed duration (`seconds` plus a sub-second `attoseconds` remainder)
+    /// expressed in whole units of `secondsPerUnit` seconds each -- used for whole seconds
+    /// (`secondsPerUnit: 1`), minutes (`60`), and hours (`3600`). Unlike `roundedUpAmount`, the
+    /// remainder here can come from *either* `seconds` not being an exact multiple of
+    /// `secondsPerUnit` *or* a nonzero `attoseconds`; either one means the true duration exceeds
+    /// the truncated quotient, so either one rounds the result up by one unit.
+    private static func ceilingUnits(seconds: Int64, attoseconds: Int64, secondsPerUnit: Int64) -> Int64 {
+        let (quotient, remainder) = seconds.quotientAndRemainder(dividingBy: secondsPerUnit)
+        return (remainder != 0 || attoseconds != 0) ? quotient + 1 : quotient
+    }
+
+    /// Ceiling integer division: the quotient, rounded toward positive infinity when there is a
+    /// nonzero remainder. Both operands are always non-negative in this file's usage.
+    private static func ceilingDivide(_ dividend: Int64, by divisor: Int64) -> Int64 {
+        let (quotient, remainder) = dividend.quotientAndRemainder(dividingBy: divisor)
+        return remainder == 0 ? quotient : quotient + 1
     }
 
     /// Parses a `grpc-timeout` value: 1-8 ASCII digits followed by exactly one of the six unit
