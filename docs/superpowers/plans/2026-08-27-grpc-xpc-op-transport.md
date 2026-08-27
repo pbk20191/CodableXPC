@@ -392,6 +392,15 @@ public enum RPCResponsePart<Bytes> { case metadata(Metadata); case message(Bytes
 - **L11 — build discipline.** Build/test only with an explicit `--scratch-path`, never the default
   build dir. Every task ends with `swift build` and `swift build --build-tests` green.
 - **L12 — deadline timers must not leak:** one per deadline-bearing RPC, cancelled on completion.
+- **L13 — after inserting a member, check what the comment above it now documents.** This has
+  happened twice, both times to the single most safety-critical comment in the file. Task 5 inserted
+  `rejecting` between `accepting`'s doc block and `accepting`, so the `- Important:` describing the
+  one remaining process-death path ended up filed under the function nobody calls to reach it, and
+  `accepting` had no documentation at all. Task 6 inserted a constant after `sendControl`'s doc
+  block, so the sole justification for swallowing every outbound control failure ended up
+  documenting the constant. Swift attaches a doc comment to whatever declaration follows it, and
+  neither the compiler nor any test will tell you. The two-second check is: after an insertion, read
+  the comment immediately above it and ask which declaration it is now on.
 
 ## Test policy (project owner directive)
 
