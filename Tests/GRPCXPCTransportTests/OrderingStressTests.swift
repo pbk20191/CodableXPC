@@ -90,6 +90,18 @@ final class OrderingStressTests: XCTestCase {
         /// handler latches the tag of its first message and every later part on that stream must
         /// match it.
         var crossRouted: [String] = []
+
+        /// **The barrier.** Handlers that have entered their body, counted monotonically -- it is
+        /// never decremented, unlike `liveHandlers`, because a barrier has to be a latch rather
+        /// than a gauge.
+        ///
+        /// No producer writes its first *message* until this reaches `streamCount`. That is what
+        /// turns "ten streams were open at once" from an observation into a fact: the premise used
+        /// to be asserted and hoped for, and a 20-run sweep by slice 2's author caught the hope
+        /// failing (1 run in 20: "only 9 of 10 streams were open at once"). Raising a tolerance to
+        /// nine would have admitted exactly the run the premise exists to exclude.
+        var handlersStarted = 0
+
         var liveHandlers = 0
         var maxLiveHandlers = 0
 
@@ -142,10 +154,23 @@ final class OrderingStressTests: XCTestCase {
     /// The number is therefore evidence that this test exercised a shared, concurrently-consumed
     /// channel -- not a measurement of wire interleaving, and it must not be quoted as one.
     ///
-    /// What is asserted is exactly what that supports: `maxLiveHandlers == 10` (ten streams really
-    /// were open on one connection at once) and a `streamSwitches` floor an order of magnitude under
-    /// every observed run. Both exist to make the *worthless* shape fail loudly -- ten streams run
-    /// end to end, one after another, which is a valid RPC test and no ordering test at all.
+    /// What is asserted is exactly what that supports: that ten streams really were open on one
+    /// connection at once, and a `streamSwitches` floor an order of magnitude under every observed
+    /// run. Both exist to make the *worthless* shape fail loudly -- ten streams run end to end, one
+    /// after another, which is a valid RPC test and no ordering test at all.
+    ///
+    /// # The ten-streams premise is constructed, not observed
+    ///
+    /// Each producer writes its `metadata` part (which carries the deferred `openStream`, so it is
+    /// what starts that stream's handler) and then **waits until all ten handlers have started**
+    /// before writing its first message. So the message phase begins with ten live streams by
+    /// construction, and `maxLiveHandlers == 10` is a consequence of the wait rather than a hope
+    /// about scheduling.
+    ///
+    /// It was a hope until a 20-run sweep caught it failing once, with "only 9 of 10 streams were
+    /// open at once". Note what was *not* done about that: raising the tolerance to nine would have
+    /// admitted a run in which the tenth stream never opened, which is precisely the shape the
+    /// premise exists to exclude. A premise worth asserting is worth making true.
     ///
     /// ``testInterleavedBlobsPreserveEveryStreamsOrderThroughTheMux()`` is where the interleaving is
     /// present by construction instead, and where `deliveredBlobCount` can say so.
@@ -176,6 +201,10 @@ final class OrderingStressTests: XCTestCase {
 
         let handler: RawSeamHandler = { stream, _ in
             arrivals.mutate {
+                // Latched before anything else, so the producers' barrier is released by the
+                // handler *existing*, not by it having read something -- it cannot read anything
+                // until the barrier releases.
+                $0.handlersStarted += 1
                 $0.liveHandlers += 1
                 $0.maxLiveHandlers = max($0.maxLiveHandlers, $0.liveHandlers)
             }
@@ -219,7 +248,27 @@ final class OrderingStressTests: XCTestCase {
                             try await pair.client.withStream(
                                 descriptor: Self.ordered, options: .defaults
                             ) { stream, _ -> Int in
+                                // A control op, and it carries the deferred `openStream` with it --
+                                // so this write is what causes this stream's handler to be
+                                // accepted and started.
                                 try await stream.outbound.write(.metadata([:]))
+
+                                // **The barrier.** Every producer waits here until all ten
+                                // handlers have started, so the message phase provably begins with
+                                // ten streams live on one connection. No handler can finish before
+                                // this releases -- a handler ends only when its inbound does, which
+                                // needs a `halfClose` that no producer sends until it has written
+                                // all 1 000 of its messages -- so `maxLiveHandlers == 10` is a
+                                // consequence of this wait rather than a hope about scheduling.
+                                //
+                                // It fails loudly if it cannot be met: `waitUntil` records an
+                                // `XCTFail` naming the condition and throws, which is the correct
+                                // outcome for a build where ten concurrent streams are impossible.
+                                try await waitUntil(
+                                    "all \(Self.streamCount) handlers to have started",
+                                    timeout: .seconds(30)
+                                ) { arrivals.value.handlersStarted >= Self.streamCount }
+
                                 for seq in 0..<Self.messagesPerStream {
                                     try await stream.outbound.write(
                                         .message(Self.payload(tag: tag, seq: seq)))
@@ -279,13 +328,20 @@ final class OrderingStressTests: XCTestCase {
         // ---------------------------------------------------------------------------------
         // L9: the channel must actually have interleaved, or this measured nothing.
         // ---------------------------------------------------------------------------------
-        // `maxLiveHandlers` is nearly free -- all ten handlers start together whatever the wire
-        // does -- so it is asserted at its full value rather than at 2, and the real guard is the
-        // switch count below.
+        // Guaranteed by the barrier the producers wait on, so this is a **cheap check that the
+        // barrier is still in place** rather than a claim about scheduling. It was the latter until
+        // a 20-run sweep caught it failing 1-in-20 with "only 9 of 10"; the fix was to make the
+        // premise hold, not to tolerate nine. Keep it: if the barrier is ever removed, this is what
+        // notices, and the failure message says which of the two it is.
+        XCTAssertEqual(
+            seen.handlersStarted, Self.streamCount,
+            "the barrier released with only \(seen.handlersStarted) of \(Self.streamCount) "
+                + "handlers started")
         XCTAssertEqual(
             seen.maxLiveHandlers, Self.streamCount,
             "only \(seen.maxLiveHandlers) of \(Self.streamCount) stream(s) were open on the "
-                + "connection at once, so this test measured sequential RPCs sharing nothing")
+                + "connection at once. The producers' barrier should have made this impossible, so "
+                + "either the barrier was removed or a handler ended before the message phase began.")
         // Measured minimum across six runs: 9 849 of a possible 9 999. A floor of 1 000 is an
         // order of magnitude under every observed run and still rules out the shape that would make
         // this case worthless -- ten streams drained one after another.
