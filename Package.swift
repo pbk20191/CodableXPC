@@ -1,6 +1,7 @@
 // swift-tools-version: 6.1
-// The package default is the Swift 5 language mode; only the `XPCActors` target opts in to
-// the Swift 6 language mode (its own `swiftSettings: [.swiftLanguageMode(.v6)]`). XPCActors is
+// The package default is the Swift 5 language mode; three targets opt in to the Swift 6 language
+// mode with their own `swiftSettings: [.swiftLanguageMode(.v6)]` -- `XPCActors`, `GRPCXPCTransport`
+// and `GRPCXPCTransportTests`. XPCActors is
 // clean under complete concurrency checking: non-Sendable state living under a
 // `Synchronization.Mutex` is `@unchecked Sendable` at the value type (the lock is the
 // synchronization), and the immutable wire structs are `@unchecked Sendable` snapshots. The
@@ -135,6 +136,10 @@ let package = Package(
             name: "GRPCXPCTransportTests",
             dependencies: [
                 "GRPCXPCTransport",
+                // Named rather than taken transitively: the tests `import GRPCCore` directly for
+                // `Metadata`, `Status`, `RPCError` and the call-type shapes, and a transitive
+                // import is not a dependency anyone declared (same rule as XPCActorsTests below).
+                .product(name: "GRPCCore", package: "grpc-swift-2"),
             ],
             swiftSettings: [
                 .swiftLanguageMode(.v6)

@@ -84,7 +84,7 @@ the task must report it rather than importing.
 | `Sources/GRPCXPCTransport/GRPCDispatchData.swift` (`GRPCSwiftData`) | **Keep, central.** The byte type everywhere. Zero-copy `init(from: xpc_object_t)` and `createXPCRepresentation()` are the ONLY two crossings to libxpc. Its `Codable`/`XPCNativeObject` extension is deleted at the swap. |
 | `Sources/GRPCXPCTransport/GRPCWireHeaders.swift` (Task 3) | **Keep, reused.** Metadata ↔ name/value fields, `grpc-timeout`, `grpc-status`/`grpc-message`, `-bin` base64, reserved-name stripping. Encoding-agnostic. **Correction to the superseded plan: `grpc-timeout` rounds UP, never truncates** — truncating tells the server a shorter deadline than the caller asked for, so it can abandon a call the client would still have accepted; grpc-swift's own `Timeout.swift` rounds up for the same reason. |
 | `HTTP2Frame.swift`, `HPACKLiteralCodec.swift` (+ their 37 tests) | **DELETE (revised 2026-08-27).** HTTP/2 is not coming, so these are unreachable code — and the module-level `StreamID` they sit beside is what blocked Task 1. The `WireCodec` seam preserves the option; the code stays recoverable from git (dd647c1, 205316c, dbe3edf). `HTTPField` moves to `RPCOp.swift`, since `GRPCWireHeaders` needs it. |
-| `XPCFrame.swift`, `StreamChannel.swift`, `XPCOutboundWriter.swift`, `XPCConnection.swift`, `Backpressure.swift`, `GRPCMessageFraming.swift` + their tests | **Legacy.** Stay compiling until the swap task deletes them. |
+| `XPCFrame.swift`, `StreamChannel.swift`, `XPCOutboundWriter.swift`, `XPCConnection.swift`, `Backpressure.swift`, `GRPCMessageFraming.swift` + their tests | **Legacy.** Stayed compiling until the swap task deleted them; all six are gone as of Task 7. |
 
 ## Normative op + wire specification
 
@@ -457,9 +457,10 @@ public enum RPCResponsePart<Bytes> { case metadata(Metadata); case message(Bytes
 **Tasks implement production code only.** Test files and TDD steps are deferred to the final test
 task. A task is done when it compiles clean and satisfies its contract by inspection.
 
-- `swift build` and `swift build --build-tests` stay green at every commit; the existing suites
-  (Task 1's 17 HTTP2Frame tests, Task 2's 20 HPACK tests, `GRPCSwiftDataTests`, and the legacy
-  suite until the swap) must keep passing.
+- `swift build` and `swift build --build-tests` stay green at every commit; the existing suites must keep
+  passing. (Historical note: Task 1's 17 HTTP2Frame tests and Task 2's 20 HPACK tests were deleted
+  with the HTTP/2 artefacts, and the legacy suite's 64 tests went with the stack at Task 7.
+  `GRPCSwiftDataTests` is the only pre-op suite that survives.)
 - **Every task report ends with a “Deferred tests” section** listing the cases that task would have
   written, plus any case discovered while implementing. That list is the backlog the test task
   consumes; an unwritten case is a lost case.
