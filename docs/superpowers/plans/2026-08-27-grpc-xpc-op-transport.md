@@ -131,6 +131,22 @@ seam earning its keep — do not add LPM to the compact codec "for standardness"
   a malformed `:path`, a stray-metadata `openStream`, and a non-empty `halfClose` body each killing
   every other stream on the connection. A **header**-level failure stays connection-fatal, and
   correctly so — framing you cannot parse is framing you cannot resynchronise.
+  Two carve-outs, both from Task 6b's review:
+  - A malformed **`goAway`** body is body-level but has no stream to fail, so it throws like a
+    header error and the cleanly-decoded prefix is discarded with it. Verified harmless rather than
+    assumed: the throw reaches `failConnection` → `failAll`, which removes and fails every entry
+    synchronously, so nothing the prefix could have delivered survives that same call.
+  - A malformed **`openStream`** must be refused on the wire, not silently dropped. It is the only
+    kind whose semantics *create* state, so the id is one the peer is definitionally entitled to and
+    definitionally waiting on; dropping it silently hangs the peer to its deadline. Every other kind
+    stays silent, because for a made-up id the core cannot tell a forgery from an ordinary
+    retirement race, and answering the 10-byte `credit` op is the classic 1:1 amplification lever.
+    **The refusal message must be a fixed literal**, and the refusal must run the same gate order
+    `openStream` itself does — role first, then id parity — or a *client* answers an `openStream` it
+    must never accept. Echoing the decode error instead turns a 12-byte malformed `openStream` into
+    ~570 bytes out, repeatable forever at zero state cost since no table entry is ever created:
+    not the same trade as the over-limit `resourceExhausted` refusal, whose message is fixed-length
+    and which a peer only reaches after paying for `maxConcurrentInboundStreams` admitted streams.
 - `cancel` from either side terminates the stream in both directions.
 - Ordering: the substrate delivers messages in order, and the core processes them serially per
   connection. There is no sequence number — XPC guarantees ordering, and the Task “XPCPipe”
