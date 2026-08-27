@@ -186,9 +186,16 @@ defaults — not because we are HTTP/2 but because those numbers and that shape 
   change. Without this clamp an oversize message deadlocks: `message` op bodies are atomic (O2 has
   no chunking), so a sender reserving partially would take the whole window, block, and wait on a
   receiver that cannot credit a message it has not finished receiving and therefore cannot deliver.
-  With it, the window serializes oversize messages one at a time per stream — which is exactly as
-  much backpressure as chunking with consumption-credit could give — and no message can charge more
-  than the window it must fit in.
+  With it, no message can charge more than the window it must fit in, and an oversize message
+  serializes the **connection**, not merely its own stream: 65 535 is the whole connection window
+  too, so every other stream's `message` waits behind it until the receiving application consumes.
+  That is head-of-line blocking, not deadlock — the stream-then-connection order above makes two
+  concurrent oversize senders queue on the connection window's FIFO rather than hold-and-wait — and
+  it is exactly as much backpressure as chunking with consumption-credit could give. Size retries
+  and timeouts against the connection, not the stream.
+- The clamp has **one definition**, `FlowControl.charge(for:window:)`. Send side and receive side
+  both call it. Two hand-inlined `min`s that must agree forever is the shape of bug the charge rule
+  was introduced to prevent.
 - A credit that would take a window above 2³¹−1 is a protocol error. Applying credit is **O(1)
   arithmetic** — never a loop over a peer-supplied count (see lesson L2).
 - A reservation is **spent, not lent**. A sender that reserves and then does not send must hand the
