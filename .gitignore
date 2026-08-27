@@ -15,3 +15,10 @@ DerivedData/
 /xpcdump/
 /xpcDistributed/
 /Tools/
+# The XPC platform-matrix probes. Same category as the above, kept out of history by the
+# same rule -- but unlike the decompilations these are *cited by committed code*: the plan's
+# "Verified API facts" carries ~20 measured rows and tells you to re-run them, and source
+# comments name individual rows. So the probes live here on disk and the citations say
+# "local only". If you clone this repo fresh, those rows are prose you cannot reproduce;
+# one has already changed answer under an OS update.
+/docs/xpc-platform-matrix/
