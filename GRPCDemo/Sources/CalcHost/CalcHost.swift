@@ -93,6 +93,19 @@ enum Main {
         try expect(counted == [1, 2, 3, 4, 5], "CountTo(5) == \(counted), expected [1,2,3,4,5]")
         print("server>>  CountTo(5) = \(counted)")
 
+        // The empty-stream edge, asserted here because nothing else can reach it. `calc.proto`
+        // says "Counts up from 1 to `value`", so CountTo(0) is an empty range and the call must
+        // end OK having sent nothing. The service used to clamp with `max(value, 1)` and answer
+        // with [1]; a review caught it by reading, and with the host only ever sending 5 the
+        // clamp could have been restored without a single test noticing.
+        let none: [Int32] = try await calc.countTo(.with { $0.value = 0 }) { response in
+            var values: [Int32] = []
+            for try await reply in response.messages { values.append(reply.value) }
+            return values
+        }
+        try expect(none.isEmpty, "CountTo(0) == \(none), expected an empty stream")
+        print("server>>  CountTo(0) = [] (empty stream, call still OK)")
+
         // ---- 4. bidirectional-streaming -------------------------------------------------
         //
         // A real gate, not an observation. The producer sends request 1 and then **waits for the
