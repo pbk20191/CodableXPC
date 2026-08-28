@@ -50,33 +50,22 @@ import GRPCCore
 // MARK: - Shared: `Metadata` <-> the field list an RPCOp.metadata/status.trailers carries
 // ===========================================================================================
 
-/// Converts between `Metadata` and the plain (no pseudo-header) field list that an
-/// `RPCOp.metadata` op or an `RPCOp.status` op's `trailers` carries -- used by all four state
-/// machines below, so the conversion lives in one place rather than four.
-///
-/// Routes directly through `GRPCWireHeaders.userMetadataFields(_:)` /
-/// `.parseUserMetadata(_:)` -- the two functions that actually do "user metadata in, plain field
-/// list out" (and back), with no pseudo-header added on either side. An earlier version of this
-/// type went through `GRPCWireHeaders`' response-direction helpers (now deleted: they were
-/// HTTP/2-era and had no callers left)
-/// instead, because `userMetadataFields`/`parseUserMetadata` were `private` -- but that silently
-/// prepended `:status: 200` and a *second* `content-type` onto every `metadata` op (both
-/// directions) and every `status` op's trailers: 50 bytes of stray HTTP/2 pseudo-header on the
-/// wire that happened to round-trip away only because the decode side's reserved-name filter
-/// discarded them again on decode -- a §O3 violation (this op model carries no HTTP/2 frames to
-/// have pseudo-headers on) papered over by a filter, not actually absent. Fixed by widening
-/// `userMetadataFields`/`parseUserMetadata` to internal (same module) instead of re-deriving
-/// their reserved-name/`-bin`/base64 logic here, which the brief forbids.
-@available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
-private enum MetadataFieldCoding {
-    static func fields(from metadata: Metadata) -> [HTTPField] {
-        GRPCWireHeaders.userMetadataFields(metadata)
-    }
-
-    static func metadata(from fields: [HTTPField]) throws(RPCError) -> Metadata {
-        try GRPCWireHeaders.parseUserMetadata(fields)
-    }
-}
+// `Metadata` <-> the plain (no pseudo-header) field list an `RPCOp.metadata` op or an
+// `RPCOp.status` op's `trailers` carries is `GRPCWireHeaders.userMetadataFields(_:)` /
+// `.parseUserMetadata(_:)` -- called directly at each of the six sites below.
+//
+// A `MetadataFieldCoding` wrapper used to stand in front of those two calls. Its reason was that
+// the four state machines went through `GRPCWireHeaders`' *response-direction* helpers, because
+// `userMetadataFields`/`parseUserMetadata` were `private` -- and those helpers silently prepended
+// `:status: 200` and a second `content-type` to every `metadata` op and every `status` op's
+// trailers: 50 bytes of stray HTTP/2 pseudo-header on the wire (a §O3 violation -- this op model
+// carries no HTTP/2 frames to have pseudo-headers on) that round-tripped away only because the
+// decode side's reserved-name filter discarded them again. The fix was to widen
+// `userMetadataFields`/`parseUserMetadata` to internal rather than re-derive their
+// reserved-name/`-bin`/base64 logic here; the response-direction helpers were then deleted for
+// having no callers left, and the wrapper became a pass-through forwarding to the very functions
+// it existed to avoid. The note survives; the indirection does not. Do **not** reintroduce a
+// direction-specific helper here -- that is the bug, not the wrapper.
 
 // ===========================================================================================
 // MARK: - RequestOpDecoder (server: ops → RPCRequestPart)
@@ -213,7 +202,7 @@ struct RequestOpDecoder: Sendable {
     /// contract in the file overview).
     private mutating func decodeMetadata(_ fields: [HTTPField]) throws(RPCError) -> Metadata {
         do {
-            return try MetadataFieldCoding.metadata(from: fields)
+            return try GRPCWireHeaders.parseUserMetadata(fields)
         } catch {
             try fail("malformed metadata field list", error: error)
         }
@@ -299,7 +288,7 @@ struct RequestOpEncoder: Sendable {
             switch position {
             case .beforeOpen:
                 position = .open
-                return [openStreamOp(), .metadata(streamID, fields: MetadataFieldCoding.fields(from: metadata))]
+                return [openStreamOp(), .metadata(streamID, fields: GRPCWireHeaders.userMetadataFields(metadata))]
             case .open:
                 try fail("received a second 'metadata' part; only one may be sent per stream")
             case .finished:
@@ -403,7 +392,7 @@ struct ResponseOpEncoder: Sendable {
             switch position {
             case .beforeMetadata:
                 position = .open
-                return [.metadata(streamID, fields: MetadataFieldCoding.fields(from: metadata))]
+                return [.metadata(streamID, fields: GRPCWireHeaders.userMetadataFields(metadata))]
             case .open:
                 try fail("received a second 'metadata' part; only one may be sent per stream")
             case .afterStatus:
@@ -415,7 +404,7 @@ struct ResponseOpEncoder: Sendable {
             case .beforeMetadata:
                 position = .open
                 return [
-                    .metadata(streamID, fields: MetadataFieldCoding.fields(from: Metadata())),
+                    .metadata(streamID, fields: GRPCWireHeaders.userMetadataFields(Metadata())),
                     .message(streamID, payload: payload),
                 ]
             case .open:
@@ -431,7 +420,7 @@ struct ResponseOpEncoder: Sendable {
                 return [
                     .status(
                         streamID, code: status.code.rawValue, message: status.message,
-                        trailers: MetadataFieldCoding.fields(from: metadata))
+                        trailers: GRPCWireHeaders.userMetadataFields(metadata))
                 ]
             case .afterStatus:
                 try fail("received a second 'status'; status is the single terminator")
@@ -483,9 +472,10 @@ struct ResponseOpDecoder: Sendable {
     /// Feeds one op to the decoder, returning the `RPCResponsePart` it produces.
     ///
     /// - Throws: `RPCError(code: .internalError)` for a grammar violation, naming the rule broken
-    ///   and what arrived instead -- including a `status` op whose `code` does not map to a known
-    ///   `Status.Code` (`Status.Code(rawValue:)` is failable); `RPCError(code: .cancelled)` if
-    ///   `op` is the peer's own `cancel` (§O2: terminal in both directions).
+    ///   and what arrived instead; `RPCError(code: .cancelled)` if `op` is the peer's own
+    ///   `cancel` (§O2: terminal in both directions). A `status` op whose `code` is not a known
+    ///   `Status.Code` is **not** among them -- it decodes to `.unknown`, per gRPC's rule for an
+    ///   unrecognized status code (see the `.status` case).
     /// - Precondition: `op` is never `.credit`/`.goAway` (connection-level; a mux bug if routed
     ///   here) and this instance has not previously thrown (dead; a mux bug to call again).
     mutating func accept(_ op: RPCOp) throws -> [RPCResponsePart<GRPCSwiftData>] {
@@ -545,9 +535,18 @@ struct ResponseOpDecoder: Sendable {
         case .status(_, let code, let message, let trailers):
             switch position {
             case .pending, .open:
-                guard let statusCode = Status.Code(rawValue: code) else {
-                    try fail("'status' op carries an unrecognized grpc-status code \(code)")
-                }
+                // An unrecognized code is UNKNOWN, not a transport failure. gRPC's own rule
+                // (PROTOCOL-HTTP2 / the status-code contract every implementation shares): a
+                // client that does not recognise a `grpc-status` value maps it to `UNKNOWN` (2)
+                // and completes the RPC. Failing the stream instead would take a peer that
+                // terminated *cleanly* -- it sent a status; the grammar was obeyed -- and answer
+                // it with an outbound `cancel` plus an `.internalError` the application never
+                // asked for. Codes 0...16 have been frozen for years, so this costs nothing
+                // today; it is what stops a newer peer sharing this wire format from being
+                // mistaken for a broken one tomorrow. `message` and `trailers` are still
+                // delivered verbatim, so the peer's own explanation of the code survives the
+                // remap.
+                let statusCode = Status.Code(rawValue: code) ?? .unknown
                 let metadata = try decodeMetadata(trailers)
                 position = .afterStatus
                 return [.status(Status(code: statusCode, message: message), metadata)]
@@ -564,7 +563,7 @@ struct ResponseOpDecoder: Sendable {
     /// `position` must not advance past the state that guarded this call before the throw).
     private mutating func decodeMetadata(_ fields: [HTTPField]) throws -> Metadata {
         do {
-            return try MetadataFieldCoding.metadata(from: fields)
+            return try GRPCWireHeaders.parseUserMetadata(fields)
         } catch {
             try fail("malformed metadata field list: \(error)")
         }

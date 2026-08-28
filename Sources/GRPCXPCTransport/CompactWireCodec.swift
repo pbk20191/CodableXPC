@@ -45,6 +45,12 @@ struct CompactWireCodec: WireCodec {
     /// ever used to size an allocation or a slice).
     static let maxBodyLength = 16 * 1024 * 1024
 
+    /// The smallest an encoded field can be: a 2-byte name length, a 0-byte name, a 4-byte value
+    /// length, a 0-byte value. Both directions use it -- `encodeFieldList` to size its body
+    /// exactly before writing it, `decodeFieldList` to reject a declared field count this field
+    /// list cannot possibly hold before `reserveCapacity` ever runs.
+    private static let minimumEncodedFieldLength = 6
+
     private static let grpcStatusFieldName = "grpc-status"
     private static let grpcMessageFieldName = "grpc-message"
 
@@ -65,10 +71,38 @@ struct CompactWireCodec: WireCodec {
 
     func encode(_ ops: [RPCOp]) throws -> GRPCSwiftData {
         var out = Data()
+        out.reserveCapacity(Self.encodedLengthLowerBound(ops))
         for op in ops {
             try Self.encodeOne(op, into: &out)
         }
         return GRPCSwiftData(viewing: out)
+    }
+
+    /// A lower bound on the blob `ops` encodes to: **exact** for every kind whose body size is
+    /// known without building the body (`message`, `halfClose`, `cancel`, `credit`, `goAway`), and
+    /// the 10-byte header alone for the three field-list-bodied kinds, whose bodies only get sized
+    /// inside `encodeFieldList`.
+    ///
+    /// Reserving it up front is what keeps a `message` payload from being copied twice: without
+    /// it, appending op *n+1* reallocates `out` and re-copies everything already in it, payloads
+    /// included -- so a blob of `k` messages copied the first payload `k` times. A *lower* bound
+    /// rather than an exact one deliberately: the field-list kinds would have to be encoded twice
+    /// to size them exactly, and under-reserving costs at most the ordinary growth this already
+    /// had, while the messages -- the only bodies big enough for the copy to matter -- are counted
+    /// exactly.
+    private static func encodedLengthLowerBound(_ ops: [RPCOp]) -> Int {
+        var total = 0
+        for op in ops {
+            total += headerLength
+            switch op {
+            case .message(_, let payload): total += payload.count
+            case .cancel(_, let reason): total += reason.utf8.count
+            case .credit, .goAway: total += 4
+            case .halfClose: break
+            case .openStream, .metadata, .status: break  // sized by `encodeFieldList`
+            }
+        }
+        return total
     }
 
     /// §O2 (as amended): a body-level rejection never takes the rest of the blob with it. Each
@@ -395,28 +429,35 @@ struct CompactWireCodec: WireCodec {
                 message: "field list has \(fields.count) field(s), exceeding the 65535 maximum")
         }
 
+        // Exact, and cheap: `String.utf8.count` is O(1) for a native string, so one pass sizes
+        // the whole body before a byte of it is written -- no growth, and no `Array(…utf8)`
+        // staging copy per field on the way in.
+        var bodyLength = 2
+        for field in fields {
+            bodyLength += minimumEncodedFieldLength + field.name.utf8.count + field.value.utf8.count
+        }
         var out = Data()
+        out.reserveCapacity(bodyLength)
+
         appendBE(count, to: &out)
         for field in fields {
-            let nameBytes = Array(field.name.utf8)
-            guard let nameLength = UInt16(exactly: nameBytes.count) else {
+            guard let nameLength = UInt16(exactly: field.name.utf8.count) else {
                 throw RPCError(
                     code: .internalError,
-                    message: "field name '\(field.name)' is \(nameBytes.count) byte(s), exceeding "
+                    message: "field name '\(field.name)' is \(field.name.utf8.count) byte(s), exceeding "
                         + "the 65535 maximum")
             }
             appendBE(nameLength, to: &out)
-            out.append(contentsOf: nameBytes)
+            out.append(contentsOf: field.name.utf8)
 
-            let valueBytes = Array(field.value.utf8)
-            guard let valueLength = UInt32(exactly: valueBytes.count) else {
+            guard let valueLength = UInt32(exactly: field.value.utf8.count) else {
                 throw RPCError(
                     code: .internalError,
-                    message: "field '\(field.name)' value is \(valueBytes.count) byte(s), exceeding "
+                    message: "field '\(field.name)' value is \(field.value.utf8.count) byte(s), exceeding "
                         + "the 4294967295 maximum")
             }
             appendBE(valueLength, to: &out)
-            out.append(contentsOf: valueBytes)
+            out.append(contentsOf: field.value.utf8)
         }
         return out
     }
@@ -430,10 +471,6 @@ struct CompactWireCodec: WireCodec {
     ///   remaining *in this field list*, a non-UTF-8 name or value, or trailing bytes left over
     ///   after the declared field count has been fully read.
     private static func decodeFieldList(_ body: GRPCSwiftData) throws -> [HTTPField] {
-        /// The smallest an encoded field can be: a 2-byte name length, a 0-byte name, a 4-byte
-        /// value length, a 0-byte value.
-        let minimumEncodedFieldLength = 6
-
         let data = body.data
         let end = data.endIndex
         var cursor = data.startIndex
@@ -523,17 +560,28 @@ struct CompactWireCodec: WireCodec {
 
     /// Reads a big-endian `T` starting at `index`.
     ///
-    /// Deliberately *not* the mirror of `appendBE`: loading the bytes into a `T` and calling
-    /// `T(bigEndian:)` would need the source to be contiguous and correctly aligned, and here
-    /// it is neither guaranteed -- `data` is a slice of a received XPC payload whose
-    /// `startIndex` is arbitrary. Accumulating byte by byte is alignment-agnostic and reads
-    /// the same on either endianness.
+    /// `loadUnaligned` is what makes this the mirror of `appendBE` rather than a per-byte
+    /// shift-and-mask ladder: alignment is exactly what it is documented not to require, so the
+    /// old objection ("`data` is a slice of a received XPC payload, so the address is arbitrary")
+    /// applies to `load`, not to this. Endianness is still handled explicitly by `T(bigEndian:)`,
+    /// so this reads the same on either.
+    ///
+    /// **`index` is a `Data.Index`, not an offset.** `withUnsafeBytes` hands back a buffer over
+    /// the slice's *own* bytes -- byte 0 of that buffer is `data.startIndex`, whatever
+    /// `data.startIndex` happens to be -- so the byte offset is `index - data.startIndex`, never
+    /// `index`. `GRPCSwiftData` indices do not rebase to zero (a decoded body's `startIndex` is
+    /// 10, and a blob received over XPC starts wherever libxpc's buffer put it), and
+    /// `WireProtocolTests` runs several cases through `RawOpBytes.offsetBlob` precisely so a
+    /// hardcoded `0` here fails instead of passing by coincidence.
     ///
     /// - Precondition: the caller has already checked
     ///   `data.endIndex - index >= MemoryLayout<T>.size`.
     private static func readBE<T: FixedWidthInteger>(
         _ data: Data, at index: Data.Index, as: T.Type
     ) -> T {
-        data[index ..< index + MemoryLayout<T>.size].reduce(T.zero) { ($0 << 8) | T($1) }
+        let offset = index - data.startIndex
+        return data.withUnsafeBytes { bytes in
+            T(bigEndian: bytes.loadUnaligned(fromByteOffset: offset, as: T.self))
+        }
     }
 }

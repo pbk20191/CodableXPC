@@ -976,4 +976,262 @@ final class WireProtocolTests: XCTestCase {
                 + "\(pathological.utf8.count)-byte peer value; the peer's input size is driving "
                 + "the size of the op sent back at it")
     }
+
+    // =======================================================================================
+    // MARK: - Pre-admission work: parsing an `openStream`'s field list
+    // =======================================================================================
+
+    /// **`GRPCWireHeaders.parseRequest` walks a peer-supplied field list exactly once.**
+    ///
+    /// The amplification this pins is pre-admission by construction: `CompactWireCodec.decode`
+    /// parses an `openStream` body *before* `RPCTransportCore.route` has run its stream-count
+    /// admission check, so nothing has yet decided the peer may open a stream at all. `count` is a
+    /// peer-chosen `UInt16`, so one ~393 KB body can declare 65 535 fields, and the parser used to
+    /// walk them three times -- once for `:path`, once for `grpc-timeout`, once for user metadata
+    /// -- lowercasing every name on every walk. With `:path` ordered *last*, that is ~200 000
+    /// `String` allocations per message, repeatable at will.
+    ///
+    /// **The assertion is on work done, not on elapsed time.** A timing assertion on a shared CI
+    /// box measures the box, not the parser. The seam is the parameter type instead:
+    /// `parseRequest` takes any `Collection` of `HTTPField`, so ``CountingFields`` can count every
+    /// element the parser pulls out and the test can assert the exact count. One pass over `n`
+    /// fields is `n` accesses; the three-pass shape is `3n`, and `n` is chosen large enough that
+    /// no off-by-a-few can blur the two.
+    ///
+    /// `:path` is deliberately the **last** field, and `grpc-timeout` deliberately absent: that is
+    /// the worst case for the old shape (no early exit on either lookup) and it is also the shape
+    /// a hostile peer would send.
+    func testParseRequestWalksAPeerSuppliedFieldListExactlyOnce() throws {
+        try runBounded("one-pass request parse", timeout: 20) {
+            let padding = 4_096
+            var fields: [HTTPField] = (0..<padding).map { ("x-pad-\($0)", "v") }
+            fields.append((":path", "/pkg.Svc/Method"))
+
+            let counter = FieldAccessCounter()
+            let parsed = try GRPCWireHeaders.parseRequest(CountingFields(fields, counter: counter))
+
+            XCTAssertEqual(parsed.path, "/pkg.Svc/Method")
+            XCTAssertNil(parsed.timeout)
+            XCTAssertEqual(
+                parsed.metadata.count, padding,
+                "the control: every non-reserved field must still have become user metadata, so "
+                    + "the access count below is a count of a walk that did the whole job")
+
+            XCTAssertEqual(
+                counter.accesses, fields.count,
+                "parseRequest must touch each field exactly once; \(counter.accesses) accesses "
+                    + "for \(fields.count) field(s) means it is walking the list "
+                    + "\(counter.accesses / fields.count)x, and every extra walk is peer-commanded "
+                    + "work done before any admission gate")
+        }
+    }
+
+    /// The fast path must not change **which** names match.
+    ///
+    /// `parseRequest` no longer calls `lowercased()` on every field name; it folds ASCII case
+    /// byte-by-byte instead. That is only sound because HTTP field names are ASCII -- and it is
+    /// only *exactly* sound because non-ASCII names still take the `lowercased()` path. Both
+    /// halves are asserted here, because the ASCII shortcut is the kind of change that silently
+    /// narrows a match set:
+    ///
+    /// * ASCII case still folds: `:PATH`, `GRPC-Timeout`, `TE`, `Content-Type` are still the
+    ///   reserved names they were, and a mixed-case metadata name still arrives lowercased.
+    /// * Non-ASCII still folds the Unicode way: U+212A KELVIN SIGN lowercases to `"k"`, so a field
+    ///   named `"\u{212A}-bin"` must still land under the key `"k-bin"` -- an ASCII-only fold
+    ///   would have left it as `"\u{212A}-bin"`, a different key with a different `-bin` meaning.
+    func testFieldNameMatchingIsUnchangedByTheASCIICaseFold() throws {
+        let fields: [HTTPField] = [
+            (":METHOD", "POST"),
+            ("TE", "trailers"),
+            ("Content-Type", "application/grpc"),
+            ("X-Mixed-Case", "kept"),
+            ("\u{212A}", "kelvin"),
+            ("GRPC-Timeout", "1500000u"),
+            (":Path", "/pkg.Svc/Method"),
+        ]
+        let parsed = try GRPCWireHeaders.parseRequest(fields)
+
+        XCTAssertEqual(parsed.path, "/pkg.Svc/Method", "`:Path` must still match `:path`")
+        XCTAssertEqual(
+            parsed.timeout, .microseconds(1_500_000),
+            "`GRPC-Timeout` must still match `grpc-timeout`")
+        XCTAssertEqual(
+            parsed.metadata.map(\.key).sorted(), ["k", "x-mixed-case"],
+            "every reserved name must still be stripped whatever its case, an ASCII metadata name "
+                + "must still arrive lowercased, and U+212A must still fold to \"k\" the way "
+                + "`lowercased()` folds it")
+    }
+
+    /// Rejection precedence is part of the contract the one-pass rewrite had to preserve.
+    ///
+    /// The three-pass shape reached `:path` first, `grpc-timeout` second and user metadata last, so
+    /// which error a doubly-malformed request produced was decided by that order. A single pass
+    /// reaches all three at once, so the order now has to be re-established deliberately -- a
+    /// malformed `-bin` value is held and rethrown last rather than escaping where it was raised.
+    /// If it were not, this request would report a base64 failure instead of the malformed path
+    /// that is the more useful diagnosis, and the `unimplemented` refusal a malformed `:path` earns
+    /// would silently become `invalidArgument`.
+    func testRejectionPrecedenceSurvivesTheSinglePass() throws {
+        func code(of fields: [HTTPField]) -> RPCError.Code? {
+            do {
+                _ = try GRPCWireHeaders.parseRequest(fields)
+                return nil
+            } catch {
+                return error.code
+            }
+        }
+
+        XCTAssertEqual(
+            code(of: [("x-bin", "!!not base64!!"), ("grpc-timeout", "nope"), (":path", "no-slash")]),
+            .unimplemented,
+            "a malformed `:path` outranks both a malformed timeout and a malformed `-bin` value")
+        XCTAssertEqual(
+            code(of: [("x-bin", "!!not base64!!"), ("grpc-timeout", "nope"), (":path", "/pkg.Svc/M")]),
+            .invalidArgument,
+            "a malformed timeout outranks a malformed `-bin` value")
+        XCTAssertEqual(
+            code(of: [("x-bin", "!!not base64!!"), (":path", "/pkg.Svc/M")]),
+            .invalidArgument,
+            "a malformed `-bin` value is still rejected, just last")
+        XCTAssertEqual(
+            code(of: [("x-bin", "!!not base64!!"), ("grpc-timeout", "nope")]),
+            .invalidArgument,
+            "and a missing `:path` still outranks everything")
+    }
+
+    // =======================================================================================
+    // MARK: - An unrecognized `grpc-status` code
+    // =======================================================================================
+
+    /// **An unrecognized `grpc-status` code completes the RPC as `UNKNOWN`; it does not fail the
+    /// stream.**
+    ///
+    /// gRPC's rule is that a client which does not recognise a status code maps it to `UNKNOWN`
+    /// (2). This decoder used to reject it instead: `Status.Code(rawValue: 17)` is `nil`, so the
+    /// stream failed with `.internalError` and the mux sent a `cancel` back at a peer that had just
+    /// terminated *cleanly* -- it sent a status, and the grammar was obeyed. Codes 0...16 have been
+    /// frozen for years, so nothing on the wire today produces this; the case exists so that a
+    /// newer peer sharing this wire format is not mistaken for a broken one.
+    ///
+    /// Both halves matter and both are asserted: the application must see a completed RPC with an
+    /// `unknown` status **and** nothing may go back out on the wire. A version that mapped the code
+    /// but still cancelled would pass the first assertion alone.
+    func testAnUnrecognizedGrpcStatusCodeCompletesTheRPCAsUnknown() throws {
+        let blob = RawOpBytes.offsetBlob(
+            RawOpBytes.op(
+                .status, streamID: 1,
+                body: RawOpBytes.fieldList([
+                    ("grpc-status", "17"),
+                    ("grpc-message", "from a newer peer"),
+                    ("x-trailer", "kept"),
+                ])))
+
+        // The codec itself is not where the mapping happens: it carries the raw code through.
+        let items = try Self.codec.decode(blob)
+        guard items.count == 1, case .op(.status(_, let code, _, _)) = items[0] else {
+            return XCTFail("expected one status op; got \(Self.describe(items))")
+        }
+        XCTAssertEqual(code, 17, "the codec moves the code verbatim; the mapping is the decoder's")
+
+        try runBounded("an unrecognized grpc-status at the mux", timeout: 20) {
+            let core = CoreUnderTest(role: .client, label: "unknown-status")
+            defer { core.shutDown() }
+            let opened = try core.core.openStream(
+                descriptor: MethodDescriptor(fullyQualifiedService: "pkg.Svc", method: "M"),
+                timeout: nil)
+            _ = core.pipe.takeSentOps()
+
+            core.pipe.deliverRaw(blob)
+
+            var status: Status?
+            var trailerKeys: [String] = []
+            for try await part in opened.stream.inbound {
+                if case .status(let received, let metadata) = part {
+                    status = received
+                    trailerKeys = metadata.map(\.key).sorted()
+                }
+            }
+            XCTAssertEqual(
+                status?.code, .unknown,
+                "gRPC maps an unrecognized status code to UNKNOWN; the application must see a "
+                    + "completed RPC, not a transport internal error")
+            XCTAssertEqual(
+                status?.message, "from a newer peer",
+                "the peer's own explanation of the code must survive the remap")
+            XCTAssertEqual(trailerKeys, ["x-trailer"], "and so must its trailers")
+
+            XCTAssertEqual(
+                core.pipe.takeSentOps().cancels(forStream: 1), [],
+                "a peer that terminated cleanly must not be answered with a cancel")
+            XCTAssertFalse(core.pipe.isCancelled, "and certainly not with a connection teardown")
+        }
+    }
+
+    /// `readBE` reads through `loadUnaligned` now, which means the byte offset it computes is
+    /// `index - data.startIndex` rather than `index`. A blob that starts at index 0 cannot tell
+    /// those apart, so this one does not: `offsetBlob` pads by 7, putting the header at index 7 and
+    /// a body at index 17 -- odd, and not a multiple of 4, so an alignment assumption would trap
+    /// rather than quietly succeed.
+    ///
+    /// Every big-endian field is covered at once: the header's `streamID` (offset 2) and
+    /// `bodyLength` (offset 6) are read off the padded header, and `credit`'s 4-byte body is read
+    /// off `body.startIndex`, the one call site whose index is a *body's* start rather than the
+    /// blob's.
+    func testBigEndianReadsAreOffsetFromTheBuffersOwnStartIndex() throws {
+        var creditBody = Data()
+        RawOpBytes.appendBE(UInt32(0xDEAD_BEEF), to: &creditBody)
+
+        for padding in [0, 1, 7, 13] {
+            let blob = RawOpBytes.offsetBlob(
+                RawOpBytes.op(.credit, streamID: 0x0102_0304, body: creditBody),
+                leadingPadding: padding)
+            XCTAssertEqual(
+                Self.describe(try Self.codec.decode(blob)),
+                ["op(credit(16909060, bytes: 3735928559))"],
+                "every offset must derive from the buffer's own startIndex (padding \(padding))")
+        }
+    }
+}
+
+// ===========================================================================================
+// MARK: - Counting the work a parser does
+// ===========================================================================================
+
+/// Counts how many elements a `Collection` handed out. A `final class` because the count has to
+/// survive the `struct` `Collection` being copied around by whatever generic algorithm is walking
+/// it; a `Mutex` because `runBounded` bodies are `@Sendable`.
+@available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
+final class FieldAccessCounter: Sendable {
+    private let box = Mutex<Int>(0)
+    func bump() { box.withLock { $0 += 1 } }
+    var accesses: Int { box.withLock { $0 } }
+}
+
+/// A `[HTTPField]` that reports every element read through it.
+///
+/// This is the seam `testParseRequestWalksAPeerSuppliedFieldListExactlyOnce` measures through, and
+/// the reason `GRPCWireHeaders.parseRequest` is generic over `Collection` rather than taking an
+/// `[HTTPField]`: an `Array` cannot tell anyone how many times it was walked, and the alternative
+/// -- asserting on elapsed time -- would measure the machine rather than the parser.
+///
+/// `Collection`'s default `makeIterator()` is `IndexingIterator`, which subscripts once per
+/// element, so `accesses` after one full walk is exactly `count`.
+@available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
+struct CountingFields: Collection {
+    private let fields: [HTTPField]
+    private let counter: FieldAccessCounter
+
+    init(_ fields: [HTTPField], counter: FieldAccessCounter) {
+        self.fields = fields
+        self.counter = counter
+    }
+
+    var startIndex: Int { fields.startIndex }
+    var endIndex: Int { fields.endIndex }
+    func index(after i: Int) -> Int { i + 1 }
+
+    subscript(position: Int) -> HTTPField {
+        counter.bump()
+        return fields[position]
+    }
 }

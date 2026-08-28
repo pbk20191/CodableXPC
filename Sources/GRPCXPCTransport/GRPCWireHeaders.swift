@@ -62,8 +62,9 @@ enum GRPCWireHeaders {
     /// Builds the header field list for a request's `HEADERS` frame.
     ///
     /// `path` is the already-slash-prefixed `:path` value (e.g.
-    /// `"/" + descriptor.fullyQualifiedMethod`); this type does not own `MethodDescriptor`
-    /// construction on the send side, only on `parseRequest`'s validation side.
+    /// `"/" + descriptor.fullyQualifiedMethod`); this type never constructs a `MethodDescriptor`
+    /// in either direction -- it moves the path as a string and validates its shape on the way
+    /// back in (``validateMethodPath(_:)``).
     static func request(path: String, timeout: Duration?, metadata: Metadata) -> [HTTPField] {
         var fields: [HTTPField] = [
             (methodPseudoHeader, methodValue),
@@ -92,54 +93,178 @@ enum GRPCWireHeaders {
     }
 
 
-    /// Parses a request's header field list.
+    /// Parses a request's header field list **in a single traversal**.
     ///
-    /// Validates `:path` by splitting it on the *last* `/` and constructing a
-    /// `MethodDescriptor(fullyQualifiedService:method:)` from the two halves --
-    /// `MethodDescriptor` has no `fullyQualifiedMethod` initializer, and its own
-    /// `fullyQualifiedMethod` accessor never includes the leading slash the `:path`
-    /// pseudo-header carries, so that split-then-reconstruct is the only way to confirm the path
-    /// names a real method shape before handing it onward. The returned `path` is the original
-    /// `:path` value (leading slash included), matching what `request(path:)` was given.
-    static func parseRequest(_ fields: [HTTPField]) throws(RPCError) -> ParsedRequest {
-        guard let path = firstValue(fields, forLoweredName: pathPseudoHeader) else {
+    /// Validates `:path` by splitting it on the *last* `/` and requiring both halves to be
+    /// non-empty (see ``validateMethodPath(_:)``). The returned `path` is the original `:path`
+    /// value (leading slash included), matching what `request(path:)` was given.
+    ///
+    /// **One pass, and that is a security property, not a micro-optimisation.** This function --
+    /// via `CompactWireCodec.decode` -- runs on an `openStream` body *before* `RPCTransportCore`
+    /// has decided whether the peer is even allowed to open another stream, so every byte of work
+    /// it does is work an unauthenticated peer can command at will. `count` is a peer-chosen
+    /// `UInt16`, so a single ~393 KB `openStream` body can declare 65,535 fields; the previous
+    /// shape walked the list three times (`:path`, then `grpc-timeout`, then user metadata) and
+    /// allocated a lowercased `String` for every name on every walk, which turned that one message
+    /// into ~200,000 `String` allocations. Adding a fourth lookup, or reintroducing a
+    /// `fields.first { $0.name.lowercased() == … }` helper, puts that amplification straight back.
+    ///
+    /// `fields` is any `Collection`, not just `[HTTPField]`, so a test can hand in a collection
+    /// that counts element accesses and assert the single-pass property directly rather than
+    /// asserting on wall-clock time -- see `WireProtocolTests`.
+    ///
+    /// Rejection precedence is deliberately unchanged from the three-pass version: a missing
+    /// `:path` beats a malformed one, which beats a malformed `grpc-timeout`, which beats a
+    /// malformed `-bin` metadata value. Because the single pass now reaches a bad `-bin` value
+    /// *before* the path and timeout have been examined, that error is held in
+    /// `deferredMetadataError` and rethrown last instead of escaping where it was raised.
+    static func parseRequest<Fields: Collection>(_ fields: Fields) throws(RPCError) -> ParsedRequest
+    where Fields.Element == HTTPField {
+        var path: String?
+        var rawTimeout: String?
+        var metadata = Metadata()
+        var deferredMetadataError: RPCError?
+
+        for field in fields {
+            switch classify(field.name) {
+            case .path:
+                // `firstValue` took the first match; so does this.
+                if path == nil { path = field.value }
+            case .timeout:
+                if rawTimeout == nil { rawTimeout = field.value }
+            case .reserved:
+                continue
+            case .userMetadata(let key):
+                // Once a `-bin` value has failed, the rest of the metadata is going to be thrown
+                // away with it -- but the walk must continue, since `:path` may still be ahead.
+                guard deferredMetadataError == nil else { continue }
+                if key.hasSuffix(binaryKeySuffix) {
+                    do {
+                        metadata.addBinary(try parseBase64(field.value), forKey: key)
+                    } catch {
+                        deferredMetadataError = error
+                    }
+                } else {
+                    metadata.addString(field.value, forKey: key)
+                }
+            }
+        }
+
+        guard let path else {
             throw RPCError(code: .invalidArgument, message: "request is missing the ':path' pseudo-header")
         }
         try validateMethodPath(path)
 
         var timeout: Duration?
-        if let rawTimeout = firstValue(fields, forLoweredName: timeoutHeader) {
+        if let rawTimeout {
             timeout = try parseTimeout(rawTimeout)
         }
 
-        let metadata = try parseUserMetadata(fields)
+        if let deferredMetadataError { throw deferredMetadataError }
         return ParsedRequest(path: path, timeout: timeout, metadata: metadata)
     }
 
 
-    /// Splits `path` (leading slash optionally present) on the last `/` into service and method,
-    /// then constructs a `MethodDescriptor` to confirm both halves are non-empty. The descriptor
-    /// itself is discarded -- callers downstream (Task 6) reconstruct their own from `path` --
-    /// this exists purely to reject a malformed `:path` here rather than downstream.
+    /// Splits `path` (leading slash optionally present) on the last `/` into service and method
+    /// and requires both halves to be non-empty -- the whole of what "a real method shape" means
+    /// here. Callers downstream reconstruct their own `MethodDescriptor` from `path`; this exists
+    /// purely to reject a malformed `:path` at the boundary rather than downstream.
+    ///
+    /// It deliberately does *not* build a `MethodDescriptor` of its own.
+    /// `MethodDescriptor(fullyQualifiedService:method:)` is a non-failable memberwise initialiser
+    /// that stores both strings and validates nothing, so a discarded `_ = MethodDescriptor(…)`
+    /// here checked exactly nothing while reading like a validation step. The two `guard`s above
+    /// are the validation.
     private static func validateMethodPath(_ path: String) throws(RPCError) {
         let withoutLeadingSlash = path.hasPrefix("/") ? String(path.dropFirst()) : path
         guard let lastSlash = withoutLeadingSlash.lastIndex(of: "/") else {
             throw RPCError(code: .unimplemented, message: "malformed ':path' value: '\(path)'")
         }
-        let service = String(withoutLeadingSlash[withoutLeadingSlash.startIndex..<lastSlash])
-        let method = String(withoutLeadingSlash[withoutLeadingSlash.index(after: lastSlash)...])
+        let service = withoutLeadingSlash[withoutLeadingSlash.startIndex..<lastSlash]
+        let method = withoutLeadingSlash[withoutLeadingSlash.index(after: lastSlash)...]
         guard !service.isEmpty, !method.isEmpty else {
             throw RPCError(code: .unimplemented, message: "malformed ':path' value: '\(path)'")
         }
-        _ = MethodDescriptor(fullyQualifiedService: service, method: method)
     }
 
+    // =======================================================================================
+    // MARK: - Field-name classification (allocation-free for ASCII names)
+    // =======================================================================================
 
-    /// First field value whose lowercased name matches `loweredName`. Header names are
-    /// case-insensitive on the wire (HTTP/2 requires lowercase, but a decoded field is only as
-    /// trustworthy as the peer that sent it), so every lookup in this type goes through here.
-    private static func firstValue(_ fields: [HTTPField], forLoweredName loweredName: String) -> String? {
-        fields.first { $0.name.lowercased() == loweredName }?.value
+    /// What one inbound field name is, decided once per field.
+    private enum FieldRole {
+        /// The `:path` pseudo-header.
+        case path
+        /// The `grpc-timeout` header.
+        case timeout
+        /// Some other name gRPC or HTTP/2 owns; never becomes user metadata.
+        case reserved
+        /// Ordinary user metadata, under its lowercased key.
+        case userMetadata(key: String)
+    }
+
+    /// Classifies one field name without allocating, for the ASCII names the wire format actually
+    /// permits (`Header-Name → 1*( %x30-39 / %x61-7A / "_" / "-" / "." )`, plus the `:`-prefixed
+    /// pseudo-headers, plus whatever ASCII case a non-conforming peer chose).
+    ///
+    /// **Non-ASCII names still go through `lowercased()`, and that is not laziness.** A handful of
+    /// non-ASCII scalars case-fold *into* ASCII -- U+212A KELVIN SIGN lowercases to `"k"` -- so an
+    /// ASCII-only fold would silently change which names match and which key a value is stored
+    /// under. Everything below the `guard` is therefore an exact fast path for all-ASCII names,
+    /// not a redefinition of the matching rule: the `else` branch is byte-for-byte the old
+    /// behaviour, and both branches classify in the same order.
+    ///
+    /// The ASCII path allocates a `String` only for a user-metadata name that actually contains an
+    /// uppercase byte; a name already lowercase (every name a conforming peer sends, and every
+    /// name this file's own encoder emits) is passed through by reference.
+    private static func classify(_ name: String) -> FieldRole {
+        guard name.utf8.allSatisfy({ $0 < 0x80 }) else {
+            return classifyLowered(name.lowercased())
+        }
+        // `:path` and `grpc-timeout` are themselves reserved names, so they must be recognised
+        // before the reserved-name filter swallows them.
+        if asciiCaseInsensitiveEquals(name, pathPseudoHeader) { return .path }
+        if asciiCaseInsensitiveEquals(name, timeoutHeader) { return .timeout }
+        if name.utf8.first == UInt8(ascii: ":") { return .reserved }
+        if asciiCaseInsensitiveHasPrefix(name, grpcReservedPrefix) { return .reserved }
+        if asciiCaseInsensitiveEquals(name, teHeader) { return .reserved }
+        if asciiCaseInsensitiveEquals(name, contentTypeHeader) { return .reserved }
+        let hasUppercase = name.utf8.contains { (0x41...0x5A).contains($0) }
+        return .userMetadata(key: hasUppercase ? name.lowercased() : name)
+    }
+
+    /// The same decision as ``classify(_:)``, spelled against an already-lowercased name -- the
+    /// slow path for the non-ASCII names `classify` refuses to fold itself.
+    private static func classifyLowered(_ loweredName: String) -> FieldRole {
+        if loweredName == pathPseudoHeader { return .path }
+        if loweredName == timeoutHeader { return .timeout }
+        if isReservedName(loweredName) { return .reserved }
+        return .userMetadata(key: loweredName)
+    }
+
+    /// `byte`, lowercased if it is an ASCII uppercase letter.
+    private static func asciiLowered(_ byte: UInt8) -> UInt8 {
+        (0x41...0x5A).contains(byte) ? byte &+ 0x20 : byte
+    }
+
+    /// `name == loweredASCII`, ignoring ASCII case, with no intermediate `String`.
+    ///
+    /// - Precondition: `name` contains no byte `>= 0x80` (``classify(_:)`` has already checked),
+    ///   and `loweredASCII` is one of this type's lowercase ASCII name constants.
+    private static func asciiCaseInsensitiveEquals(_ name: String, _ loweredASCII: String) -> Bool {
+        guard name.utf8.count == loweredASCII.utf8.count else { return false }
+        return zip(name.utf8, loweredASCII.utf8).allSatisfy { asciiLowered($0) == $1 }
+    }
+
+    /// `name.hasPrefix(loweredASCII)`, ignoring ASCII case, with no intermediate `String`.
+    ///
+    /// - Precondition: as ``asciiCaseInsensitiveEquals(_:_:)``.
+    private static func asciiCaseInsensitiveHasPrefix(_ name: String, _ loweredASCII: String) -> Bool {
+        var nameBytes = name.utf8.makeIterator()
+        for target in loweredASCII.utf8 {
+            guard let byte = nameBytes.next(), asciiLowered(byte) == target else { return false }
+        }
+        return true
     }
 
     // =======================================================================================
@@ -197,11 +322,15 @@ enum GRPCWireHeaders {
     /// already guarantees by construction) but has no way to reject bad *bytes*, so the base64
     /// decode failure has to be caught on this side of the boundary or it doesn't get caught at
     /// all.
+    /// Shares ``classify(_:)`` with `parseRequest` rather than lowercasing each name itself: this
+    /// runs on every inbound `metadata` op and every `status` op's trailers, all of which are
+    /// peer-sized field lists too, so the same allocation-free ASCII path applies. `.path` and
+    /// `.timeout` are both reserved names, so they are dropped here exactly as `isReservedName`
+    /// dropped them before.
     static func parseUserMetadata(_ fields: [HTTPField]) throws(RPCError) -> Metadata {
         var metadata = Metadata()
         for field in fields {
-            let loweredKey = field.name.lowercased()
-            guard !isReservedName(loweredKey) else { continue }
+            guard case .userMetadata(let loweredKey) = classify(field.name) else { continue }
 
             if loweredKey.hasSuffix(binaryKeySuffix) {
                 let bytes = try parseBase64(field.value)
