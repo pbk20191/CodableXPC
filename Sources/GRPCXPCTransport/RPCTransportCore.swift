@@ -673,10 +673,18 @@ final class RPCTransportCore: Sendable {
 
         case .cancel(let streamID, let reason):
             // Contract line 6. No `cancel` is sent back -- see above.
+            //
+            // `reason` is the peer's, and the decode path applies no per-field cap to it -- only
+            // `CompactWireCodec`'s 16 MiB `maxBodyLength`. Interpolating it whole would hand the
+            // application (and every log that prints it) a 16 MiB `RPCError` message, which is the
+            // same unbounded in-process allocation `failStream` and `cancelStream` already refuse.
+            // This was the one sink that skipped it.
             removeStream(
                 streamID,
                 failingInboundWith: RPCError(
-                    code: .cancelled, message: "the peer cancelled stream \(streamID): \(reason)"),
+                    code: .cancelled,
+                    message: "the peer cancelled stream \(streamID): "
+                        + Self.truncatedForWire(reason)),
                 sendingCancel: nil)
 
         case .openStream(let streamID, let method, let timeout):
@@ -1251,6 +1259,41 @@ final class RPCTransportCore: Sendable {
         }
     }
 
+    /// Whether `id` still has an entry in the registry -- i.e. whether the stream is alive at all.
+    ///
+    /// ``OutboundOpWriter`` asks before every send, **including the ones that carry no flow-control
+    /// charge**, and that is the whole point: a `metadata` or `halfClose` consults nothing else, so
+    /// before this existed the writer's *first* write could put `[openStream, metadata]` on the
+    /// wire after ``removeStream(_:failingInboundWith:sendingCancel:)`` had already sent
+    /// `cancel(id)` for the same stream. `openStream` is deferred to that first write (see
+    /// ``openStream(descriptor:timeout:)``), so the gap between "registered, deadline armed" and
+    /// "the peer has heard of this stream" is as long as the caller takes to write -- and a
+    /// deadline firing inside it is reachable, not theoretical.
+    ///
+    /// The peer's view of that reordering was the damage: it drops the `cancel` for an id it has
+    /// never seen, then admits the stream and runs a handler for an RPC the client has already
+    /// abandoned, and (with no deadline of its own) holds a `maxConcurrentInboundStreams` slot
+    /// until the connection is torn down. The client cannot repair it either -- its own entry is
+    /// already gone, so a later `cancelStream` finds nothing and returns `false`.
+    ///
+    /// - Note: the check is not atomic with the send that follows it; nothing short of sending
+    ///   under the registry lock could be, and L7 forbids that. It is taken **inside the writer's
+    ///   encoder lock, immediately before `pipe.send`**, which is as tight as this can be made: a
+    ///   removal that has not yet reached the table when the check runs is a removal that had not
+    ///   happened, and one that has is refused. What is closed is the arbitrarily long window --
+    ///   an entire deadline's worth -- not the few instructions at the end of it.
+    fileprivate func streamIsOpen(_ id: RPCStreamID) -> Bool {
+        registry.withLock { $0.streams[id] != nil }
+    }
+
+    /// The error a write refused by ``streamIsOpen(_:)`` reports. `.unavailable` rather than
+    /// `.internalError`: the stream really is gone from under the caller (a deadline, a peer
+    /// `cancel`, a teardown), which is not a caller mistake -- and it matches what
+    /// ``reserveOutboundWindow(_:forStream:)`` already throws for the same condition.
+    fileprivate func streamNoLongerOpen(_ id: RPCStreamID) -> RPCError {
+        RPCError(code: .unavailable, message: "stream \(id) is no longer open on this connection")
+    }
+
     /// Encodes and sends ops the caller has already accounted for. The one outbound path; every
     /// op this file emits goes through here or through ``sendControl(_:)``.
     ///
@@ -1301,7 +1344,7 @@ final class RPCTransportCore: Sendable {
     /// Detection compares `endIndex` rather than counting, so the common short-string case stays
     /// O(1) instead of walking a possibly enormous string.
     ///
-    /// **Four uses, of which two are wire-bound.** The count was right before; the
+    /// **Five uses, of which two are wire-bound.** The count was right before; the
     /// characterisation was not, and a reader would have concluded that every wire-bound peer text
     /// funnels through one place. It does not:
     ///
@@ -1312,11 +1355,14 @@ final class RPCTransportCore: Sendable {
     ///     refusal, which interpolates the peer's `method` (up to the codec's 16 MiB body cap) into
     ///     a `status` op. It is truncated at that site because it never reaches `removeStream`: no
     ///     table entry is created for a refused open.
-    ///   * **local** -- ``cancelStream(_:reason:)``'s error text and ``failStream(_:dueTo:)``'s
-    ///     error text. Bounded not because they cross the wire but because an unbounded in-process
-    ///     message is still an unbounded allocation.
+    ///   * **local** -- ``cancelStream(_:reason:)``'s error text, ``failStream(_:dueTo:)``'s error
+    ///     text, and ``route(_:)``'s `.cancel` case, which interpolates the **peer's** `reason`
+    ///     into the `RPCError` the application sees. Bounded not because they cross the wire but
+    ///     because an unbounded in-process message is still an unbounded allocation -- and the
+    ///     `.cancel` one is peer-chosen, so it is the same hostile input as the wire-bound uses,
+    ///     merely pointed inwards.
     ///
-    /// When you add a fifth use, say which class it is in as well as updating the count. This
+    /// When you add a sixth use, say which class it is in as well as updating the count. This
     /// sentence has now gone stale twice: once on the count, once on the classification.
     static func truncatedForWire(_ text: String) -> String {
         let head = text.utf8.prefix(maxWireReasonLength)
@@ -1923,6 +1969,11 @@ extension ResponseOpEncoder: OutboundOpEncoding {
 /// `finish()` on a writer whose `write` has already failed, so without this flag an ordinary
 /// grammar error would become a process trap. Once dead, `write` throws without touching the
 /// encoder and `finish()` is a no-op.
+///
+/// It carries a second class of death, added later: a stream that has been **removed from the
+/// registry** under the writer. Both `write` and `finish` ask `RPCTransportCore.streamIsOpen(_:)`
+/// before they touch the encoder, and a refusal is permanent for this instance -- see that
+/// function for why an unchecked write is worse than futile on the first one.
 @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
 final class OutboundOpWriter<Encoder: OutboundOpEncoding>: ClosableRPCWriterProtocol {
     typealias Element = Encoder.Part
@@ -1986,6 +2037,16 @@ final class OutboundOpWriter<Encoder: OutboundOpEncoding>: ClosableRPCWriterProt
         do {
             try state.withLock { state in
                 guard !state.isDead else { throw streamDead() }
+                // The stream may have been retired while this write was queued behind the lock or
+                // parked on credit -- a fired deadline, a peer `cancel`, a teardown. Sending
+                // anyway is not merely futile: on the *first* write it puts the deferred
+                // `openStream` on the wire behind the `cancel` the removal already sent, and
+                // opens a stream on the peer that nothing will ever close. See
+                // `RPCTransportCore.streamIsOpen(_:)`.
+                guard core.streamIsOpen(streamID) else {
+                    state.isDead = true
+                    throw core.streamNoLongerOpen(streamID)
+                }
                 do {
                     try core.sendEncoded(state.encoder.encode(element))
                 } catch {
@@ -2021,6 +2082,14 @@ final class OutboundOpWriter<Encoder: OutboundOpEncoding>: ClosableRPCWriterProt
 
         let ops: [RPCOp]? = state.withLock { state in
             guard !state.isDead else { return nil }
+            // Same refusal as `write(_:)`, and for the same reason: `finish()` on a request that
+            // never wrote anything emits the deferred `openStream` alongside `halfClose`, so a
+            // retired stream must not reach the encoder here either. Silent, because this method
+            // has no caller to report to.
+            guard core.streamIsOpen(streamID) else {
+                state.isDead = true
+                return nil
+            }
             do {
                 return try state.encoder.finish()
             } catch {
