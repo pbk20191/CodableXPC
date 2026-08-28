@@ -553,16 +553,13 @@ public final class XPCServerTransport: ServerTransport {
                 code: .failedPrecondition,
                 message: "only an anonymous XPCServerTransport has an endpoint to dial")
         }
-        let queue = DispatchSerialQueue(
-            label: ConnectionQueueLabel.mint(role: "client", peer: "endpoint"))
-        var built: RPCTransportCore?
-        // The returned pipe is discarded: `built` holds it strongly. Handlers are installed by
-        // `RPCTransportCore.init`, weakly -- never here.
-        _ = try XPCPipe.connecting(to: endpoint, queue: queue) { pipe in
-            built = RPCTransportCore(pipe: pipe, codec: CompactWireCodec(), role: .client)
-        }
-        guard let core = built else {
-            preconditionFailure("XPCPipe.connecting did not run its `building` closure")
+        // The recipe -- queue, `building`, pipe retention, handler installation -- is
+        // `XPCClientTransport.dialledCore(peer:_:)`'s, and is documented there. All this file
+        // contributes is the one step the client file cannot: naming `XPCEndpoint`. The returned
+        // pipe is discarded because the core holds it; that too is the factory's invariant, not a
+        // local choice.
+        let (core, _) = try XPCClientTransport.dialledCore(peer: "endpoint") { queue, building in
+            try XPCPipe.connecting(to: endpoint, queue: queue, building: building)
         }
         return XPCClientTransport(core: core)
     }

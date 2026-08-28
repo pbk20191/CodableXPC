@@ -68,6 +68,9 @@ final class TestPipe: MessagePipe, @unchecked Sendable {
         /// When set, ``send(_:)`` throws this instead of recording -- for the "the substrate is
         /// gone" arm of a test that has nothing to do with XPC.
         var sendFailure: (any Error)?
+        /// See ``onEachSend(_:)``. Nil for every test that does not ask for it, which is all but
+        /// one.
+        var sendObserver: (@Sendable (GRPCSwiftData) -> Void)?
     }
 
     private let state = Mutex(State())
@@ -82,6 +85,10 @@ final class TestPipe: MessagePipe, @unchecked Sendable {
     // -------------------------------------------------------------------------------------
 
     func send(_ blob: GRPCSwiftData) throws {
+        // Read under the lock, called **outside** it. An observer runs inside whatever core call
+        // is doing the sending, and may reach back into the core or the transport above it; doing
+        // that with this pipe's lock held would deadlock the moment it sent anything.
+        if let observer = state.withLock({ $0.sendObserver }) { observer(blob) }
         try state.withLock { state in
             if let failure = state.sendFailure { throw failure }
             guard !state.isCancelled else {
@@ -130,6 +137,24 @@ final class TestPipe: MessagePipe, @unchecked Sendable {
     /// `sendControl(_:)` is documented as dropping its failure "here and only here". Read by
     /// `WireProtocolTests.testARefusalThatCannotBeSentIsDroppedNotFatal`.
     func failNextSends(with error: any Error) { state.withLock { $0.sendFailure = error } }
+
+    /// Installs a hook run **on the sending thread, inside the core call that is sending**, before
+    /// the blob is recorded.
+    ///
+    /// This is the suite's one deterministic way to stand *in the middle of* a core operation
+    /// rather than before or after it, and it exists because one of this transport's ordering
+    /// defects is only observable there: `beginGracefulShutdown()` calls `core.beginDraining()`,
+    /// which sets the mux's `localDraining` flag and then sends `goAway` -- so a hook that blocks
+    /// here holds the process at exactly the instant "the mux is draining, and the transport's own
+    /// shutdown bookkeeping has not finished". A test that hoped to hit that window by racing
+    /// would be sampling a distribution; this one stops time in it.
+    ///
+    /// Blocking in here is the intended use. Blocking *forever* is not: the observer runs on
+    /// whatever thread called `send`, so give it its own bound (L8 applies to the hook as much as
+    /// to the test).
+    func onEachSend(_ observer: @escaping @Sendable (GRPCSwiftData) -> Void) {
+        state.withLock { $0.sendObserver = observer }
+    }
 
     /// Encodes `ops` into one blob and delivers it, exactly as a peer's single XPC message would.
     func deliver(_ ops: [RPCOp]) throws {

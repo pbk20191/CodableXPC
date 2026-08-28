@@ -97,6 +97,88 @@ final class DrainTests: XCTestCase {
         }
     }
 
+    /// A local shutdown is not blamed on the peer **from inside `beginGracefulShutdown()` itself**
+    /// -- the one window the test above cannot reach.
+    ///
+    /// ``testALocalShutdownRefusesNewStreamsWithFailedPrecondition()`` calls
+    /// `beginGracefulShutdown()` and then opens a stream, so by the time it looks, both of the
+    /// shutdown's two writes have landed. But they are two writes, not one, and they are not
+    /// ordered by anything the type system can see:
+    ///
+    /// * `core.beginDraining()` sets the mux's `localDraining` (which makes `core.isDraining` true
+    ///   for the rest of this connection's life), and
+    /// * `state.phase`/`localShutdownRequested` records that **this side** is the one shutting
+    ///   down, which is what tells `withStream` whose fault it is.
+    ///
+    /// With the mux's flag landing first, a `withStream` running in between passed the local gate
+    /// (nothing said "shutting down" yet), saw `core.isDraining`, re-read the local state, still
+    /// found nothing -- and refused with the *peer's* code and the peer's message: `.unavailable`,
+    /// "the peer sent goAway". That is a retryable, backoff-and-try-again answer for a shutdown
+    /// this process asked for and will never revoke, and `withStream`'s own contract gives the two
+    /// codes distinct meanings, so it is a lie a caller acts on rather than a cosmetic mislabel.
+    ///
+    /// # Why this is deterministic and not a race the test hopes to win
+    ///
+    /// `beginDraining()` sets `localDraining` under the registry lock and *then* puts `goAway` on
+    /// the wire through `pipe.send`. So a `TestPipe` whose ``TestPipe/onEachSend(_:)`` hook blocks
+    /// stops the shutdown at precisely the instant the window exists -- mux draining, transport
+    /// bookkeeping unfinished -- and holds it there until the probe has had its answer. Nothing
+    /// here is timing-dependent, retried, or load-sensitive: the window is *held open*, not
+    /// sampled. (This suite has been burned once by a retry-until-it-races design that turned out
+    /// to be sampling a warmth-dependent distribution.)
+    ///
+    /// The shutdown runs on a `DispatchQueue.global()` thread rather than in a `Task` for the
+    /// blocking's sake: it parks that thread inside the hook, and parking one of the cooperative
+    /// pool's threads instead would risk starving the probe that is supposed to release it.
+    ///
+    /// The assertion is on the *outcome* -- the code and the message a caller sees -- not on which
+    /// of `withStream`'s two gates produced it. Both gates deliberately share one constant (see
+    /// the note on the test above), and which one fires is an implementation detail; "a local
+    /// shutdown never reads as the peer's" is the property.
+    func testALocalDrainIsNotBlamedOnThePeerFromInsideTheShutdown() throws {
+        let pipe = TestPipe(label: "shutdownFlagOrder")
+        let core = RPCTransportCore(pipe: pipe, codec: CompactWireCodec(), role: .client)
+        let transport = XPCClientTransport(core: core)
+
+        let drainIsMidFlight = OneShotGate()
+        let probeHasItsAnswer = DispatchSemaphore(value: 0)
+
+        pipe.onEachSend { _ in
+            drainIsMidFlight.open()
+            // Bounded, so a regression that never releases this cannot hang the suite (L8) --
+            // `runBounded` bounds the test's own task, not this thread.
+            _ = probeHasItsAnswer.wait(timeout: .now() + 15)
+        }
+
+        let refusal = try runBounded("a local drain must not be blamed on the peer", timeout: 20) {
+            () -> RPCError? in
+            DispatchQueue.global().async { transport.beginGracefulShutdown() }
+            await drainIsMidFlight.wait()
+            defer { probeHasItsAnswer.signal() }
+
+            do {
+                _ = try await transport.withStream(
+                    descriptor: LifecycleMethods.echo, options: .defaults
+                ) { _, _ in }
+                return nil
+            } catch let error as RPCError {
+                return error
+            }
+        }
+
+        guard let refusal else {
+            XCTFail("withStream must refuse a new call once a local shutdown has begun")
+            return
+        }
+        XCTAssertEqual(
+            refusal.code, .failedPrecondition,
+            "a local shutdown is permanent, so even mid-shutdown the refusal must be "
+                + ".failedPrecondition and not the retryable .unavailable")
+        XCTAssertTrue(
+            refusal.message.contains("this transport has begun shutting down"),
+            "the refusal must name this side's shutdown, not the peer's goAway: " + refusal.message)
+    }
+
     /// The **peer's** `goAway` refuses new streams with `.unavailable`, and does not disturb the
     /// stream already open.
     ///

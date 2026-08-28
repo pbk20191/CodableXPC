@@ -171,10 +171,9 @@ enum XPCPairHarness {
     /// transport dialled at its endpoint, runs `body`, then shuts both down gracefully and waits
     /// for both to stop.
     ///
-    /// Shutdown order is client first, then server: closing the client's session is what makes the
-    /// server see peer death and retire the connection, so the server's own drain then has nothing
-    /// left to wait for. Both are graceful -- nothing here cancels a task, so this path exercises
-    /// the drain rather than the forceful teardown.
+    /// The bring-up/run/shut-down sequence itself, and the rule about whose error the caller sees,
+    /// are ``run(_:serving:driving:shuttingDown:expectingRoughTeardown:_:)``'s -- including the
+    /// client-first shutdown order and why it is that way round.
     ///
     /// - Important: **`body` must issue at least one RPC.** `GRPCClient.beginGracefulShutdown()` on
     ///   a client that has not started yet moves it straight to `.stopped` **without** telling the
@@ -203,44 +202,16 @@ enum XPCPairHarness {
             client: GRPCClient(transport: transports.client),
             server: GRPCServer(transport: transports.server, router: router))
 
-        return try await withThrowingTaskGroup(of: Void.self, returning: Result.self) { group in
-            group.addTask { try await pair.server.serve() }
-            group.addTask { try await pair.client.runConnections() }
-
-            // Kept rather than propagated, so the shutdown below happens on the failing path too:
-            // a body that threw must still take both halves down, or a listener and two sessions
-            // leak into every test that follows.
-            let outcome: Swift.Result<Result, any Error>
-            do {
-                outcome = .success(try await body(pair))
-            } catch {
-                outcome = .failure(error)
-            }
-
-            pair.client.beginGracefulShutdown()
-            pair.server.beginGracefulShutdown()
-
-            // **The body's error wins.** A broken body usually makes the teardown fail too, and
-            // the teardown's error is the derived one -- reporting it would name the symptom and
-            // hide the cause.
-            //
-            // When the body *succeeded*, a teardown error is thrown by default: silently
-            // swallowing "the drain never finished" would hide a real transport defect behind a
-            // green test, which is the worse of the two failure modes for a suite whose whole job
-            // is to find them. But it does mean a test whose asserted property held can still fail
-            // with an error pointing at `waitForAll()` rather than at anything it asserted -- so a
-            // test that has deliberately made the teardown rough passes
-            // `expectingRoughTeardown: true` and gets its value regardless.
-            var teardownError: (any Error)?
-            do {
-                try await group.waitForAll()
-            } catch {
-                teardownError = error
-            }
-            let value = try outcome.get()
-            if let teardownError, !expectingRoughTeardown { throw teardownError }
-            return value
-        }
+        return try await run(
+            pair,
+            serving: { try await pair.server.serve() },
+            driving: { try await pair.client.runConnections() },
+            shuttingDown: {
+                pair.client.beginGracefulShutdown()
+                pair.server.beginGracefulShutdown()
+            },
+            expectingRoughTeardown: expectingRoughTeardown,
+            body)
     }
 
     /// The raw transport seam: `listen(streamHandler:)` and `connect()` running, no gRPC runtime.
@@ -258,22 +229,70 @@ enum XPCPairHarness {
     ) async throws -> Result {
         let pair = try XPCTransportPair.make()
 
-        return try await withThrowingTaskGroup(of: Void.self, returning: Result.self) { group in
-            group.addTask { try await pair.server.listen(streamHandler: streamHandler) }
-            group.addTask { try await pair.client.connect() }
+        return try await run(
+            pair,
+            serving: { try await pair.server.listen(streamHandler: streamHandler) },
+            driving: { try await pair.client.connect() },
+            shuttingDown: {
+                pair.client.beginGracefulShutdown()
+                pair.server.beginGracefulShutdown()
+            },
+            expectingRoughTeardown: expectingRoughTeardown,
+            body)
+    }
+
+    /// **The teardown policy, written once.** Both entry points above differ only in what they
+    /// run in the group, what they hand the body and what they shut down; the rule about *whose
+    /// error wins* is one rule and belongs in one place, not restated per entry point where the
+    /// two copies can drift.
+    ///
+    /// What it does, in order:
+    ///
+    /// 1. runs `serving` and `driving` as the group's two long-lived tasks;
+    /// 2. runs `body`, **keeping** its outcome rather than propagating it, so that step 3 happens
+    ///    on the failing path too -- a body that threw must still take both halves down, or a
+    ///    listener and two sessions leak into every test that follows;
+    /// 3. calls `shuttingDown`, which every caller implements as **client first, then server**:
+    ///    closing the client's session is what makes the server see peer death and retire the
+    ///    connection, so the server's own drain then has nothing left to wait for. Both are
+    ///    graceful -- nothing here cancels a task, so this path exercises the drain rather than
+    ///    the forceful teardown;
+    /// 4. waits for both tasks, and decides which error the caller sees.
+    ///
+    /// **The body's error wins.** A broken body usually makes the teardown fail too, and the
+    /// teardown's error is the derived one -- reporting it would name the symptom and hide the
+    /// cause.
+    ///
+    /// When the body *succeeded*, a teardown error is thrown by default: silently swallowing "the
+    /// drain never finished" would hide a real transport defect behind a green test, which is the
+    /// worse of the two failure modes for a suite whose whole job is to find them. But it does
+    /// mean a test whose asserted property held can still fail with an error pointing at
+    /// `waitForAll()` rather than at anything it asserted -- so a test that has deliberately made
+    /// the teardown rough passes `expectingRoughTeardown: true` and gets its value regardless.
+    ///
+    /// No timeout here either: wrap the call in
+    /// ``XCTestCase/runBounded(_:timeout:file:line:_:)``, which is where L8 lives.
+    private static func run<Subject: Sendable, Result: Sendable>(
+        _ subject: Subject,
+        serving: @escaping @Sendable () async throws -> Void,
+        driving: @escaping @Sendable () async throws -> Void,
+        shuttingDown: @Sendable () -> Void,
+        expectingRoughTeardown: Bool,
+        _ body: @Sendable (Subject) async throws -> Result
+    ) async throws -> Result {
+        try await withThrowingTaskGroup(of: Void.self, returning: Result.self) { group in
+            group.addTask { try await serving() }
+            group.addTask { try await driving() }
 
             let outcome: Swift.Result<Result, any Error>
             do {
-                outcome = .success(try await body(pair))
+                outcome = .success(try await body(subject))
             } catch {
                 outcome = .failure(error)
             }
 
-            pair.client.beginGracefulShutdown()
-            pair.server.beginGracefulShutdown()
+            shuttingDown()
 
-            // As above: see ``withPair(router:expectingRoughTeardown:_:)`` for why a teardown
-            // error is thrown by default and when to opt out.
             var teardownError: (any Error)?
             do {
                 try await group.waitForAll()

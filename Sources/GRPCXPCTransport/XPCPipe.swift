@@ -37,8 +37,11 @@ import XPC
 //    and hoping; it is achieved *structurally*, by never calling a handler inline from a libxpc
 //    callback. Every callback body is `queue.async { ... }` against the very same
 //    `DispatchSerialQueue` object that the `queue` property returns (`delivery.queue` in both
-//    cases -- one stored property, not two queues configured alike). `setTargetQueue(queue)` is
-//    still called, so the hop is usually a same-queue re-enqueue rather than a thread switch.
+//    cases -- one stored property, not two queues configured alike). The session is pointed at
+//    that queue all the same -- **once**, and by whichever route its kind allows: a dialled
+//    session gets it as the initializer's `targetQueue:` argument, an accepted one through
+//    `setTargetQueue(queue)` (it is handed back already built, so there is no initializer to pass
+//    it to) -- so the hop is usually a same-queue re-enqueue rather than a thread switch.
 //    **Affinity** does not depend on that call having taken effect -- the hop alone guarantees it.
 //    **Ordering does**, and the two must not be conflated: order survives only because libxpc
 //    issues one session's inbound callbacks serially, and pointing the session at a
@@ -469,8 +472,9 @@ final class XPCPipe: MessagePipe {
     private let state: Mutex<State>
 
     /// See ``MessagePipe/queue``. This returns the *stored* queue -- the same object every
-    /// `async` in ``Delivery`` targets and the same object handed to `setTargetQueue`. There is
-    /// one queue here, not one exposed and one used.
+    /// `async` in ``Delivery`` targets and the same object the session is pointed at (by
+    /// `targetQueue:` when dialled, by `setTargetQueue` when accepted). There is one queue here,
+    /// not one exposed and one used.
     var queue: DispatchSerialQueue { delivery.queue }
 
     /// Private: a pipe is only ever built by a factory, because the factories are what make
@@ -490,7 +494,11 @@ final class XPCPipe: MessagePipe {
             self.state = Mutex(State(phase: .running, sessionIsLive: false))
         case .dialled:
             // Inactive. Cancelling it now would trap; only a successful `activate()` earns that.
-            session.setTargetQueue(delivery.queue)
+            //
+            // Nothing is done to the session here, and in particular its target queue is *not*
+            // set: every dial factory already passed `targetQueue: queue` to the initializer, and
+            // `delivery.queue` is that same object. A third setting of it (this one, plus
+            // `dialling`'s) said nothing the first had not.
             self.state = Mutex(State(phase: .idle, sessionIsLive: false))
         }
     }
@@ -1018,7 +1026,9 @@ extension XPCPipe {
         session.setCancellationHandler { (_: XPCRichError) in
             delivery.peerDied()
         }
-        session.setTargetQueue(queue)
+        // No `setTargetQueue(queue)`: `makeSession` passed `targetQueue: queue` to the
+        // initializer -- step 1 above -- and this is the same queue object. Setting a session's
+        // target queue is not cumulative; the second call only restated the first.
         let pipe = XPCPipe(session: session, origin: .dialled, delivery: delivery)
         build(pipe)
         try pipe.activate()

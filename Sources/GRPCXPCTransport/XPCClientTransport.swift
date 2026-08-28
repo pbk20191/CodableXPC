@@ -105,6 +105,30 @@ public final class XPCClientTransport: ClientTransport {
 
         var phase: Phase = .idle
 
+        /// Raised by `beginGracefulShutdown()` **before** it calls `core.beginDraining()`, and
+        /// never lowered.
+        ///
+        /// It exists for one reason: to make "this side asked for the shutdown" observable no
+        /// later than the mux's own draining flag. `phase` cannot do that job, because the phase
+        /// transition needs `liveCalls`, and reading `liveCalls` means taking this lock -- which
+        /// `beginGracefulShutdown()` must not hold across `core.beginDraining()` (L7: that call
+        /// reaches libxpc through `pipe.send`). So the two updates cannot be one atomic step, and
+        /// the only remaining choice is which of them lands first.
+        ///
+        /// **They used to land in the wrong order**, and the window between them was reachable: a
+        /// `withStream` running there passed the gate below (`isShuttingDown` still false), saw
+        /// `core.isDraining` true, re-read the phase, still found `.idle` -- and reported a
+        /// purely local, permanent shutdown as `.unavailable` "the peer sent goAway", i.e. as
+        /// *retryable* and as *the peer's fault*. `withStream`'s contract gives those two codes
+        /// distinct meanings (`.failedPrecondition` = "closing or closed", `.unavailable` = "may
+        /// be possible after some backoff"), so a caller acts on the difference.
+        ///
+        /// This flag closes that window by landing first, which makes the implication one-way and
+        /// safe: *a local drain is visible here at least as early as it is visible in the mux*.
+        /// The opposite skew -- this true while `core.isDraining` is still false -- is harmless,
+        /// because the gate below already refuses with the local, permanent error.
+        var localShutdownRequested = false
+
         /// Calls that have claimed a slot in `withStream` and not yet released it. Claimed before
         /// `openStream`, released by a `defer`, so it counts exactly the window in which an RPC
         /// could still be running.
@@ -120,13 +144,19 @@ public final class XPCClientTransport: ClientTransport {
             }
         }
 
-        /// Whether new streams are refused. Both cases are **permanent** for this transport --
+        /// Whether new streams are refused. Every case is **permanent** for this transport --
         /// there is no reconnect -- which is why `withStream` reports them as
         /// `.failedPrecondition` rather than `.unavailable`.
+        ///
+        /// `localShutdownRequested` is part of the answer and not merely a hint at one: it is the
+        /// half of a local shutdown that is already visible while `beginGracefulShutdown()` is
+        /// still inside `core.beginDraining()`, and refusing there is exactly as correct as
+        /// refusing a moment later -- the shutdown has been asked for and will not be revoked.
         var isShuttingDown: Bool {
+            if localShutdownRequested { return true }
             switch phase {
-            case .idle, .connected: false
-            case .draining, .shutDown: true
+            case .idle, .connected: return false
+            case .draining, .shutDown: return true
             }
         }
     }
@@ -216,35 +246,73 @@ public final class XPCClientTransport: ClientTransport {
         try dialling(.xpcService(name))
     }
 
-    private static func dialling(_ peer: Peer) throws -> XPCClientTransport {
-        // One serial queue per connection (Task 5 §6.4). Nothing else may share it: the mux
-        // decodes and routes every inbound blob on it, and `XPCPipe.accepting` blocks on the
-        // queue it is handed.
+    /// **The one build-a-client-core recipe.** Mints the connection queue, builds the mux inside
+    /// `building`, and hands back both halves.
+    ///
+    /// Every dial in this package goes through here -- the two public factories above,
+    /// `XPCServerTransport.connectingClient()` (which dials an `XPCEndpoint`, a type this file may
+    /// not name), and the test suite's `InspectableXPCPair`. It was written out three times
+    /// before, invariant comments and all, which meant a change to pipe retention or handler
+    /// installation had to be made three times or the dial paths would diverge -- from each other,
+    /// and from the one the tests claim to be inspecting. This is not ordinary duplication to
+    /// tolerate: the accept/dial recipe is where both of this project's reproduced process deaths
+    /// lived.
+    ///
+    /// The invariants, all four of them, now stated once:
+    ///
+    /// * **One serial queue per connection** (Task 5 §6.4). Nothing else may share it: the mux
+    ///   decodes and routes every inbound blob on it, and `XPCPipe.accepting` blocks on the queue
+    ///   it is handed.
+    /// * **`building` installs no pipe handlers.** It constructs the core and nothing else;
+    ///   `RPCTransportCore.init` installs `onReceive`/`onPeerDeath` itself, and **weakly** (L6).
+    ///   Installing them here would *replace* the core's -- `XPCPipe`'s setters are set-once and
+    ///   trap on a `precondition` -- and silently disconnect the mux.
+    /// * **`building` runs synchronously**, inside the dial factory and before the session is
+    ///   activated, which is what makes the `guard` below unreachable and lets a `var` capture
+    ///   carry the core back out.
+    /// * **The pipe is not this function's to drop.** `core` holds it strongly, so the reference
+    ///   returned here is never its last one; a caller that wants only the transport discards it
+    ///   (`_ =`) and a caller whose *subject* is the pipe keeps it. Either is safe: a dialled
+    ///   pipe's one safe disposal is activate-then-cancel, and whichever of `core.close()` /
+    ///   `XPCPipe.deinit` gets there first performs exactly one cancel (the obligation is taken
+    ///   and cleared under the pipe's own lock). See `XPCPipe`'s disposal matrix.
+    ///
+    /// - Parameter peer: how the peer was named, for the queue label only -- see
+    ///   ``ConnectionQueueLabel``. Correctness never depends on it.
+    /// - Parameter dial: **exactly one of `XPCPipe`'s three dial factories**, applied to the queue
+    ///   and `building` closure this function supplies. A closure rather than a `Peer` case
+    ///   because `XPCEndpoint` cannot be named in this file (see ``Peer``), and the endpoint dial
+    ///   is one of the callers this recipe has to cover.
+    /// - Returns: the live core and the pipe it was built on.
+    static func dialledCore(
+        peer: String,
+        _ dial: (DispatchSerialQueue, (XPCPipe) -> Void) throws -> XPCPipe
+    ) throws -> (core: RPCTransportCore, pipe: XPCPipe) {
         let queue = DispatchSerialQueue(
-            label: ConnectionQueueLabel.mint(role: "client", peer: peer.label))
+            label: ConnectionQueueLabel.mint(role: "client", peer: peer))
 
-        // `building` runs synchronously inside the factory, before the session is activated, and
-        // `RPCTransportCore.init` installs both pipe handlers itself (weakly). Installing our own
-        // here would *replace* the core's and silently disconnect the mux.
         var built: RPCTransportCore?
-        let build: (XPCPipe) -> Void = { pipe in
+        let pipe = try dial(queue) { pipe in
             built = RPCTransportCore(pipe: pipe, codec: CompactWireCodec(), role: .client)
-        }
-        // The returned pipe is intentionally discarded: `built` holds it strongly, so this is not
-        // its last reference. (A dialled pipe must be activate-then-cancelled before release, and
-        // `XPCPipe` owns that -- see its disposal matrix.)
-        switch peer {
-        case .machService(let name):
-            _ = try XPCPipe.connecting(toMachService: name, queue: queue, building: build)
-        case .xpcService(let name):
-            _ = try XPCPipe.connecting(toXPCService: name, queue: queue, building: build)
         }
 
         guard let core = built else {
-            // Unreachable: both factories call `building` synchronously before returning. A trap
-            // rather than a thrown error, because the only way here is a broken `XPCPipe`, and
-            // recovering would mean handling a pipe with no mux behind it.
+            // Unreachable: every dial factory calls `building` synchronously before returning. A
+            // trap rather than a thrown error, because the only way here is a broken `XPCPipe`,
+            // and recovering would mean handling a pipe with no mux behind it.
             preconditionFailure("XPCPipe.connecting did not run its `building` closure")
+        }
+        return (core, pipe)
+    }
+
+    private static func dialling(_ peer: Peer) throws -> XPCClientTransport {
+        let (core, _) = try dialledCore(peer: peer.label) { queue, building in
+            switch peer {
+            case .machService(let name):
+                try XPCPipe.connecting(toMachService: name, queue: queue, building: building)
+            case .xpcService(let name):
+                try XPCPipe.connecting(toXPCService: name, queue: queue, building: building)
+            }
         }
         return XPCClientTransport(core: core)
     }
@@ -399,14 +467,23 @@ public final class XPCClientTransport: ClientTransport {
     /// already in flight run to completion. Returns immediately -- the waiting happens in
     /// `connect()`.
     ///
-    /// Three things happen, in this order:
-    /// 1. `core.beginDraining()` -- `goAway` on the wire, and `openStream` throws `.unavailable`
+    /// Four things happen, **in this order, and the first one is load-bearing**:
+    /// 1. `ConnectState.localShutdownRequested` is raised, which closes the local gate
+    ///    `withStream` checks. It happens *before* step 2 so that no observer can ever see the mux
+    ///    draining without also seeing that **this side** asked for it -- see the flag's own doc
+    ///    comment for the misreport that ordering prevents;
+    /// 2. `core.beginDraining()` -- `goAway` on the wire, and `openStream` throws `.unavailable`
     ///    from here on, so `withStream` refuses new calls even if it were asked past the local
     ///    gate;
-    /// 2. this transport moves to `.draining` (RPCs still in flight) or straight to `.shutDown`
-    ///    (none), which is the local gate `withStream` checks;
-    /// 3. a parked `connect()` is resumed **only in the second case**. Otherwise the last
+    /// 3. this transport moves to `.draining` (RPCs still in flight) or straight to `.shutDown`
+    ///    (none), which is what a parked `connect()` waits on;
+    /// 4. a parked `connect()` is resumed **only in the second case**. Otherwise the last
     ///    in-flight call to finish resumes it, in ``callDidFinish()``.
+    ///
+    /// Steps 3 and 4 stay *after* step 2 for a reason of their own: step 4 is what lets
+    /// `connect()`'s tail run `core.close()`, and closing before `beginDraining()` had its turn
+    /// would cancel the pipe with the `goAway` never sent -- the peer would learn of an orderly
+    /// shutdown as peer death. So the local flag moves to the front, and nothing else moves.
     ///
     /// It deliberately does **not** call `core.failAll(...)`: failing in-flight streams is the
     /// opposite of draining them, and cancelling `connect()`'s task is the forceful lever gRPC
@@ -423,9 +500,18 @@ public final class XPCClientTransport: ClientTransport {
     /// Idempotent: a second call finds `.draining`/`.shutDown` and changes nothing, and
     /// `beginDraining()` is itself a no-op once draining.
     public func beginGracefulShutdown() {
+        state.withLock { $0.localShutdownRequested = true }
         core.beginDraining()
         let completion: Completion = state.withLock { state in
-            guard !state.isShuttingDown else { return .nothing }
+            // Keyed on the **phase**, not on `isShuttingDown`: the line above has just made
+            // `isShuttingDown` true, so guarding on it would make this block unreachable and
+            // nothing would ever leave `.idle`. The phase is still the whole of the idempotence
+            // question -- `.draining`/`.shutDown` is exactly "a previous call (or a cancellation)
+            // already did this".
+            switch state.phase {
+            case .draining, .shutDown: return .nothing
+            case .idle, .connected: break
+            }
             let parked = state.parked
             guard state.liveCalls == 0 else {
                 state.phase = .draining(parked)
@@ -534,11 +620,18 @@ public final class XPCClientTransport: ClientTransport {
         // will immediately refuse. `core.openStream` also checks, under its own lock, so this is
         // a clearer error rather than the only gate.
         //
-        // The local phase is **re-read** rather than assumed, because `core.isDraining` is the
+        // The local state is **re-read** rather than assumed, because `core.isDraining` is the
         // disjunction of the mux's three flags (`isClosed || localDraining || peerDraining`): a
         // local `beginGracefulShutdown()` landing between the gate above and this check would
         // otherwise be reported as a retryable `.unavailable` *and* blamed on the peer -- which
         // inverts the very distinction the code above exists to draw.
+        //
+        // The re-read only works because the two flags are **ordered**:
+        // `beginGracefulShutdown()` raises `localShutdownRequested` before it calls
+        // `core.beginDraining()`, so `core.isDraining` can never be true *because of this side*
+        // while this re-read still answers "not shutting down". Until that ordering existed the
+        // re-read was correct and still lost the race it was written to win -- the window it
+        // could not see was inside `beginGracefulShutdown()` itself.
         if core.isDraining {
             throw state.withLock { state -> RPCError in
                 state.isShuttingDown ? Self.localShutdownRefusal : Self.peerDrainingRefusal

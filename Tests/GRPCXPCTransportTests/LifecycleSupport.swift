@@ -263,8 +263,14 @@ enum RawSeamHandlers {
 /// `XPCClientTransport.core` and `RPCTransportCore.pipe` are both `private`, so a test whose
 /// *subject* is one of them -- "was the XPC session cancelled?", "did the peer's `goAway` reach
 /// this core?", "is this core's `deinit` reachable?" -- cannot get at it through
-/// ``XPCTransportPair/make()``. This builds the client half with exactly the two calls
-/// `XPCServerTransport.connectingClient()` makes and hands both intermediates back.
+/// ``XPCTransportPair/make()``. This builds the client half **through the same factory**
+/// `XPCServerTransport.connectingClient()` uses -- `XPCClientTransport.dialledCore(peer:_:)` --
+/// and hands both intermediates back.
+///
+/// Going through that factory rather than restating it is what makes this type's claim true: the
+/// pipe and core a test inspects here are built by the production recipe, so a change to pipe
+/// retention or handler installation reaches this path automatically instead of leaving the tests
+/// inspecting a copy that has quietly diverged. (It was a copy, line for line, until the dedupe.)
 ///
 /// # Why it is safe, hazard by hazard
 ///
@@ -272,10 +278,10 @@ enum RawSeamHandlers {
 ///   "publish before you return the `Decision`" rule -- whose violation is an unclosable process
 ///   death -- does not apply. The server half is still `XPCServerTransport.anonymous()`, whose
 ///   `Acceptor` remains the only accept path in the package.
-/// * **One serial queue per connection, and not the listener's.** Minted here, used by nothing
-///   else. `XPCPipe.connecting` does not `queue.sync`, so the `dispatchPrecondition` in
+/// * **One serial queue per connection, and not the listener's.** Minted by the factory, used by
+///   nothing else. `XPCPipe.connecting` does not `queue.sync`, so the `dispatchPrecondition` in
 ///   `accepting` is not even in play.
-/// * **No handler installation.** `building` constructs the core and nothing else;
+/// * **No handler installation.** The factory's `building` constructs the core and nothing else;
 ///   `RPCTransportCore.init` installs `onReceive`/`onPeerDeath` itself, weakly. A second install
 ///   trips `XPCPipe`'s `precondition`.
 /// * **No nudge blob.** Nothing is sent here at all.
@@ -291,8 +297,9 @@ struct InspectableXPCPair: Sendable {
     let clientCore: RPCTransportCore
     let clientPipe: XPCPipe
 
-    /// - Parameter label: goes into the connection queue's label, so a `dispatchPrecondition`
-    ///   failure or a crash log names the test that built it.
+    /// - Parameter label: goes into the connection queue's label (as the factory's `peer`
+    ///   component), so a `dispatchPrecondition` failure or a crash log names the test that built
+    ///   it.
     static func make(label: String) throws -> InspectableXPCPair {
         let server = try XPCServerTransport.anonymous()
         guard let endpoint = server.endpoint else {
@@ -300,15 +307,9 @@ struct InspectableXPCPair: Sendable {
                 code: .failedPrecondition,
                 message: "an anonymous XPCServerTransport must have an endpoint")
         }
-        let queue = DispatchSerialQueue(label: "GRPCXPCTransportTests.\(label).client")
-        var built: RPCTransportCore?
-        let pipe = try XPCPipe.connecting(to: endpoint, queue: queue) { pipe in
-            built = RPCTransportCore(pipe: pipe, codec: CompactWireCodec(), role: .client)
-        }
-        guard let core = built else {
-            throw RPCError(
-                code: .internalError,
-                message: "XPCPipe.connecting did not run its `building` closure")
+        let (core, pipe) = try XPCClientTransport.dialledCore(peer: "test:\(label)") {
+            queue, building in
+            try XPCPipe.connecting(to: endpoint, queue: queue, building: building)
         }
         return InspectableXPCPair(
             server: server, client: XPCClientTransport(core: core), clientCore: core,
