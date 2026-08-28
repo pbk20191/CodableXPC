@@ -86,6 +86,96 @@ final class DispatchDataBridgeTests: XCTestCase {
         XCTAssertLessThan(growth, 64, "grew \(growth) MiB over 40 x 8 MiB — the +1 is not consumed")
     }
 
+    // MARK: - dispatchData(_:)
+
+    private func allBytes(_ value: DispatchData) -> Data {
+        var out = Data(count: value.count)
+        let copied: Int = out.withUnsafeMutableBytes { raw in
+            guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return 0 }
+            return value.copyBytes(to: UnsafeMutableBufferPointer(start: base, count: value.count),
+                                   count: value.count)
+        }
+        XCTAssertEqual(copied, value.count)
+        return out
+    }
+
+    /// Whatever the object is, the bytes come back. This is the only guarantee the
+    /// three paths -- already dispatch data, the SPI substitution, the plain copy --
+    /// share, and the only one a caller may depend on.
+    func testDispatchDataPreservesBytesForEveryObjectShape() {
+        var shapes: [(String, NSData)] = [
+            ("empty", NSData()),
+            ("inline", Data([1, 2, 3]) as NSData),
+            ("swift 64 KiB", Data(repeating: 0x5A, count: 64 << 10) as NSData),
+            ("swift 1 MiB", Data(repeating: 0x5A, count: 1 << 20) as NSData),
+        ]
+        let mutable = NSMutableData(length: 1 << 20)!
+        memset(mutable.mutableBytes, 0xAA, mutable.length)
+        shapes.append(("NSMutableData 1 MiB", mutable))
+        shapes.append(("dispatch, flat", dispatchBacked(repeating: 0x11, count: 4096)))
+        var joined = dispatchData(repeating: 0x22, count: 8)
+        joined.append(dispatchData(repeating: 0x33, count: 8))
+        shapes.append(("dispatch, concatenated", (joined as AnyObject) as! NSData))
+
+        for (name, object) in shapes {
+            let result = DispatchDataBridge.dispatchData(object)
+            XCTAssertEqual(result.count, object.length, name)
+            XCTAssertEqual(allBytes(result), object as Data, name)
+        }
+    }
+
+    /// An object that already *is* a dispatch data is returned, not rebuilt. The
+    /// working tree asked a private selector and then force-cast on the answer --
+    /// a cast the compiler said "always fails" -- where the runtime's own answer
+    /// does the job and cannot go missing.
+    func testDispatchDataDoesNotRebuildSomethingThatAlreadyIsOne() {
+        let original = dispatchData(repeating: 0x7E, count: 4096)
+        let asNSData = (original as AnyObject) as! NSData
+
+        let result = DispatchDataBridge.dispatchData(asNSData)
+
+        XCTAssertTrue((result as AnyObject) === asNSData,
+                      "a dispatch data should come back as itself, not as a copy")
+    }
+
+    /// The result must not be a view onto a buffer someone else can still write to.
+    /// It is a copy on every path here, and mutating the source afterwards proves it.
+    func testDispatchDataDoesNotAliasAMutableSource() {
+        for size in [4 << 10, 1 << 20] {
+            let source = NSMutableData(length: size)!
+            memset(source.mutableBytes, 0xAA, size)
+
+            let result = DispatchDataBridge.dispatchData(source)
+            let snapshot = allBytes(result)
+            memset(source.mutableBytes, 0xBB, size)
+
+            XCTAssertEqual(allBytes(result), snapshot,
+                           "\(size): the result changed when the source was written to")
+            XCTAssertEqual(snapshot.first, 0xAA, "\(size)")
+        }
+    }
+
+    /// `isAvailable` has to cover every selector this type sends, because
+    /// `@NSManaged` sends them without asking. If a selector were sent from outside
+    /// that gate, losing it under an OS update would be an unrecognised-selector
+    /// crash rather than the documented fallback.
+    func testAvailabilityCoversEverySelectorTheTypeSends() {
+        let probe = NSData()
+        let sent = ["_canReplaceWithDispatchDataForXPCCoder", "_createDispatchData"]
+        let covered = sent.allSatisfy { probe.responds(to: NSSelectorFromString($0)) }
+        XCTAssertEqual(DispatchDataBridge.isAvailable, covered,
+                       "isAvailable must be exactly 'every selector sent is present'")
+    }
+
+    private func dispatchData(repeating byte: UInt8, count: Int) -> DispatchData {
+        let bytes = [UInt8](repeating: byte, count: count)
+        return bytes.withUnsafeBytes { DispatchData(bytes: $0) }
+    }
+
+    private func dispatchBacked(repeating byte: UInt8, count: Int) -> NSData {
+        (dispatchData(repeating: byte, count: count) as AnyObject) as! NSData
+    }
+
     /// Encoding a `Data` field goes through it, and comes back equal.
     func testDataFieldsStillRoundTrip() throws {
         struct Holder: Codable, Equatable { let small: Data; let large: Data }

@@ -6,7 +6,7 @@ import ObjectiveC
 private extension NSData {
     @NSManaged func _canReplaceWithDispatchDataForXPCCoder() -> Bool
     /// `Unmanaged` because this returns +1 -- see ``DispatchDataBridge``.
-    @NSManaged func _createDispatchData() -> Unmanaged<NSData>
+    @NSManaged func _createDispatchData() -> Unmanaged<__DispatchData>
 }
 
 /// Builds the `xpc_data` for a `Data`, taking the cheaper of two copies.
@@ -66,7 +66,7 @@ private extension NSData {
 /// goes away, ``isAvailable`` turns false and every call takes the plain path.
 /// The result is the same either way — the tests assert the two paths produce
 /// identical bytes — so losing this costs speed and nothing else.
-public enum DispatchDataBridge {
+package enum DispatchDataBridge {
     /// Whether the substitution can be attempted at all on this OS.
     ///
     /// `@NSManaged` emits the call without checking anything, so a missing
@@ -91,8 +91,37 @@ public enum DispatchDataBridge {
         guard bridged._canReplaceWithDispatchDataForXPCCoder() else { return nil }
 
         let dispatchData = bridged._createDispatchData().takeRetainedValue()
-        return xpc_data_create_with_dispatch_data(
-            unsafeBitCast(dispatchData, to: __DispatchData.self))
+        return xpc_data_create_with_dispatch_data(dispatchData)
+    }
+
+    /// The `DispatchData` for an `NSData`, without a copy where the object already is one.
+    ///
+    /// The first question -- "is this already a dispatch data?" -- is asked of the
+    /// ObjC runtime rather than of SPI. An `NSData` that libdispatch or libxpc handed
+    /// back *is* an `OS_dispatch_data`, so a conditional cast answers it, and measured
+    /// here it gives the same answer `_isDispatchData` gives for every shape this
+    /// package can produce: `_NSZeroData`, `_NSInlineData`, `__NSSwiftData`,
+    /// `NSConcreteMutableData`, and dispatch data both flat and concatenated. A public
+    /// runtime cast cannot go missing under an OS update, and a `nil` from it costs a
+    /// copy rather than the process -- neither of which is true of a private selector
+    /// answered with a force-cast.
+    ///
+    /// Everything past that is the substitution ``substituting(_:)`` already makes,
+    /// behind the same two gates: ``isAvailable``, so a removed selector falls back
+    /// instead of crashing, and Apple's own `_canReplaceWithDispatchDataForXPCCoder`
+    /// threshold, so a small object is not run through it for nothing. When either
+    /// says no, a plain `DispatchData` copy is the answer; it is always correct and
+    /// only ever costs speed, which is the same trade the rest of this type makes.
+    public static func dispatchData(_ data: NSData) -> DispatchData {
+        if let already = data as AnyObject as? DispatchData { return already }
+
+        if isAvailable, data._canReplaceWithDispatchDataForXPCCoder() {
+            return data._createDispatchData().takeRetainedValue() as DispatchData
+        }
+
+        return withExtendedLifetime(data) {
+            DispatchData(bytes: UnsafeRawBufferPointer(start: data.bytes, count: data.length))
+        }
     }
 }
 #endif

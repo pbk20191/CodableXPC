@@ -54,7 +54,12 @@ struct Calculator: Demo_V1_Calculator.SimpleServiceProtocol {
     ) async throws {
         log.info("countTo(\(request.value, privacy: .public))")
         let pid = getpid()
-        for i in 1...max(request.value, 1) {
+        // `calc.proto` says "Counts up from 1 to `value`", and for a value below 1 that
+        // range is empty -- so the response stream is empty and the call ends OK. Clamping
+        // with `max(value, 1)` answered CountTo(0) with [1] instead, which is neither what
+        // the proto documents nor a count of anything.
+        guard request.value >= 1 else { return }
+        for i in 1...request.value {
             try await response.write(.with { $0.value = i; $0.responderPid = pid })
         }
     }
