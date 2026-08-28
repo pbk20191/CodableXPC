@@ -63,8 +63,16 @@ import Synchronization
 //
 // * **L7 -- explicit lifecycle.** `Phase = .running | .draining | .closed` under the one
 //   `registry` mutex, taken-and-transitioned atomically. No continuation is ever resumed under a
-//   lock: every window `grant`/`release`/`fail`, every `AsyncThrowingStream.Continuation` call and
-//   every `pipe.send` happens after `withLock` has returned.
+//   lock, and nothing that can suspend is held across one: every window `grant`/`release`/`fail`
+//   and every `AsyncThrowingStream.Continuation` call happens after `withLock` has returned, and
+//   §O4's credit is acquired before any lock is taken.
+//
+// * **Outbound order.** `pipe.send` *is* held under a lock, and deliberately -- the ``submission``
+//   mutex, which is what makes a stream's wire order match the order this file decided things in.
+//   It is not the registry lock (see that property for why), it guards no state, and nothing that
+//   suspends is held across it. An earlier round asserted the opposite -- "every `pipe.send`
+//   happens after `withLock` has returned" -- while a `cancel` could still overtake the deferred
+//   `openStream` it belonged to; see ``send(_:forStream:)``.
 //
 // * **L12 -- deadline timers.** At most one `DispatchSourceTimer` per deadline-bearing RPC, owned
 //   by that RPC's table entry, activated only after the entry is in the table, and cancelled on
@@ -323,7 +331,73 @@ final class RPCTransportCore: Sendable {
     private let acceptedContinuation: AsyncStream<AcceptedRPCStream>.Continuation
 
     // =======================================================================================
-    // MARK: - Mutable state (one lock)
+    // MARK: - Outbound submission order
+    // =======================================================================================
+
+    /// **The lock that makes this connection's outbound order match its decisions.** Held across
+    /// exactly one thing -- `pipe.send` -- plus, on ``send(_:forStream:)``'s path, the registry
+    /// lookup that decides whether to send at all.
+    ///
+    /// It guards **no state**, which is why it lives here and not in the section below: the
+    /// registry is still the one lock over this object's mutable state, and this one orders side
+    /// effects. Two locks, two jobs, and the nesting is one-way: `submission` may be held while
+    /// taking `registry`, never the reverse. Nothing that holds `registry` submits anything --
+    /// every send in this file happens after its lock section has ended -- so there is no cycle to
+    /// order around. (``OutboundOpWriter`` adds its own encoder lock *outside* this one, giving the
+    /// single global order `writer.state` → `submission` → `registry`.)
+    ///
+    /// # Why a second lock rather than the registry, or the pipe's queue
+    ///
+    /// The invariant needs decision and submission to be one atomic step against *the other
+    /// submitter*. Three mechanisms can supply that, and the two rejected ones each cost something
+    /// this one does not:
+    ///
+    ///   * **hold the registry lock across the send.** Correct, and it would work -- L7 never
+    ///     forbade it -- but it puts a libxpc syscall inside the lock that every inbound routing
+    ///     turn takes, so outbound sends would serialise inbound routing behind them. That is the
+    ///     one real objection to it, and it is enough.
+    ///   * **hop every send onto the pipe's serial queue** (the shape proposed as the structural
+    ///     answer). The queue *is* a serialisation point, and the fix would be sound if the check
+    ///     rode across the hop with the send. But `pipe.send` is synchronous and reports its error
+    ///     to the caller, and a writer holds a non-async `Mutex` across it: an `async` hop cannot
+    ///     return the error to `write`, and a `sync` hop would deadlock the moment a send is issued
+    ///     from the queue itself -- which every inbound-triggered `cancel` and `credit` is. It also
+    ///     puts outbound sends behind inbound routing on the same queue for no gain.
+    ///   * **this lock.** Same atomicity, no syscall under the registry lock, no hop, no change to
+    ///     the error contract, and inbound *routing* never waits on it (only inbound work that
+    ///     itself sends does, which is the ordering it needs anyway).
+    ///
+    /// # What it costs, measured
+    ///
+    /// Every outbound submission on a connection serialises here, so a `pipe.send` that stalls now
+    /// stalls other streams' sends rather than only its own stream's. Nothing that can suspend is
+    /// ever held across it -- §O4's credit is acquired *before* the writer's encoder lock, so a
+    /// writer parked on credit holds neither this nor the registry.
+    ///
+    /// Measured on `OrderingStressTests` over two real XPC sessions, 5 runs each side: 10 000
+    /// messages across 10 concurrent streams went from a mean of 92.4 ms to 92.6 ms (**+20 ns per
+    /// message**, against ~9 µs end to end), and the interleaved-blob case from 104.8 ms to 105.6 ms
+    /// -- under its own 9 ms run-to-run spread. One uncontended `Mutex` per submission.
+    ///
+    /// Inbound *routing* never waits on it: `send(_:forStream:)` releases the registry lock before
+    /// `pipe.send`, so a routing turn's table lookups are never behind a syscall. A routing turn
+    /// that itself submits -- a `cancel`, a `credit`, an accept refusal -- does wait, for at most one
+    /// in-flight send, and that wait *is* the ordering it needs.
+    ///
+    /// # What it deliberately does not order
+    ///
+    /// **`credit` ops.** ``messageConsumed(streamID:charge:)`` and ``creditConnection(_:)`` read the
+    /// registry, release it, and *then* submit, so a `credit(id)` decided just before a removal can
+    /// reach the wire after that stream's `cancel`. That is harmless twice over -- the peer drops a
+    /// `credit` for an id it no longer has (``applyCredit(streamID:bytes:)``), and a `credit(0)` is
+    /// connection-scoped, always applicable and never dropped -- so no accounting can diverge. It is
+    /// named here because it is the one remaining place where this connection's decision order and
+    /// its wire order can differ for a single stream, and a reader should not have to re-derive that
+    /// it is safe.
+    private let submission = Mutex<Void>(())
+
+    // =======================================================================================
+    // MARK: - Mutable state (the one lock over this object's state)
     // =======================================================================================
 
     /// One live stream's state.
@@ -1259,48 +1333,90 @@ final class RPCTransportCore: Sendable {
         }
     }
 
-    /// Whether `id` still has an entry in the registry -- i.e. whether the stream is alive at all.
-    ///
-    /// ``OutboundOpWriter`` asks before every send, **including the ones that carry no flow-control
-    /// charge**, and that is the whole point: a `metadata` or `halfClose` consults nothing else, so
-    /// before this existed the writer's *first* write could put `[openStream, metadata]` on the
-    /// wire after ``removeStream(_:failingInboundWith:sendingCancel:)`` had already sent
-    /// `cancel(id)` for the same stream. `openStream` is deferred to that first write (see
-    /// ``openStream(descriptor:timeout:)``), so the gap between "registered, deadline armed" and
-    /// "the peer has heard of this stream" is as long as the caller takes to write -- and a
-    /// deadline firing inside it is reachable, not theoretical.
-    ///
-    /// The peer's view of that reordering was the damage: it drops the `cancel` for an id it has
-    /// never seen, then admits the stream and runs a handler for an RPC the client has already
-    /// abandoned, and (with no deadline of its own) holds a `maxConcurrentInboundStreams` slot
-    /// until the connection is torn down. The client cannot repair it either -- its own entry is
-    /// already gone, so a later `cancelStream` finds nothing and returns `false`.
-    ///
-    /// - Note: the check is not atomic with the send that follows it; nothing short of sending
-    ///   under the registry lock could be, and L7 forbids that. It is taken **inside the writer's
-    ///   encoder lock, immediately before `pipe.send`**, which is as tight as this can be made: a
-    ///   removal that has not yet reached the table when the check runs is a removal that had not
-    ///   happened, and one that has is refused. What is closed is the arbitrarily long window --
-    ///   an entire deadline's worth -- not the few instructions at the end of it.
-    fileprivate func streamIsOpen(_ id: RPCStreamID) -> Bool {
-        registry.withLock { $0.streams[id] != nil }
-    }
-
-    /// The error a write refused by ``streamIsOpen(_:)`` reports. `.unavailable` rather than
+    /// The error a send refused because its stream is gone reports. `.unavailable` rather than
     /// `.internalError`: the stream really is gone from under the caller (a deadline, a peer
     /// `cancel`, a teardown), which is not a caller mistake -- and it matches what
     /// ``reserveOutboundWindow(_:forStream:)`` already throws for the same condition.
-    fileprivate func streamNoLongerOpen(_ id: RPCStreamID) -> RPCError {
+    private func streamNoLongerOpen(_ id: RPCStreamID) -> RPCError {
         RPCError(code: .unavailable, message: "stream \(id) is no longer open on this connection")
     }
 
-    /// Encodes and sends ops the caller has already accounted for. The one outbound path; every
-    /// op this file emits goes through here or through ``sendControl(_:)``.
+    /// Encodes and submits ops for a stream whose entry must still exist -- every op
+    /// ``OutboundOpWriter`` emits, and the only path that takes the submission lock **with a
+    /// decision inside it**.
+    ///
+    /// # What this closes
+    ///
+    /// `openStream` is deferred to the writer's first `write`/`finish` (see
+    /// ``openStream(descriptor:timeout:)``), so between "registered, deadline armed" and "the peer
+    /// has heard of this stream" the stream exists locally and nowhere else. A removal inside that
+    /// gap -- a fired deadline is the reachable one -- sends `cancel(id)` for an id the peer will
+    /// drop, and a first write that reached the wire afterwards would open the stream *behind* it:
+    /// the peer then admits a stream whose client has already abandoned it, runs a handler for it,
+    /// and (with no deadline of its own) holds a ``maxConcurrentInboundStreams`` slot until the
+    /// connection is torn down. The client cannot repair it either -- its own entry is already
+    /// gone, so a later `cancelStream` finds nothing and returns `false`.
+    ///
+    /// An earlier round narrowed that window by asking "is this stream still open?" immediately
+    /// before the send, and recorded in this file that the two could not be made atomic because
+    /// "nothing short of sending under the registry lock could be, and L7 forbids that". **Both
+    /// halves of that were wrong.** L7 is about lifecycle state machines and about resuming
+    /// *continuations* outside a lock; `pipe.send` is neither. And the check does not have to be
+    /// atomic with the send *against the registry* at all -- it has to be atomic against **the
+    /// other submitter**, which is a strictly weaker requirement and needs no registry lock held
+    /// across a syscall.
+    ///
+    /// # Why this is now closed rather than narrowed
+    ///
+    /// Two facts compose, and neither is about libxpc's message ordering:
+    ///
+    /// 1. ``removeStream(_:failingInboundWith:sendingCancel:)`` takes the entry **out of the
+    ///    registry before it submits anything**. So a `cancel` that has been submitted is a
+    ///    `cancel` whose entry was already gone.
+    /// 2. This function performs its registry lookup **and** its `pipe.send` inside one
+    ///    ``submission`` critical section.
+    ///
+    /// Therefore: if the lookup here succeeds, the removal had not finished its registry section,
+    /// so its `cancel` cannot have been submitted -- and it cannot be submitted before this send
+    /// returns, because we hold `submission`. If the removal did finish first, the lookup fails and
+    /// nothing is sent. There is no third interleaving, and the ordering does not depend on how
+    /// wide the window is.
+    ///
+    /// What libxpc contributes is only the last link: submission order is delivery order. Measured
+    /// rather than assumed -- `docs/xpc-platform-matrix/SendOrderMatrix.swift` row **S1**, 20 000
+    /// sends from 8 threads issued under one lock, arrival order identical to submission order 5
+    /// runs out of 5. Its control row **S2** moves the send outside the lock and reorders **10 168
+    /// of 20 000**, which is what "the remaining window is only `encode` + `pipe.send` wide" is
+    /// actually worth under contention.
+    ///
+    /// - Throws: ``streamNoLongerOpen(_:)`` if the stream is gone (nothing was sent), the codec's
+    ///   error, or the substrate's `RPCError(code: .unavailable)`.
+    fileprivate func send(_ ops: [RPCOp], forStream id: RPCStreamID) throws {
+        guard !ops.isEmpty else { return }
+        // Deliberately outside the lock: encoding is pure, and it is the widest part of what used
+        // to be the racing window. Wire order is submission order, not encode order.
+        let blob = try codec.encode(ops)
+        try submission.withLock { _ in
+            guard registry.withLock({ $0.streams[id] != nil }) else {
+                throw streamNoLongerOpen(id)
+            }
+            try pipe.send(blob)
+        }
+    }
+
+    /// Encodes and submits ops that answer to no registry entry: credit, `goAway`, an accept
+    /// refusal for an id that was never admitted, and the `cancel` of a removal that has *already*
+    /// taken its entry out of the table.
+    ///
+    /// Takes ``submission`` for the same reason as ``send(_:forStream:)`` -- it is the other half
+    /// of that function's ordering argument, and a `cancel` submitted outside the lock would make
+    /// the check inside it meaningless.
     ///
     /// - Throws: the codec's error, or the substrate's `RPCError(code: .unavailable)`.
-    fileprivate func sendEncoded(_ ops: [RPCOp]) throws {
+    private func sendEncoded(_ ops: [RPCOp]) throws {
         guard !ops.isEmpty else { return }
-        try pipe.send(codec.encode(ops))
+        let blob = try codec.encode(ops)
+        try submission.withLock { _ in try pipe.send(blob) }
     }
 
     /// Sends control ops that have no caller to report a failure to -- credit, `goAway`, teardown
@@ -1493,9 +1609,16 @@ final class RPCTransportCore: Sendable {
     /// The cancellation observer fires only on abnormal removal: firing it on a clean completion
     /// would tell a server handler it had been cancelled after it had already succeeded.
     ///
-    /// Idempotent: the entry is taken out of the table under the lock, so exactly one caller ever
-    /// performs the teardown. Everything that can block or call out -- window failures,
-    /// continuations, `pipe.send` -- happens after the lock is released (L7).
+    /// Idempotent: the entry is taken out of the table under the registry lock, so exactly one
+    /// caller ever performs the teardown. Everything that can block or call out -- window
+    /// failures, continuations, `pipe.send` -- happens after that lock is released (L7).
+    ///
+    /// **The order of the last two statements is load-bearing, not tidiness: the entry leaves the
+    /// registry strictly before this function submits anything.** That is one half of the
+    /// outbound-ordering invariant -- ``send(_:forStream:)`` is the other half, and it is where the
+    /// argument is written out. A refactor that submitted the `cancel` from inside the registry
+    /// section, or that removed the entry *after* sending, would let a writer's deferred
+    /// `openStream` follow this `cancel` onto the wire again.
     @discardableResult
     private func removeStream(
         _ id: RPCStreamID,
@@ -1956,11 +2079,18 @@ extension ResponseOpEncoder: OutboundOpEncoding {
 /// # Why the encoder and the send share one lock
 ///
 /// `encode` assigns each op its place in §O2's grammar (it is what prepends `openStream` to the
-/// first part), so encode order **is** wire order. Encoding under a lock and sending outside it
-/// would let two concurrent writes swap on the way to the pipe and put a `message` ahead of the
-/// `metadata` that must precede it. `pipe.send` is synchronous and does not block on the peer, so
-/// holding the lock across it costs a short critical section and buys the ordering outright.
-/// Credit, which *does* suspend, is acquired before the lock is taken.
+/// first part), so encode order **is** this stream's wire order. Encoding under a lock and sending
+/// outside it would let two concurrent writes swap on the way to the pipe and put a `message` ahead
+/// of the `metadata` that must precede it. `pipe.send` is synchronous and does not block on the
+/// peer, so holding the lock across it costs a short critical section and buys the ordering
+/// outright. Credit, which *does* suspend, is acquired before the lock is taken.
+///
+/// **``finish()`` obeys this too, and did not always.** It used to encode under the lock and send
+/// after releasing it -- the exact shape this section forbids -- so a `write` racing a `finish`
+/// could put a `message` on the wire *after* the `halfClose` that the encoder had already placed
+/// before it, which is a §O2 grammar violation the peer would fail the stream for. Both methods now
+/// submit inside the lock; only `localDirectionDidClose` is deferred past it, because that call can
+/// retire the stream and finish continuations (L7).
 ///
 /// # Why there is an `isDead` flag
 ///
@@ -1971,9 +2101,11 @@ extension ResponseOpEncoder: OutboundOpEncoding {
 /// encoder and `finish()` is a no-op.
 ///
 /// It carries a second class of death, added later: a stream that has been **removed from the
-/// registry** under the writer. Both `write` and `finish` ask `RPCTransportCore.streamIsOpen(_:)`
-/// before they touch the encoder, and a refusal is permanent for this instance -- see that
-/// function for why an unchecked write is worse than futile on the first one.
+/// registry** under the writer. That refusal is now made by `RPCTransportCore.send(_:forStream:)`
+/// itself, *inside* the submission lock, rather than by a separate question asked before the send
+/// -- see that function for why the separate question could not close the window. A refusal is
+/// permanent for this instance either way: nothing reached the wire, but the encoder's position has
+/// moved, so this writer can no longer produce a well-formed continuation of the stream.
 @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
 final class OutboundOpWriter<Encoder: OutboundOpEncoding>: ClosableRPCWriterProtocol {
     typealias Element = Encoder.Part
@@ -2037,21 +2169,19 @@ final class OutboundOpWriter<Encoder: OutboundOpEncoding>: ClosableRPCWriterProt
         do {
             try state.withLock { state in
                 guard !state.isDead else { throw streamDead() }
-                // The stream may have been retired while this write was queued behind the lock or
-                // parked on credit -- a fired deadline, a peer `cancel`, a teardown. Sending
-                // anyway is not merely futile: on the *first* write it puts the deferred
-                // `openStream` on the wire behind the `cancel` the removal already sent, and
-                // opens a stream on the peer that nothing will ever close. See
-                // `RPCTransportCore.streamIsOpen(_:)`.
-                guard core.streamIsOpen(streamID) else {
-                    state.isDead = true
-                    throw core.streamNoLongerOpen(streamID)
-                }
                 do {
-                    try core.sendEncoded(state.encoder.encode(element))
+                    // The stream may have been retired while this write was queued behind the lock
+                    // or parked on credit -- a fired deadline, a peer `cancel`, a teardown. Sending
+                    // anyway is not merely futile: on the *first* write it would put the deferred
+                    // `openStream` on the wire behind the `cancel` the removal sent, and open a
+                    // stream on the peer that nothing will ever close. `send(_:forStream:)` refuses
+                    // it, atomically with the submission -- which is what asking beforehand could
+                    // not be. See that function.
+                    try core.send(state.encoder.encode(element), forStream: streamID)
                 } catch {
-                    // Either the grammar was violated or the op never reached the wire; the
-                    // encoder's position has moved either way, so this instance is finished.
+                    // Either the grammar was violated, or the stream is gone, or the op never
+                    // reached the wire; the encoder's position has moved in every case, so this
+                    // instance is finished.
                     state.isDead = true
                     throw error
                 }
@@ -2077,37 +2207,33 @@ final class OutboundOpWriter<Encoder: OutboundOpEncoding>: ClosableRPCWriterProt
     /// Non-throwing by protocol, so a gone core and a dead encoder are both silent: there is no
     /// peer left to half-close to and no caller to report to. ``write(_:)`` is where a lost
     /// connection surfaces.
+    ///
+    /// The encode **and** the submission happen inside the encoder lock, exactly as in
+    /// ``write(_:)``: this method used to encode under the lock and send after releasing it, which
+    /// is the one shape the type's doc comment forbids -- see it for the reordering that allowed.
     func finish() async {
         guard let core else { return }
 
-        let ops: [RPCOp]? = state.withLock { state in
-            guard !state.isDead else { return nil }
-            // Same refusal as `write(_:)`, and for the same reason: `finish()` on a request that
-            // never wrote anything emits the deferred `openStream` alongside `halfClose`, so a
-            // retired stream must not reach the encoder here either. Silent, because this method
-            // has no caller to report to.
-            guard core.streamIsOpen(streamID) else {
-                state.isDead = true
-                return nil
-            }
+        // Same refusal as `write(_:)`, and for the same reason: `finish()` on a request that never
+        // wrote anything emits the deferred `openStream` alongside `halfClose`, so a retired stream
+        // must not be opened here either. Silent, because this method has no caller to report to.
+        //
+        // Control ops: no flow control (§O4), so a starved stream can still be closed.
+        let closedLocalDirection = state.withLock { state -> Bool in
+            guard !state.isDead else { return false }
             do {
-                return try state.encoder.finish()
+                try core.send(state.encoder.finish(), forStream: streamID)
+                return true
             } catch {
                 state.isDead = true
-                return nil
+                return false
             }
         }
-        guard let ops else { return }
 
-        // Control ops: no flow control (§O4), so a starved stream can still be closed.
-        do {
-            try core.sendEncoded(ops)
-        } catch {
-            state.withLock { $0.isDead = true }
-            return
+        // Outside the lock: this can retire the stream, which finishes continuations (L7).
+        if closedLocalDirection, Encoder.finishClosesLocalDirection {
+            core.localDirectionDidClose(streamID)
         }
-
-        if Encoder.finishClosesLocalDirection { core.localDirectionDidClose(streamID) }
     }
 
     /// Aborts the stream. Never touches the encoder (it may already be dead, and there is no

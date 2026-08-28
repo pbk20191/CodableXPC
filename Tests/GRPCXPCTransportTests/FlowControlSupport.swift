@@ -85,9 +85,11 @@ final class TestPipe: MessagePipe, @unchecked Sendable {
     // -------------------------------------------------------------------------------------
 
     func send(_ blob: GRPCSwiftData) throws {
-        // Read under the lock, called **outside** it. An observer runs inside whatever core call
-        // is doing the sending, and may reach back into the core or the transport above it; doing
-        // that with this pipe's lock held would deadlock the moment it sent anything.
+        // Read under the lock, called **outside** it. An observer runs inside whatever core call is
+        // doing the sending, and may reach back into the core or the transport above it; doing that
+        // with this pipe's lock held would deadlock the moment it sent anything. (It may not send
+        // *anything* from in there either, but for a different reason and not because of this lock
+        // -- see ``onEachSend(_:)``.)
         if let observer = state.withLock({ $0.sendObserver }) { observer(blob) }
         try state.withLock { state in
             if let failure = state.sendFailure { throw failure }
@@ -152,6 +154,13 @@ final class TestPipe: MessagePipe, @unchecked Sendable {
     /// Blocking in here is the intended use. Blocking *forever* is not: the observer runs on
     /// whatever thread called `send`, so give it its own bound (L8 applies to the hook as much as
     /// to the test).
+    ///
+    /// - Important: **an observer must not itself send anything, on this thread.** It runs inside
+    ///   `RPCTransportCore`'s submission lock -- that lock is exactly "the decision to send and the
+    ///   submission are one step", so a nested send from inside a send deadlocks on it. Reaching
+    ///   back into the core for anything that does *not* send is fine, and so is handing the send to
+    ///   another thread: `CancelOrderingTests` does exactly that, and the other thread blocking on
+    ///   the submission lock until this hook returns is the property it measures.
     func onEachSend(_ observer: @escaping @Sendable (GRPCSwiftData) -> Void) {
         state.withLock { $0.sendObserver = observer }
     }

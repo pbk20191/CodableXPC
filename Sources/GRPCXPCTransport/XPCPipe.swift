@@ -589,10 +589,21 @@ final class XPCPipe: MessagePipe {
     ///
     /// Callable from any queue, as `MessagePipe` promises. No lock is held across
     /// `session.send(message:)`: libxpc's own send is thread-safe and totally ordered per
-    /// connection, so serializing sends here would buy nothing but a contention point. Two blobs
+    /// connection, so serializing sends *here* would buy nothing but a contention point. Two blobs
     /// handed to `send` concurrently from two threads have no defined order *to* preserve -- what
     /// the contract promises, and what libxpc delivers, is that whichever order libxpc accepts
     /// them in is the order the peer's `onReceive` sees.
+    ///
+    /// **That last sentence is load-bearing above this file, and it is measured rather than
+    /// assumed.** `RPCTransportCore` orders its own outbound ops by serialising the *decision to
+    /// send* with the submission under one lock of its own, which is only worth anything if
+    /// libxpc's "accepted order" respects a happens-before between two threads' sends. Row **S1**
+    /// of `docs/xpc-platform-matrix/SendOrderMatrix.swift`: 20 000 sends from 8 threads, each
+    /// issued while holding a lock, arrived in exact submission order, 5 runs out of 5. Its control
+    /// row **S2** moves the send outside the lock -- allocating the sequence number under it, as a
+    /// check-then-send does -- and reorders 10 168 of 20 000. So the ordering the layers above rely
+    /// on comes from *their* serialisation plus libxpc's FIFO, and neither half is sufficient
+    /// alone.
     ///
     /// Errors are shaped, never passed through: once the peer is gone libxpc fails the send with
     /// its own rich error, and every caller in this transport -- and gRPC's machinery above it --
