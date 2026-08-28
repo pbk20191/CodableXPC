@@ -2,6 +2,8 @@
 /.build
 Demo/.build
 Demo/.swiftpm
+GRPCDemo/.build
+GRPCDemo/.swiftpm
 /Packages
 /*.xcodeproj
 xcuserdata/

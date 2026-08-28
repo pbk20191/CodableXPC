@@ -1,0 +1,38 @@
+// The demo's contract. Deliberately boring: the interesting part is that these four methods are
+// the four gRPC call types, and that every byte on the wire below is real protobuf produced by
+// generated code rather than a `GRPCSwiftData` a test built by hand.
+//
+// One message pair serves all four methods. A demo that also exercised nested messages, maps and
+// oneofs would be testing swift-protobuf, which is not what is unverified here.
+syntax = "proto3";
+
+package demo.v1;
+
+message CalcRequest {
+  // The operand. `Sum` adds these up; the streaming methods use it as a seed.
+  int32 value = 1;
+}
+
+message CalcReply {
+  // The answer.
+  int32 value = 1;
+  // The pid that computed it. The host asserts this differs from its own -- which is the whole
+  // claim being made, and the one thing an in-process test can never show.
+  int32 responder_pid = 2;
+}
+
+service Calculator {
+  // Unary: one request, one response.
+  rpc Double(CalcRequest) returns (CalcReply);
+
+  // Client-streaming: many requests, one response. Sums everything the client sent.
+  rpc Sum(stream CalcRequest) returns (CalcReply);
+
+  // Server-streaming: one request, many responses. Counts up from 1 to `value`.
+  rpc CountTo(CalcRequest) returns (stream CalcReply);
+
+  // Bidirectional-streaming: many requests, many responses, interleaved. Emits a running total
+  // after each request, so a reply that arrives before the client has finished sending proves
+  // the two directions are independent.
+  rpc RunningTotal(stream CalcRequest) returns (stream CalcReply);
+}
