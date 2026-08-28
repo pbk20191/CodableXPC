@@ -497,8 +497,22 @@ public final class XPCServerTransport: ServerTransport {
     // MARK: - Construction
     // =======================================================================================
 
-    /// Listens on a launchd Mach service name (an `XPCService`/`LaunchDaemon` bundle's
-    /// `MachServices` key). The listener is active when this returns.
+    /// Listens on a launchd service name. The listener is active when this returns.
+    ///
+    /// `name` is **either** a Mach service name (a `LaunchAgent`/`LaunchDaemon` plist's
+    /// `MachServices` key) **or** the `CFBundleIdentifier` of an `.xpc` service bundle. The same
+    /// call covers both: `xpc_listener_create` documents its `service` argument as "the Mach
+    /// service or XPC Service name" and performs the launchd check-in itself, so a service inside
+    /// an application's `XPCServices/` directory needs no `xpc_main`, no `MachServices` key, and no
+    /// separate factory here.
+    ///
+    /// That second half went undocumented until `GRPCDemo/` ran it, and its absence mattered: the
+    /// bundle case is the only server topology a consumer of this package can actually reach, and
+    /// this doc read as though it were unsupported.
+    ///
+    /// Note the contrast with `Demo/`'s `XPCActors` service, which *does* need `xpc_main` -- that
+    /// stack speaks to a raw `xpc_connection_t` rather than to the overlay's listener. Both are
+    /// correct for what they talk to.
     public static func service(named name: String) throws -> XPCServerTransport {
         let acceptor = Acceptor()
         let listener = try XPCListener(
@@ -722,8 +736,8 @@ public final class XPCServerTransport: ServerTransport {
     ///
     /// **Neither arm cancels the listener** -- `deinit` is the only place that happens, so that a
     /// peer mid-dial is refused rather than ignored. A consequence worth naming for
-    /// ``XPCServerTransport/service(named:)``: the Mach service name stays claimed until this
-    /// transport is released, where it used to be given up at the end of `listen()`. That is
+    /// ``XPCServerTransport/service(named:)``: the service name -- Mach service or bundle
+    /// identifier -- stays claimed until this transport is released, where it used to be given up at the end of `listen()`. That is
     /// deliberate (a name that answers "shutting down" is more useful than one that answers
     /// nothing), but it means a replacement server cannot claim the name until the old transport is
     /// gone.
