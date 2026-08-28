@@ -75,7 +75,11 @@ struct CompactWireCodec: WireCodec {
         for op in ops {
             try Self.encodeOne(op, into: &out)
         }
-        return GRPCSwiftData(viewing: out)
+        // `borrowsXPCStorage: false` -- `out` was built here and nothing else references it, so a
+        // mutation of the result has nothing to corrupt. The default is `true` because that is the
+        // safe answer for a caller who did not think about it (the decode side at `:187` really is
+        // slicing a received `xpc_data`), and this is the one call site entitled to say otherwise.
+        return GRPCSwiftData(viewing: out, borrowsXPCStorage: false)
     }
 
     /// A lower bound on the blob `ops` encodes to: **exact** for every kind whose body size is
