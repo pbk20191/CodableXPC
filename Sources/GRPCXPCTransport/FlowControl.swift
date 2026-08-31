@@ -139,6 +139,66 @@ enum FlowControl {
 final class FlowControlWindow: Sendable {
 
     // =======================================================================================
+    // MARK: - The failure type
+    // =======================================================================================
+
+    /// Why a reservation did not happen. **There are exactly two reasons, and this says which.**
+    ///
+    /// ``FlowControlWindow/reserve(upTo:)`` fails for the window's sake or for the waiter's, never
+    /// for anything else: either the window died under it (``fail(_:)``, whose `RPCError` is stored
+    /// verbatim and travels verbatim in ``windowFailed(_:)``), or the waiting task was cancelled
+    /// while suspended. Those two have no common supertype but `any Error`, which is what the
+    /// continuation's failure type used to be -- and the cost of that was a slot that encoded the
+    /// outcome twice, once in ``FlowControlWindow/Slot`` and again as the continuation's
+    /// return-or-throw, with nothing making the two agree.
+    ///
+    /// # This type stops at the edge of the flow-control layer
+    ///
+    /// It is **not** what a sender above this layer observes, and it must not become that. Choosing
+    /// a two-case type over the simpler "rewrite `CancellationError` as `RPCError(code: .cancelled)`"
+    /// was a decision to keep the observed identity exactly as it was: a cancelled sender still sees
+    /// `CancellationError`, a torn-down one still sees the window's own `RPCError`. The mapping back
+    /// is ``callerFacingError``, applied once, in `RPCTransportCore.reserveFully(_:from:)` -- the
+    /// single in-tree consumer of `reserve(upTo:)` and therefore the only place this type can leak
+    /// from. Everything above it (`reserveOutboundWindow`, `OutboundOpWriter.write`, `withStream`'s
+    /// caller) is `any Error` by protocol requirement, so there is nothing further up that could
+    /// usefully switch on these cases.
+    ///
+    /// Three tests hold that line, and all three assert on the error a *caller* sees rather than on
+    /// this type. Verified by mutation: dropping the `callerFacingError` call fails every one of
+    /// them with "ReservationFailure" where the caller-facing identity belongs.
+    ///
+    /// * `FlowControlWindowTests.testACancelledWriterAboveTheTransportStillSeesCancellationError`
+    ///   -- deterministic, one `CoreUnderTest`, the `.cancelled` arm;
+    /// * `BackpressureTests.testAGatedReaderBoundsTheWritersInFlightBytes` -- the same arm raced
+    ///   over a real XPC pair;
+    /// * `TeardownTests.testPeerDeathWakesWritersParkedOnBothWindows` -- the `.windowFailed(e)`
+    ///   arm: a parked writer woken by a teardown must still catch an `RPCError` of `.unavailable`.
+    enum ReservationFailure: Error {
+        /// The waiting task was cancelled while suspended, and no grant had already been handed to
+        /// it. (If one had, `reserve` returns the bytes instead -- that is L1, not an oversight.)
+        case cancelled
+        /// ``FlowControlWindow/fail(_:)`` broke the window, before or during the wait. The payload
+        /// is that call's `RPCError`, unwrapped and unmodified.
+        case windowFailed(RPCError)
+
+        /// The identity a caller **outside** the flow-control layer must observe, unchanged from
+        /// before this type existed.
+        ///
+        /// `any Error` deliberately: the two cases map to two unrelated concrete types, which is
+        /// precisely the fact that made a narrower slot impossible in the first place. Erasing here
+        /// -- at one call site, on the failure path, where the error is about to be thrown into
+        /// `async throws` code anyway -- costs nothing and keeps the erasure from spreading back
+        /// down into the cell.
+        var callerFacingError: any Error {
+            switch self {
+            case .cancelled: CancellationError()
+            case .windowFailed(let error): error
+            }
+        }
+    }
+
+    // =======================================================================================
     // MARK: - State
     // =======================================================================================
 
@@ -157,32 +217,32 @@ final class FlowControlWindow: Sendable {
     /// grant is never in flight without an owner obliged to return it (see ``reserve(upTo:)``,
     /// which returns `k` even to a task that was cancelled in the interim).
     ///
-    /// # Why the continuation's failure type is `any Error` and not `RPCError`
+    /// # The cell and the continuation now say the same thing
     ///
-    /// **One blocker, and it is a behaviour question rather than a typing one.** An earlier round
-    /// named three -- `.failed`'s payload, ``fail(_:)``'s parameter, and `onCancel`'s
-    /// `CancellationError` -- and said the second was forced from above, because
-    /// ``RPCTransportCore/failAll(_:)`` took `any Error`. Two of those three are gone: the whole
-    /// failure chain (`failAll`, `failConnection`, `removeStream(_:failingInboundWith:_:)`,
-    /// ``fail(_:)``, `.failed`, `State.failure`, `Admission.failed`) is now `RPCError`, because a
-    /// trace of every call site found every one of them already constructing an `RPCError` literal
-    /// -- the two that passed a variable through resolve to `RPCError` literals one hop away, and
-    /// the two `catch`-derived paths *wrap* the caught value as `cause:` rather than forwarding it.
-    /// Nothing was widened to make that fit.
+    /// The continuation's failure type used to be `any Error`, and that was the last piece of the
+    /// failure chain left untyped. The rest went first: `failAll`, `failConnection`,
+    /// `removeStream(_:failingInboundWith:_:)`, ``fail(_:)``, `.failed`, `State.failure` and
+    /// `Admission.failed` are all `RPCError`, because a trace of all 23 production call sites found
+    /// every one already constructing an `RPCError`. What blocked the continuation was not plumbing
+    /// but arithmetic: ``reserve(upTo:)`` produces **two unrelated error identities on purpose** --
+    /// the window's `RPCError`, and `CancellationError` -- and `any Error` was their only common
+    /// supertype.
     ///
-    /// What remains is `onCancel`. ``reserve(upTo:)`` throws **two unrelated error identities on
-    /// purpose**: the window's `RPCError` when it died, and `CancellationError` when the waiting
-    /// task was cancelled. `any Error` is their only common type, so any narrower slot -- a
-    /// two-case enum, or `CancellationError` rewritten as `RPCError(code: .cancelled)` -- changes
-    /// what a cancelled sender *observes*. `FlowControlWindowTests` asserts that identity directly
-    /// (`error is CancellationError`, in four places), so this is a decision about the transport's
-    /// behaviour and not a re-spelling of it. Left as it is deliberately, and now for a reason that
-    /// is entirely about cancellation rather than half about plumbing.
+    /// ``ReservationFailure`` is that supertype, written down. The point is not the typing; it is
+    /// that the cell's terminal cases and the continuation's payload finally **enumerate the same
+    /// outcomes**. `.granted(k)` resumes `returning: k`; `.cancelled` resumes `throwing: .cancelled`;
+    /// `.failed(e)` resumes `throwing: .windowFailed(e)`. Every terminal case has exactly one
+    /// continuation spelling and vice versa, so there is no state the cell can be in that the
+    /// continuation would have to re-derive -- which is what "the cell encoded an outcome the
+    /// continuation re-encoded as return-or-throw" meant, and it is gone.
+    ///
+    /// It does not change what a sender sees. ``ReservationFailure/callerFacingError`` maps back at
+    /// the one place this type leaves the layer; see that property.
     private enum Slot {
         /// Waiting. `continuation` is `nil` in the window between taking a token and actually
         /// parking; a resolution landing in that window is remembered by the terminal cases below
         /// and picked up when the waiter arrives.
-        case pending(requested: Int, continuation: CheckedContinuation<Int, any Error>?)
+        case pending(requested: Int, continuation: CheckedContinuation<Int, ReservationFailure>?)
         /// Resolved by ``grant(_:)``: `bytes` have **already been deducted** from `available` and
         /// belong to this waiter. Terminal -- nothing may overwrite it, or those bytes are lost
         /// from the window forever.
@@ -232,12 +292,18 @@ final class FlowControlWindow: Sendable {
         /// under the lock and resuming under the lock is L7's bug. The caller resumes after
         /// `withLock` returns.
         ///
+        /// The list is typed `ReservationFailure` for the same reason the cell is, and not because
+        /// this function ever fails: `bank` only ever resumes `returning:`. The failure parameter
+        /// travels with the continuation whether or not this path can spell one, so it is the cell's
+        /// type by construction -- there is no second choice to make here, and making one would mean
+        /// re-erasing on the way out of the cell.
+        ///
         /// O(waiters), never O(`addition`): the loop is bounded by `order.count` and every
         /// iteration removes exactly one token from `order`. That is what keeps a peer-supplied
         /// credit from driving a loop at all (L2).
-        mutating func bank(_ addition: Int) -> [(continuation: CheckedContinuation<Int, any Error>, bytes: Int)] {
+        mutating func bank(_ addition: Int) -> [(continuation: CheckedContinuation<Int, ReservationFailure>, bytes: Int)] {
             available += addition
-            var toResume: [(continuation: CheckedContinuation<Int, any Error>, bytes: Int)] = []
+            var toResume: [(continuation: CheckedContinuation<Int, ReservationFailure>, bytes: Int)] = []
             while available > 0, let token = order.first {
                 order.removeFirst()
                 guard case .pending(let requested, let parked) = slots[token] else {
@@ -335,11 +401,18 @@ final class FlowControlWindow: Sendable {
     ///   type's doc comment.
     /// - Returns: a **partial** reservation: at least 1, at most `requested`. The caller loops
     ///   until it has reserved everything it needs (see the type's doc comment).
-    /// - Throws: the window's failure (`RPCError(code: .unavailable)` when the connection is torn
-    ///   down), or `CancellationError` if the task is cancelled while suspended and no grant had
+    /// - Throws: ``ReservationFailure/windowFailed(_:)`` carrying the window's failure
+    ///   (`RPCError(code: .unavailable)` when the connection is torn down), or
+    ///   ``ReservationFailure/cancelled`` if the task is cancelled while suspended and no grant had
     ///   already been handed to it. **Never returns 0, and never throws away a grant it was
     ///   given** -- see ``Slot``.
-    func reserve(upTo requested: Int) async throws -> Int {
+    ///
+    ///   Those are this layer's names for the two outcomes, not what a sender observes: the caller
+    ///   that crosses out of the flow-control layer -- `RPCTransportCore.reserveFully(_:from:)`,
+    ///   the only one there is -- maps them back through
+    ///   ``ReservationFailure/callerFacingError``, so a torn-down sender still sees the `RPCError`
+    ///   verbatim and a cancelled one still sees `CancellationError`.
+    func reserve(upTo requested: Int) async throws(ReservationFailure) -> Int {
         precondition(requested >= 1, "reserve(upTo:) needs at least 1 byte; got \(requested)")
 
         let admission: Admission = state.withLock { s in
@@ -361,7 +434,7 @@ final class FlowControlWindow: Sendable {
         case .reserved(let bytes):
             return bytes
         case .failed(let error):
-            throw error
+            throw .windowFailed(error)
         case .parked(let token):
             return try await park(token)
         }
@@ -373,46 +446,72 @@ final class FlowControlWindow: Sendable {
     /// what makes the race benign in either direction: if `onCancel` runs first it writes
     /// `.cancelled` and this body observes it; if `grant` runs first it writes `.granted(k)` and
     /// `onCancel` finds a non-`.pending` slot and leaves it alone.
-    private func park(_ token: UInt64) async throws -> Int {
-        try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Int, any Error>) in
-                let immediate: Result<Int, any Error>? = state.withLock { s in
-                    guard let slot = s.slots[token] else {
-                        // Impossible: only this function removes a slot belonging to a waiter that
-                        // has not parked, and this function runs once per token. Trap rather than
-                        // invent a reservation -- a fabricated 0 would violate the contract and a
-                        // fabricated non-zero would conjure window out of nothing.
-                        preconditionFailure("flow-control slot \(token) vanished before its waiter parked")
+    ///
+    /// # Why the operation closure carries an explicit `() async throws(ReservationFailure) -> Int`
+    ///
+    /// Both `withTaskCancellationHandler` and `withCheckedThrowingContinuation` have typed-throws
+    /// overloads on this toolchain -- `throws(Failure)` and `throws(E)`, both available from
+    /// macOS 10.15 -- but `withTaskCancellationHandler` also has an untyped `rethrows` overload, and
+    /// with a bare trailing closure the compiler picks **that** one: measured, in a standalone probe
+    /// as well as here, as "thrown expression type 'any Error' cannot be converted to error type
+    /// 'ReservationFailure'" pointing at the `withTaskCancellationHandler` call itself. Spelling the
+    /// closure's type selects the typed overload and the error survives both nested calls with no
+    /// cast and no unreachable branch. The inner call needs no such help: annotating `continuation`
+    /// already pins `E`.
+    ///
+    /// `XPCClientTransport.ParkedConnect`'s doc comment records the same collision for a
+    /// `throws(RPCError)` operation closure and resolves it the other way, by carrying the outcome
+    /// as a `Result` through a non-throwing continuation. That remains correct there and is not
+    /// worth churning; but do not read it as a rule that a typed error *cannot* cross these two
+    /// functions -- it is a rule about which overload a bare trailing closure selects.
+    private func park(_ token: UInt64) async throws(ReservationFailure) -> Int {
+        try await withTaskCancellationHandler(
+            operation: { () async throws(ReservationFailure) -> Int in
+                try await withCheckedThrowingContinuation {
+                    (continuation: CheckedContinuation<Int, ReservationFailure>) in
+                    let immediate: Result<Int, ReservationFailure>? = state.withLock { s in
+                        guard let slot = s.slots[token] else {
+                            // Impossible: only this function removes a slot belonging to a waiter
+                            // that has not parked, and this function runs once per token. Trap
+                            // rather than invent a reservation -- a fabricated 0 would violate the
+                            // contract and a fabricated non-zero would conjure window out of
+                            // nothing.
+                            preconditionFailure(
+                                "flow-control slot \(token) vanished before its waiter parked")
+                        }
+                        switch slot {
+                        case .granted(let bytes):
+                            // Already ours. The bytes left `available` when this case was written,
+                            // so dropping them here -- because the task was cancelled a moment ago,
+                            // say -- would shrink the window permanently (L1: measured 1-14 permits
+                            // lost per 3 000 races in the previous design, ending in a stream
+                            // stalled forever).
+                            s.slots[token] = nil
+                            return .success(bytes)
+                        case .cancelled:
+                            s.slots[token] = nil
+                            return .failure(.cancelled)
+                        case .failed(let error):
+                            s.slots[token] = nil
+                            return .failure(.windowFailed(error))
+                        case .pending(let requested, let parked):
+                            precondition(parked == nil, "flow-control slot \(token) parked twice")
+                            s.slots[token] = .pending(
+                                requested: requested, continuation: continuation)
+                            return nil
+                        }
                     }
-                    switch slot {
-                    case .granted(let bytes):
-                        // Already ours. The bytes left `available` when this case was written, so
-                        // dropping them here -- because the task was cancelled a moment ago, say --
-                        // would shrink the window permanently (L1: measured 1-14 permits lost per
-                        // 3 000 races in the previous design, ending in a stream stalled forever).
-                        s.slots[token] = nil
-                        return .success(bytes)
-                    case .cancelled:
-                        s.slots[token] = nil
-                        return .failure(CancellationError())
-                    case .failed(let error):
-                        s.slots[token] = nil
-                        return .failure(error)
-                    case .pending(let requested, let parked):
-                        precondition(parked == nil, "flow-control slot \(token) parked twice")
-                        s.slots[token] = .pending(requested: requested, continuation: continuation)
-                        return nil
+                    // L7: resumed outside the lock. `withLock` has returned by here, in every
+                    // branch.
+                    switch immediate {
+                    case .success(let bytes): continuation.resume(returning: bytes)
+                    case .failure(let error): continuation.resume(throwing: error)
+                    case nil: break   // parked; `grant` or `fail` resumes it
                     }
-                }
-                // L7: resumed outside the lock. `withLock` has returned by here, in every branch.
-                switch immediate {
-                case .success(let bytes): continuation.resume(returning: bytes)
-                case .failure(let error): continuation.resume(throwing: error)
-                case nil: break   // parked; `grant` or `fail` resumes it
                 }
             }
-        } onCancel: {
-            let continuation = state.withLock { s -> CheckedContinuation<Int, any Error>? in
+        ) {
+            let continuation = state.withLock { s -> CheckedContinuation<Int, ReservationFailure>? in
                 // Not `.pending` any more (or already collected) means someone else resolved this
                 // waiter first, and their resolution stands. This is the whole of L1's ordering:
                 // the check is "is the slot still unresolved", not "which flag is set".
@@ -429,7 +528,7 @@ final class FlowControlWindow: Sendable {
                 return nil
             }
             // L7.
-            continuation?.resume(throwing: CancellationError())
+            continuation?.resume(throwing: .cancelled)
         }
     }
 
@@ -456,7 +555,7 @@ final class FlowControlWindow: Sendable {
     /// - Throws: `RPCError(code: .internalError)` if the credit would take the window above
     ///   §O4's 2³¹−1 ceiling -- a protocol violation by the peer.
     func grant(_ bytes: UInt32) throws(RPCError) {
-        var toResume: [(continuation: CheckedContinuation<Int, any Error>, bytes: Int)] = []
+        var toResume: [(continuation: CheckedContinuation<Int, ReservationFailure>, bytes: Int)] = []
 
         try state.withLock { s throws(RPCError) in
             // Validate the peer's number whatever the window's state: a protocol violation is a
@@ -536,7 +635,7 @@ final class FlowControlWindow: Sendable {
         precondition(bytes >= 0, "release(_:) takes a byte count; got \(bytes)")
         guard bytes > 0 else { return }
 
-        var toResume: [(continuation: CheckedContinuation<Int, any Error>, bytes: Int)] = []
+        var toResume: [(continuation: CheckedContinuation<Int, ReservationFailure>, bytes: Int)] = []
         state.withLock { s in
             guard s.failure == nil else { return }
             toResume = s.bank(bytes)
@@ -558,10 +657,11 @@ final class FlowControlWindow: Sendable {
     ///
     /// **`RPCError`, not `any Error`.** Every caller -- ``RPCTransportCore/failAll(_:)``,
     /// `removeStream`, and the two tests -- already had one; nothing was ever narrowed or wrapped
-    /// to make that fit. The value is stored verbatim in `State.failure` and rethrown verbatim by
-    /// ``reserve(upTo:)``, so what a torn-down sender observes is unchanged by the typing. What a
-    /// *cancelled* sender observes is a separate question and is still `CancellationError` -- see
-    /// ``Slot``.
+    /// to make that fit. The value is stored verbatim in `State.failure`, travels verbatim as
+    /// ``ReservationFailure/windowFailed(_:)``'s payload, and is unwrapped verbatim by
+    /// ``ReservationFailure/callerFacingError``, so what a torn-down sender observes is unchanged by
+    /// the typing. What a *cancelled* sender observes is a separate question and is still
+    /// `CancellationError` -- see ``ReservationFailure``.
     ///
     /// Racing ``grant(_:)`` is well-defined in both directions, because both only transition slots
     /// that are still `.pending`: a waiter that `grant` already resolved keeps its `.granted(k)`
@@ -569,7 +669,7 @@ final class FlowControlWindow: Sendable {
     /// window has already deducted, which is exactly L1). Its sender then discovers the failure on
     /// its next reservation, or from the substrate when the send fails.
     func fail(_ error: RPCError) {
-        var toResume: [CheckedContinuation<Int, any Error>] = []
+        var toResume: [CheckedContinuation<Int, ReservationFailure>] = []
 
         state.withLock { s in
             if s.failure == nil { s.failure = error }
@@ -588,7 +688,7 @@ final class FlowControlWindow: Sendable {
         }
 
         // L7.
-        for continuation in toResume { continuation.resume(throwing: error) }
+        for continuation in toResume { continuation.resume(throwing: .windowFailed(error)) }
     }
 }
 

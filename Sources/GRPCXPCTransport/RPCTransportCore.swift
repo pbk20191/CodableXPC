@@ -1326,6 +1326,30 @@ final class RPCTransportCore: Sendable {
     /// that goes back with `release(_:)` -- including on the `CancellationError` path, because
     /// `reserve` hands bytes even to a task cancelled an instant earlier (that is L1 working, not
     /// a bug to work around).
+    ///
+    /// # This is the observability boundary, and the one place `ReservationFailure` is unwrapped
+    ///
+    /// `reserve(upTo:)` is `throws(FlowControlWindow.ReservationFailure)` -- a two-case type that
+    /// says *which* of the two things went wrong, so the window's slot cell and its continuation
+    /// enumerate the same outcomes. That type is an implementation detail of the flow-control layer
+    /// and stops here, at its only in-tree consumer: `callerFacingError` maps `.cancelled` back to
+    /// `CancellationError` and `.windowFailed(e)` back to `e`, so nothing above this line can tell
+    /// the type exists.
+    ///
+    /// **Here rather than higher up**, and the trace is short. Above this are
+    /// `reserveOutboundWindow` (which also throws a plain `RPCError` when the stream is gone --
+    /// forcing the two-case type through it would mean inventing a `.windowFailed` for a window
+    /// that did not fail), then `OutboundOpWriter.write`, whose signature is
+    /// `ClosableRPCWriterProtocol`'s untyped `async throws` and cannot be narrowed, and then
+    /// `withStream`'s caller, which is application code holding a `RPCWriter.Closable`. Not one of
+    /// those three switches on the error's identity; every one of them only catches to give the
+    /// reservation back and rethrow. So there is nothing further up that the extra precision could
+    /// serve, and one hop further up would already be two mapping sites instead of one -- this
+    /// method is called twice (stream window, then connection window) but its `catch` is written
+    /// once, and it is a `catch` that had to exist anyway for the give-back.
+    ///
+    /// **Here rather than inside `FlowControlWindow`**, because mapping there would leave the cell
+    /// re-erasing its own outcome on the way out, which is the thing being removed.
     private static func reserveFully(_ charge: Int, from window: FlowControlWindow) async throws {
         var acquired = 0
         do {
@@ -1334,7 +1358,7 @@ final class RPCTransportCore: Sendable {
             }
         } catch {
             if acquired > 0 { window.release(acquired) }
-            throw error
+            throw error.callerFacingError
         }
     }
 

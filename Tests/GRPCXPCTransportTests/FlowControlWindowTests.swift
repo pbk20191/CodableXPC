@@ -96,7 +96,7 @@ final class FlowControlWindowTests: XCTestCase {
         ///
         /// Deterministic whichever way the scheduler orders the cancellation against the task's
         /// start: cancel before entry, between taking the token and installing the handler, or
-        /// after parking all resolve the same slot to `.cancelled` / `CancellationError`.
+        /// after parking all resolve the same slot to `.cancelled`.
         case cancelResolvesThenGrantArrives
 
         /// The waiter is parked and both resolutions are then called back to back. **Which one
@@ -134,7 +134,20 @@ final class FlowControlWindowTests: XCTestCase {
         let task = Task.detached { try await window.reserve(upTo: 1) }
 
         var reserved = 0
-        var thrown: (any Error)?
+        var thrown: FlowControlWindow.ReservationFailure?
+
+        // `Task.detached` erases its `Failure` to `any Error` (there is no typed-throws overload),
+        // so the narrowing happens here rather than in the type. That the erased value is always a
+        // `ReservationFailure` is itself part of `reserve(upTo:)`'s contract, so a value that is
+        // not one is a violation and not a cast to force.
+        func narrow(_ error: any Error) -> String? {
+            guard let failure = error as? FlowControlWindow.ReservationFailure else {
+                return "\(order): reserve threw \(type(of: error)); reserve(upTo:) is "
+                    + "throws(ReservationFailure) and can produce nothing else"
+            }
+            thrown = failure
+            return nil
+        }
 
         switch order {
         case .grantResolvesThenCancelArrives, .cancelCalledOnAParkedWaiter:
@@ -153,7 +166,7 @@ final class FlowControlWindowTests: XCTestCase {
             }
             switch await task.result {
             case .success(let bytes): reserved = bytes
-            case .failure(let error): thrown = error
+            case .failure(let error): if let problem = narrow(error) { return problem }
             }
 
         case .cancelResolvesThenGrantArrives:
@@ -162,7 +175,7 @@ final class FlowControlWindowTests: XCTestCase {
             // which is the whole point of `reserve` throwing rather than parking on cancellation.
             switch await task.result {
             case .success(let bytes): reserved = bytes
-            case .failure(let error): thrown = error
+            case .failure(let error): if let problem = narrow(error) { return problem }
             }
             do { try window.grant(1) } catch { return "\(order): grant(1) threw \(error)" }
         }
@@ -180,16 +193,25 @@ final class FlowControlWindowTests: XCTestCase {
         }
 
         // Then the per-case consequence.
+        //
+        // These assert `ReservationFailure.cancelled` rather than `CancellationError`, and that is
+        // a **gain** in precision, not a retype to match the implementation: the subject here is
+        // `FlowControlWindow.reserve(upTo:)` called directly, so its own contract is what is under
+        // test, and `.cancelled` distinguishes the cancellation from `.windowFailed` in a way that
+        // `is CancellationError` could only do by exclusion. What a caller *above* the flow-control
+        // layer sees is a different claim, and it has its own tests:
+        // `testACancelledWriterAboveTheTransportStillSeesCancellationError` here, and
+        // `BackpressureTests.testAGatedReaderBoundsTheWritersInFlightBytes` over a real XPC pair.
         switch order {
         case .grantResolvesThenCancelArrives:
             guard thrown == nil, reserved == 1 else {
                 return "\(order): the waiter must keep the byte the grant already deducted for it; "
-                    + "got " + (thrown.map { "\(type(of: $0))" } ?? "\(reserved)")
+                    + "got " + (thrown.map { "\($0)" } ?? "\(reserved)")
             }
         case .cancelResolvesThenGrantArrives:
-            guard thrown is CancellationError else {
-                return "\(order): expected CancellationError, got "
-                    + (thrown.map { "\(type(of: $0))" } ?? "a reservation of \(reserved)")
+            guard case .cancelled = thrown else {
+                return "\(order): expected ReservationFailure.cancelled, got "
+                    + (thrown.map { "\($0)" } ?? "a reservation of \(reserved)")
             }
             guard available == 1 else {
                 return "\(order): the byte must stay in the window rather than be handed to a "
@@ -197,19 +219,20 @@ final class FlowControlWindowTests: XCTestCase {
             }
         case .cancelCalledOnAParkedWaiter:
             // Either winner is legal; the consequence must match whichever it was.
-            if thrown is CancellationError {
+            switch thrown {
+            case .cancelled:
                 guard available == 1 else {
                     return "\(order): the cancellation won, so the byte must be in the window; "
                         + "available == \(available)"
                 }
-            } else if thrown == nil {
+            case nil:
                 guard reserved == 1, available == 0 else {
                     return "\(order): the grant won, so the waiter must hold exactly the one byte; "
                         + "reserved \(reserved), available \(available)"
                 }
-            } else {
-                return "\(order): reserve threw \(type(of: thrown!)); only CancellationError is "
-                    + "legal here"
+            case .windowFailed(let error):
+                return "\(order): reserve threw .windowFailed(\(error)); nothing failed this "
+                    + "window, so only .cancelled is legal here"
             }
         }
         return nil
@@ -244,12 +267,16 @@ final class FlowControlWindowTests: XCTestCase {
                         "round \(round): reserve returned \(bytes), must be exactly 1")
                 }
             case .failure(let error):
-                if error is CancellationError {
+                // Same judgement as `orderedRound`: this calls `reserve(upTo:)` directly, so the
+                // window's own contract is the subject and `.cancelled` is the precise claim.
+                // Nothing here fails the window, so `.windowFailed` is a violation rather than an
+                // alternative -- which the old `is CancellationError` could not say.
+                if case .cancelled? = error as? FlowControlWindow.ReservationFailure {
                     outcome.cancelled += 1
                 } else {
                     outcome.violations.append(
                         "round \(round): reserve threw \(type(of: error)) (\(error)); only "
-                            + "CancellationError is legal here")
+                            + "ReservationFailure.cancelled is legal here")
                 }
             }
 
@@ -536,9 +563,13 @@ final class FlowControlWindowTests: XCTestCase {
                 XCTFail(
                     "reserve returned \(bytes) from an empty window to an already-cancelled task")
             case .failure(let error):
-                XCTAssertTrue(
-                    error is CancellationError,
-                    "expected CancellationError, got \(type(of: error)): \(error)")
+                // The window's own contract again -- `reserve(upTo:)` is called directly here --
+                // so the precise case, not the caller-facing identity it is later mapped to.
+                guard case .cancelled? = error as? FlowControlWindow.ReservationFailure else {
+                    XCTFail(
+                        "expected ReservationFailure.cancelled, got \(type(of: error)): \(error)")
+                    return
+                }
             }
 
             XCTAssertEqual(
@@ -581,10 +612,24 @@ final class FlowControlWindowTests: XCTestCase {
                 do {
                     _ = try await window.reserve(upTo: 1)
                     log.append("third=returned")
-                } catch let error as RPCError where error == Self.probeFailure {
-                    log.append("third=probeFailure")
                 } catch {
-                    log.append("third=\(type(of: error)): \(error)")
+                    // The sticky failure travels as `.windowFailed`'s payload and is compared by
+                    // **identity**, so this cannot pass on an error the window synthesised.
+                    //
+                    // Spelled as a cast rather than as `catch .windowFailed(...)`: this `catch` is
+                    // inferred `any Error` (the enclosing closure has other, differently-typed
+                    // throwing calls), and the leading-dot form then resolves against the wrong
+                    // type -- or, written as `catch .windowFailed(Self.probeFailure)`, crashes this
+                    // toolchain's type checker outright (`recordMatchCallArgumentResult`,
+                    // CSSimplify.cpp:15618).
+                    if case .windowFailed(let rpc)? =
+                        error as? FlowControlWindow.ReservationFailure,
+                        rpc == Self.probeFailure
+                    {
+                        log.append("third=probeFailure")
+                    } else {
+                        log.append("third=\(error)")
+                    }
                 }
                 return log
             }
@@ -599,6 +644,76 @@ final class FlowControlWindowTests: XCTestCase {
             ["first=5", "second=4", "third=probeFailure"],
             "a reentrant reserve/grant/release/fail from a resumed waiter must all complete, and "
                 + "fail must be sticky")
+    }
+
+    // =======================================================================================
+    // MARK: - The observability boundary
+    // =======================================================================================
+
+    /// **`ReservationFailure` stops at `RPCTransportCore.reserveFully(_:from:)`.** A sender above it
+    /// still sees `CancellationError`, exactly as it did before that type existed.
+    ///
+    /// This is the assertion that makes the two-case failure type a *refactor*. Every other case in
+    /// this file calls `FlowControlWindow.reserve(upTo:)` directly and therefore asserts the
+    /// window's own contract -- `.cancelled`, which is strictly more precise than the
+    /// `is CancellationError` they used to assert, because it also rules out `.windowFailed`. None
+    /// of them can tell whether the mapping back exists. This one can: it goes through
+    /// `OutboundOpWriter.write` -> `reserveOutboundWindow` -> `reserveFully`, which is the whole of
+    /// the chain between the window and application code, and it fails if the erasure is dropped,
+    /// moved, or applied to the wrong case.
+    ///
+    /// The owner chose the two-case type over the simpler "rewrite `CancellationError` as
+    /// `RPCError(code: .cancelled)`" *because* that alternative would change this. So a future
+    /// change that makes a cancelled sender see an `RPCError` is a decision to take deliberately,
+    /// not a test to update.
+    ///
+    /// # Determinism, not a settle window
+    ///
+    /// The task busy-waits on `Task.isCancelled` before it calls `write` at all, so the reservation
+    /// is provably entered post-cancellation and `withTaskCancellationHandler` runs `onCancel`
+    /// ahead of the operation body -- the same device
+    /// ``testReserveOnAnAlreadyCancelledTaskThrowsRatherThanParks()`` uses, and the reason this case
+    /// needs neither a race nor a negative-assertion sleep to catch a writer in the act of parking.
+    /// `BackpressureTests.testAGatedReaderBoundsTheWritersInFlightBytes` covers the *raced* shape
+    /// of the same claim over a real XPC pair, and
+    /// `TeardownTests.testPeerDeathWakesWritersParkedOnBothWindows` covers the other half of the
+    /// mapping -- `.windowFailed(e)` -> `e`, seen as an `RPCError` of `.unavailable`.
+    func testACancelledWriterAboveTheTransportStillSeesCancellationError() throws {
+        try runBounded("the reservation-failure boundary", timeout: 20) {
+            let core = CoreUnderTest(role: .client, label: "reservation-boundary")
+            defer { core.shutDown() }
+
+            let opened = try core.core.openStream(
+                descriptor: MethodDescriptor(fullyQualifiedService: "pkg.Svc", method: "Push"),
+                timeout: nil)
+            let outbound = opened.stream.outbound
+
+            // §O4 clamps a charge at the window it must fit in, so one message of exactly
+            // `initialWindow` bytes empties this stream's window *and* the connection's. Nothing is
+            // left for the next message, and no peer credit can arrive -- `TestPipe` is the peer and
+            // it is not answering.
+            try await outbound.write(.message(WindowSizes.payload(FlowControl.initialWindow)))
+
+            let task = Task.detached { () -> Void in
+                while !Task.isCancelled { try? await Task.sleep(for: .milliseconds(1)) }
+                try await outbound.write(.message(WindowSizes.payload(1)))
+            }
+            task.cancel()
+
+            switch await task.result {
+            case .success:
+                XCTFail("the write completed with both windows at zero; nothing was reserved for it")
+            case .failure(let error):
+                XCTAssertTrue(
+                    error is CancellationError,
+                    "a cancelled sender must still see CancellationError, got "
+                        + "\(type(of: error)): \(error)")
+                XCTAssertNil(
+                    error as? FlowControlWindow.ReservationFailure,
+                    "ReservationFailure is the flow-control layer's own vocabulary and must not "
+                        + "reach a caller: \(error)")
+            }
+        }
     }
 
     // =======================================================================================
