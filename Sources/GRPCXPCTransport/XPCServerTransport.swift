@@ -428,7 +428,7 @@ public final class XPCServerTransport: ServerTransport {
     /// This listener's endpoint, for the anonymous case only. `XPCEndpoint` is how a peer in the
     /// same process (or one handed the endpoint over an existing session) dials an anonymous
     /// listener; a named-service listener is dialled by name instead and has none.
-    let endpoint: XPCEndpoint?
+    public let endpoint: XPCEndpoint?
 
     /// Admitted connections still waiting for libxpc to prove their accept window closed. Should
     /// be 0 in any steady state: the proof arrives with the peer's first blob, which is the blob
@@ -525,10 +525,12 @@ public final class XPCServerTransport: ServerTransport {
     /// Listens on an **anonymous** listener and exposes its ``endpoint``, which is how a peer is
     /// connected without a launchd service -- including a peer in this same process.
     ///
-    /// Internal rather than public: an anonymous endpoint has to be handed to the peer by some
-    /// other channel, so this is a building block (and the in-process pair below), not a
-    /// deployment story.
-    static func anonymous() throws -> XPCServerTransport {
+    /// Public, but it is a building block rather than a deployment story on its own: an anonymous
+    /// endpoint is not discoverable, so it has to be handed to the peer over a channel that
+    /// already exists. That is the ordinary XPC brokering pattern, and it is the one topology a
+    /// launchd name cannot express -- see ``XPCClientTransport/connecting(to:)`` for the other
+    /// half. The in-process pair below is the same machinery with both ends here.
+    public static func anonymous() throws -> XPCServerTransport {
         let acceptor = Acceptor()
         let listener = XPCListener(
             targetQueue: nil, options: .inactive,

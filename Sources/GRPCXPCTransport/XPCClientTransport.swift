@@ -1,6 +1,7 @@
 import Dispatch
 import GRPCCore
 import Synchronization
+import XPC
 
 /// The process-wide source of connection-queue labels, shared by both transports.
 ///
@@ -213,11 +214,17 @@ public final class XPCClientTransport: ClientTransport {
     private enum Peer {
         case machService(String)
         case xpcService(String)
+        case peer(XPCEndpoint)
 
         var label: String {
             switch self {
             case .machService(let name): "machService:\(name)"
             case .xpcService(let name): "xpcService:\(name)"
+            // No interpolation: an anonymous endpoint has no stable name a human could match
+            // against anything, and this string ends up as a dispatch queue label in crash logs.
+            // `dialledCore` already appends a process-wide counter, which is what distinguishes
+            // one anonymous dial from the next.
+            case .peer: "endpoint"
             }
         }
     }
@@ -245,6 +252,22 @@ public final class XPCClientTransport: ClientTransport {
     public static func connecting(toXPCService name: String) throws -> XPCClientTransport {
         try dialling(.xpcService(name))
     }
+    
+    /// Dials an **anonymous** listener's endpoint -- the third topology, and the one a launchd
+    /// name cannot express.
+    ///
+    /// `XPCEndpoint` is not discoverable: the server side gets one from
+    /// ``XPCServerTransport/anonymous()``'s ``XPCServerTransport/endpoint`` and has to hand it to
+    /// this side over a channel that already exists, which is the ordinary XPC brokering pattern
+    /// (a broker service vends per-client endpoints over its own connection). That is why this
+    /// takes an endpoint rather than a name, and why there is nothing to look up.
+    ///
+    /// Taking an `XPCEndpoint` is what obliges this file to `import XPC`; the rest of the op
+    /// layer stays substrate-agnostic.
+    public static func connecting(to endpoint: XPCEndpoint) throws -> XPCClientTransport {
+        try dialling(.peer(endpoint))
+    }
+
 
     /// **The one build-a-client-core recipe.** Mints the connection queue, builds the mux inside
     /// `building`, and hands back both halves.
@@ -312,6 +335,8 @@ public final class XPCClientTransport: ClientTransport {
                 try XPCPipe.connecting(toMachService: name, queue: queue, building: building)
             case .xpcService(let name):
                 try XPCPipe.connecting(toXPCService: name, queue: queue, building: building)
+            case .peer(let endPoint):
+                try XPCPipe.connecting(to: endPoint, queue: queue, building: building)
             }
         }
         return XPCClientTransport(core: core)

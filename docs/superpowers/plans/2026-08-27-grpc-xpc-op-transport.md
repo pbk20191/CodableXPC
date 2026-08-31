@@ -75,6 +75,18 @@ modules — the project owner chose this over splitting a core module out.
 separate module: if a task needs an XPC type inside `RPCTransportCore`, the abstraction is wrong and
 the task must report it rather than importing.
 
+**But the rule stops there, and the rationale above it was wrong.** The seam was justified as
+keeping the op layer portable to another substrate — and this plan had already ruled *pure XPC
+only*, so that substrate was never going to be written. What the seam actually earns its keep for
+is **testing**: most of the suite (ordering stress, flow control, wire protocol) drives the mux over
+`TestPipe` rather than over libxpc, which is a real second conformer, not a hypothetical one. Judge
+the seam by that, and keep the rule scoped to the core and the codec.
+
+Everything else may import `XPC` when it has a reason. Both transports do: the server for
+`XPCListener`, the client for the public `connecting(to: XPCEndpoint)` that makes brokering
+reachable. Successive task briefs tightened this to *"one file only"* and had to relax it three
+times — the tell that the constraint was being policed past the point where it bought anything.
+
 **No socket pipe is built.** The seam exists so one *could* be; building it is out of scope.
 
 ## Existing work: what stays
