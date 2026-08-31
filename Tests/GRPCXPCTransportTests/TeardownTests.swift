@@ -508,4 +508,110 @@ final class TeardownTests: XCTestCase {
             withExtendedLifetime(pipe) {}
         }
     }
+
+    // =======================================================================================
+    // MARK: - A failure on an inbound sequence is terminal
+    // =======================================================================================
+
+    /// The unit-level floor under every teardown test above: once ``InboundContinuation`` has
+    /// carried a failure, **nothing follows it**.
+    ///
+    /// # Why this needs its own test rather than riding on the integration tests
+    ///
+    /// The inbound parts used to travel as `AsyncThrowingStream<Part, any Error>`, where
+    /// `finish(throwing:)` made this true by construction. They now travel as
+    /// `AsyncStream<Result<Part, RPCError>>`, where the error is an ordinary element and the buffer
+    /// is perfectly willing to accept more after it. `InboundContinuation` is what puts the
+    /// guarantee back, and the tests above would not notice if it stopped holding: they assert that
+    /// a consumer *sees* the failure, which a stream that also delivered trailing junk after it
+    /// would still satisfy.
+    ///
+    /// Both halves of the invariant are asserted from the consumer's side, which is the only side
+    /// that matters:
+    ///
+    /// * a `yield` after the failure is dropped -- **not** trapped, deliberately, because `deliver`
+    ///   races `removeStream` off the pipe's queue and that interleaving is legal (see the type's
+    ///   own documentation);
+    /// * a second `finish(throwing:)` cannot append a second failure or overwrite the first.
+    ///
+    /// The parts already buffered *before* the failure must still arrive -- that is the property
+    /// the `Result`-as-element shape gets for free, and asserting it here is what stops a future
+    /// "make failure terminal" change from over-reaching into discarding the buffer.
+    func testAFailureIsTheLastThingAnInboundSequenceDelivers() throws {
+        try runBounded("a failure is terminal", timeout: 20) {
+            let (stream, continuation) = InboundContinuation<RPCRequestPart<GRPCSwiftData>>
+                .makeStream()
+
+            let first = RPCError(code: .internalError, message: "the first and only failure")
+            let second = RPCError(code: .unavailable, message: "a second failure, which must not "
+                + "reach the consumer")
+
+            continuation.yield(.metadata([:]))
+            continuation.finish(throwing: first)
+            // Everything from here on must be invisible to the consumer.
+            continuation.yield(.message([1, 2, 3]))
+            continuation.finish(throwing: second)
+            continuation.finish()
+
+            var delivered: [Result<RPCRequestPart<GRPCSwiftData>, RPCError>] = []
+            for await element in stream { delivered.append(element) }
+
+            XCTAssertEqual(
+                delivered.count, 2,
+                "the consumer must see exactly the part buffered before the failure and then the "
+                    + "failure; got \(delivered.count) element(s)")
+
+            guard delivered.count == 2 else { return }
+
+            guard case .success(.metadata) = delivered[0] else {
+                XCTFail(
+                    "a part buffered before the failure must still be delivered -- the error is an "
+                        + "element behind it in the same buffer, not a signal that races it")
+                return
+            }
+            guard case .failure(let observed) = delivered[1] else {
+                XCTFail("the failure must be the last element delivered")
+                return
+            }
+            XCTAssertEqual(
+                observed.code, first.code,
+                "the *first* failure is the terminal one; a later finish(throwing:) must not "
+                    + "replace it")
+            XCTAssertEqual(observed.message, first.message)
+        }
+    }
+
+    /// A clean end is terminal in the same way: a stream that has already finished normally cannot
+    /// be given an error afterwards.
+    ///
+    /// This is the ordering `RPCTransportCore` actually relies on. `deliver(_:toStream:)` finishes
+    /// the sequence the moment the decoder reports the remote end, and the `retireIfComplete(_:)`
+    /// immediately after reaches `removeStream` -- which calls `finishInbound` again. If a late
+    /// error could still be appended there, every cleanly completed RPC would be at the mercy of
+    /// whatever the teardown path happened to be holding, and a handler that had already succeeded
+    /// would see a cancellation.
+    func testACleanEndCannotLaterBeTurnedIntoAFailure() throws {
+        try runBounded("a clean end is terminal", timeout: 20) {
+            let (stream, continuation) = InboundContinuation<RPCRequestPart<GRPCSwiftData>>
+                .makeStream()
+
+            continuation.yield(.metadata([:]))
+            continuation.finish()
+            continuation.finish(
+                throwing: RPCError(code: .cancelled, message: "a late cancel, arriving after the "
+                    + "stream had already completed cleanly"))
+
+            var delivered: [Result<RPCRequestPart<GRPCSwiftData>, RPCError>] = []
+            for await element in stream { delivered.append(element) }
+
+            XCTAssertEqual(
+                delivered.count, 1,
+                "a cleanly ended sequence must deliver its buffered part and nothing else; got "
+                    + "\(delivered.count) element(s)")
+            guard case .success(.metadata) = delivered.first else {
+                XCTFail("a clean end must not be retro-fitted with an error")
+                return
+            }
+        }
+    }
 }

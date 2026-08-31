@@ -64,7 +64,7 @@ import Synchronization
 // * **L7 -- explicit lifecycle.** `Phase = .running | .draining | .closed` under the one
 //   `registry` mutex, taken-and-transitioned atomically. No continuation is ever resumed under a
 //   lock, and nothing that can suspend is held across one: every window `grant`/`release`/`fail`
-//   and every `AsyncThrowingStream.Continuation` call happens after `withLock` has returned, and
+//   and every ``InboundContinuation`` call happens after `withLock` has returned, and
 //   §O4's credit is acquired before any lock is taken.
 //
 // * **Outbound order.** `pipe.send` *is* held under a lock, and deliberately -- the ``submission``
@@ -132,7 +132,7 @@ import Synchronization
 //   connection (`Registry.connectionUnconsumed`), and a peer that pushes past either bound is
 //   failed at that bound's blast radius: a stream over its 65 535 fails *that stream* and gets a
 //   `cancel`; the connection total over its own fails the *connection*. This is what HTTP/2 spends
-//   `FLOW_CONTROL_ERROR` on. Without it the inbound `AsyncThrowingStream` is an unbounded buffer
+//   `FLOW_CONTROL_ERROR` on. Without it the inbound part stream is an unbounded buffer
 //   and a peer that simply ignores `credit` retains 16 MiB per op, on every admitted stream, until
 //   an application that will never read it does. An accountant with no debit side is not flow
 //   control. See ``deliver(_:toStream:)`` for the exactness argument -- the counter mirrors the
@@ -181,6 +181,13 @@ import Synchronization
 /// ``AcceptedRPCStream`` -- which is **not** generic, and must not become so, or the server's
 /// `AsyncStream<AcceptedRPCStream>` and both of `XPCServerTransport.Acceptor`'s tables would be --
 /// has to name one without choosing an instantiation to name it through.
+///
+/// **`any Error`, and it is not a choice this file gets to make.** grpc-swift fixes
+/// `Inbound == RPCAsyncSequence<RPCResponsePart<Bytes>, any Error>` on `ClientTransport`, and
+/// `RPCAsyncSequence.init(wrapping:)` wants an exact match rather than a conversion, so a narrower
+/// failure type here does not type-check at `withStream`. The parts themselves travel with a
+/// concrete `RPCError` right up to this boundary -- see ``CreditingInbound`` for the one place the
+/// widening happens and why it can only happen there.
 @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
 typealias ClientRPCStream = RPCStream<
     RPCAsyncSequence<RPCResponsePart<GRPCSwiftData>, any Error>,
@@ -287,7 +294,7 @@ final class RPCTransportCore<Pipe: MessagePipe, Codec: WireCodec>: Sendable {
     /// (§O5 deviation 6). §O4's byte credit bounds a stream's bytes; nothing in the op model bounds
     /// how many streams a peer may open, and §O5 negotiates nothing, so without this a peer can
     /// spend ~40 wire bytes per `openStream` to buy a table entry, two windows and an
-    /// `AsyncThrowingStream` each. Over-limit accepts are refused with `status(resourceExhausted)`,
+    /// inbound part stream each. Over-limit accepts are refused with `status(resourceExhausted)`,
     /// which is an ordinary gRPC failure on the peer's side.
     ///
     /// **"Outstanding" counts the table *plus* accepts yielded but not yet pulled**, and that
@@ -483,28 +490,25 @@ final class RPCTransportCore<Pipe: MessagePipe, Codec: WireCodec>: Sendable {
 
         /// Ends this stream's inbound sequence. `error == nil` is the clean end-of-stream.
         ///
-        /// `RPCError?` rather than `(any Error)?` even though the `AsyncThrowingStream` beneath is
-        /// gRPC's `..., any Error>`: the two callers (``removeStream(_:failingInboundWith:_:)`` and
-        /// ``failAll(_:)``) both hold an `RPCError` now, and widening back to the existential here
-        /// would only re-open a door nothing walks through. The upcast to the stream's own failure
-        /// type happens at `finish(throwing:)`.
+        /// `RPCError?` rather than `(any Error)?`: the two callers
+        /// (``removeStream(_:failingInboundWith:sendingCancel:)`` and ``failAll(_:)``) both hold an
+        /// `RPCError`, the storage beneath is `RPCError`-typed too, and the widening to gRPC's
+        /// `any Error` happens once, far downstream, at ``CreditingInbound``.
+        ///
+        /// Terminality is ``InboundContinuation/finish(throwing:)``'s to enforce, not this
+        /// function's: there, the error and the end are one call, so this cannot emit a failure and
+        /// then forget to end the sequence.
         func finishInbound(throwing error: RPCError?) {
             switch inbound {
-            case .request(_, let continuation):
-                if let error { continuation.finish(throwing: error) } else { continuation.finish() }
-            case .response(_, let continuation):
-                if let error { continuation.finish(throwing: error) } else { continuation.finish() }
+            case .request(_, let continuation): continuation.finish(throwing: error)
+            case .response(_, let continuation): continuation.finish(throwing: error)
             }
         }
     }
 
     private enum InboundMachine {
-        case request(
-            RequestOpDecoder,
-            AsyncThrowingStream<RPCRequestPart<GRPCSwiftData>, any Error>.Continuation)
-        case response(
-            ResponseOpDecoder,
-            AsyncThrowingStream<RPCResponsePart<GRPCSwiftData>, any Error>.Continuation)
+        case request(RequestOpDecoder, InboundContinuation<RPCRequestPart<GRPCSwiftData>>)
+        case response(ResponseOpDecoder, InboundContinuation<RPCResponsePart<GRPCSwiftData>>)
     }
 
     /// L7: the connection's lifecycle, explicit and under the one lock.
@@ -836,17 +840,22 @@ final class RPCTransportCore<Pipe: MessagePipe, Codec: WireCodec>: Sendable {
     /// Type scope rather than function scope only because Swift cannot nest a type in a generic
     /// context, and this class is now generic over its two seams. Used by that one method and
     /// nothing else; it did not become shared by moving.
+    /// Private type scope rather than local to `deliver`, because Swift forbids a method-local
+    /// type in a generic context and the core is generic over its two seams. The payloads are
+    /// ``InboundContinuation``s: a `.failure` can only be emitted by `finish(throwing:)`, which
+    /// terminates in the same call, so "a failure is the last thing on this stream" is a shape
+    /// rather than a rule anyone has to keep.
     private enum Delivered {
         case unknownStream
         case streamOverran(Int)
         case connectionOverran(Int)
         case request(
             [RPCRequestPart<GRPCSwiftData>],
-            AsyncThrowingStream<RPCRequestPart<GRPCSwiftData>, any Error>.Continuation,
+            InboundContinuation<RPCRequestPart<GRPCSwiftData>>,
             remoteEnded: Bool)
         case response(
             [RPCResponsePart<GRPCSwiftData>],
-            AsyncThrowingStream<RPCResponsePart<GRPCSwiftData>, any Error>.Continuation,
+            InboundContinuation<RPCResponsePart<GRPCSwiftData>>,
             remoteEnded: Bool)
         case violation(RPCError)
     }
@@ -1032,8 +1041,8 @@ final class RPCTransportCore<Pipe: MessagePipe, Codec: WireCodec>: Sendable {
             return
         }
 
-        let (inbound, continuation) = AsyncThrowingStream.makeStream(
-            of: RPCRequestPart<GRPCSwiftData>.self)
+        let (inbound, continuation) = InboundContinuation<RPCRequestPart<GRPCSwiftData>>
+            .makeStream()
         let entry = StreamEntry(
             id: id,
             inbound: .request(
@@ -1241,8 +1250,8 @@ final class RPCTransportCore<Pipe: MessagePipe, Codec: WireCodec>: Sendable {
             "RPCTransportCore.openStream: only a client-role core allocates streams; a server "
                 + "accepts them through `acceptedStreams`")
 
-        let (inbound, continuation) = AsyncThrowingStream.makeStream(
-            of: RPCResponsePart<GRPCSwiftData>.self)
+        let (inbound, continuation) = InboundContinuation<RPCResponsePart<GRPCSwiftData>>
+            .makeStream()
 
         // L7: the lifecycle check and the id allocation are one atomic take-and-transition, so a
         // `beginDraining()` racing this call either loses (the stream is allocated) or wins (this
@@ -2309,6 +2318,115 @@ final class OutboundOpWriter<Encoder: OutboundOpEncoding, Pipe: MessagePipe, Cod
 }
 
 // ===========================================================================================
+// MARK: - Inbound parts: the producing half
+// ===========================================================================================
+
+/// The write end of one stream's inbound part sequence, and **the reason a failure on it is
+/// terminal by construction rather than by convention.**
+///
+/// # What this exists to replace
+///
+/// The parts used to travel as `AsyncThrowingStream<Part, any Error>`, whose `finish(throwing:)`
+/// made terminality *structural*: the error and the end were one call, so there could not be two
+/// errors and nothing could follow one. Carrying the error as an element of an
+/// `AsyncStream<Result<Part, RPCError>>` gives that up -- nothing stops a `yield(.failure(e))` from
+/// being followed by more yields, and the raw `.Continuation` offers no way to say "and that was
+/// the last one".
+///
+/// **So the pairing is not offered.** Holding the invariant with a comment on a two-call
+/// `yield(.failure(e)) ; finish()` sequence would be precisely the trade this project keeps being
+/// burnt by -- a type-enforced invariant swapped for a documented one. This type therefore has no
+/// `yield(_: Result<…>)` at all: ``finish(throwing:)`` is the *only* way a `.failure` can reach the
+/// stream, and it terminates in the same call. Emitting a failure and forgetting to end, or ending
+/// twice with two different errors, is not a bug to be caught -- it is unrepresentable.
+///
+/// # The latch, and why the hot path has neither a lock nor an atomic
+///
+/// One `Atomic<Bool>`, touched only by ``finish(throwing:)``, which runs on a teardown path at most
+/// once per stream. ``yield(_:)`` -- the delivery hot path -- does not consult it and takes no
+/// lock: it is a bare forward to the continuation, exactly as the raw `.Continuation` was. It does
+/// not need to consult anything, because `AsyncStream.Continuation.yield` is *already* a no-op once
+/// `finish()` has been called, dropping the value and returning `.terminated`. The producers are
+/// serialised on the pipe's queue (L4) besides, so ordering is given; only the terminal latch was
+/// ever missing.
+///
+/// The latch is deliberately belt-and-braces, and worth saying so plainly: today no two
+/// error-bearing finishes can race, because ``RPCTransportCore/removeStream(_:failingInboundWith:sendingCancel:)``
+/// and ``RPCTransportCore/failAll(_:)`` each take the entry out of the registry under its lock, so
+/// exactly one of them ever reaches a given stream with an error. The latch is what keeps *this
+/// type* correct without depending on that -- a caller discipline living in another file, several
+/// hundred lines away, which a future refactor could weaken without ever looking here.
+///
+/// # Why a post-terminal `yield` is dropped and not trapped
+///
+/// A trap is the house style for a caller bug (`preconditionFailure` when `credit` or `goAway`
+/// reaches a stream machine; `precondition(parked == nil, "parked twice")`), and those are cases no
+/// schedule can produce -- reaching them means someone wrote the call. A yield after termination is
+/// not in that class, for two independent reasons:
+///
+/// 1. **The clean path finishes twice, by design.** ``RPCTransportCore/deliver(_:toStream:)``
+///    finishes the sequence when the decoder reports the remote end, and the
+///    `retireIfComplete(_:)` immediately after reaches
+///    ``RPCTransportCore/removeStream(_:failingInboundWith:sendingCancel:)`` with a `nil` error,
+///    which finishes it again. Idempotence here is the normal case, not the pathological one.
+/// 2. **Delivery genuinely races teardown, and neither side is buggy.** `deliver` yields *outside*
+///    the registry lock (L7) and leaves the entry in the table, while `removeStream` reaches this
+///    type from ``RPCTransportCore/cancelStream(_:reason:)`` and `streamHandlerFinished` -- on
+///    whatever task the writer or the server handler is running, not the pipe's queue. L4
+///    serialises routing against routing; it says nothing about routing against a local cancel. So
+///    a `.success` arriving after a `.failure` is a legal interleaving, and trapping on it would
+///    turn an ordinary teardown race into a process kill.
+///
+/// Dropping is also what is actually being *restored*: `AsyncThrowingStream.finish(throwing:)` did
+/// not trap on a later `yield` either, it ignored it. A trap would be stricter than the invariant
+/// this type exists to bring back, and strictness that kills the process on a legal schedule is not
+/// a safety property.
+///
+/// # One property this conversion gets for free
+///
+/// "Buffered elements are delivered before the terminal error" is now trivially true, because the
+/// error *is* an element and sits in the same buffer behind them. Under `AsyncThrowingStream` the
+/// error travelled beside the buffer rather than in it, and that ordering was an argument review
+/// had to make about the implementation rather than a fact about the type.
+@available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
+final class InboundContinuation<Part: Sendable>: Sendable {
+
+    private let base: AsyncStream<Result<Part, RPCError>>.Continuation
+
+    /// `false` until ``finish(throwing:)`` has run. Never cleared.
+    private let terminated = Atomic<Bool>(false)
+
+    private init(base: AsyncStream<Result<Part, RPCError>>.Continuation) {
+        self.base = base
+    }
+
+    /// The read end and the write end together -- the only way to make either.
+    static func makeStream() -> (
+        stream: AsyncStream<Result<Part, RPCError>>, continuation: InboundContinuation<Part>
+    ) {
+        let (stream, continuation) = AsyncStream.makeStream(of: Result<Part, RPCError>.self)
+        return (stream, InboundContinuation(base: continuation))
+    }
+
+    /// Hands one part to the consumer. Dropped if the sequence has already ended -- see above on
+    /// why that is a drop and not a trap.
+    func yield(_ part: Part) {
+        base.yield(.success(part))
+    }
+
+    /// Ends the sequence, with `error` as its last element on the abnormal paths so a consumer sees
+    /// *why* rather than a silent end-of-stream. `nil` is the clean end.
+    ///
+    /// Idempotent, and the first call wins: a stream that has already ended cleanly cannot later be
+    /// given an error, and a stream that has already failed cannot fail twice.
+    func finish(throwing error: RPCError? = nil) {
+        guard !terminated.exchange(true, ordering: .acquiringAndReleasing) else { return }
+        if let error { base.yield(.failure(error)) }
+        base.finish()
+    }
+}
+
+// ===========================================================================================
 // MARK: - Credit on consumption (contract line 5)
 // ===========================================================================================
 
@@ -2322,16 +2440,37 @@ final class OutboundOpWriter<Encoder: OutboundOpEncoding, Pipe: MessagePipe, Cod
 ///
 /// `onConsume` holds the core weakly (L6) -- the closure the core passes in captures `[weak self]`
 /// -- so an undrained inbound sequence can never keep a connection alive.
+///
+/// # This is where `RPCError` becomes `any Error`, and it is the only such place
+///
+/// The concrete error type lives in the storage -- ``InboundContinuation`` and the
+/// `AsyncStream<Result<Part, RPCError>>` beneath it -- and at every producer site in this file.
+/// Nothing inside the core ever handles an inbound failure as an existential, so nothing inside the
+/// core has to re-open one to find out what went wrong.
+///
+/// It is widened exactly once, here, and the boundary is not negotiable. grpc-swift fixes
+/// `Inbound == RPCAsyncSequence<…Part<Bytes>, any Error>` on both transport protocols (see
+/// ``RPCTransportCore/ClientRPCStream`` and ``RPCTransportCore/ServerRPCStream``), and
+/// `RPCAsyncSequence.init(wrapping:)` requires `Source: AsyncSequence<Element, Failure>` -- an
+/// exact match on *both* parameters, not a conversion. So the sequence handed to `RPCAsyncSequence`
+/// must already declare `Failure == any Error`, and this wrapper is the last type this file owns
+/// before that call. Widening any earlier would throw the concrete type away while the core still
+/// had uses for it; widening any later is not possible, because there is no later.
+///
+/// The widening itself costs one word of source: `Result.get()` throws `RPCError`, which converts
+/// implicitly to `any Error` at the `throws(any Error)` boundary of ``Iterator/next(isolation:)``.
+/// Nothing above that boundary can observe the difference -- gRPC's generated code catches
+/// `any Error` and re-derives an `RPCError` from it either way.
 @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
 struct CreditingInbound<Part: Sendable>: AsyncSequence, Sendable {
     typealias Element = Part
     typealias Failure = any Error
 
-    private let base: AsyncThrowingStream<Part, any Error>
+    private let base: AsyncStream<Result<Part, RPCError>>
     private let onConsume: @Sendable (Part) -> Void
 
     init(
-        base: AsyncThrowingStream<Part, any Error>,
+        base: AsyncStream<Result<Part, RPCError>>,
         onConsume: @escaping @Sendable (Part) -> Void
     ) {
         self.base = base
@@ -2343,13 +2482,16 @@ struct CreditingInbound<Part: Sendable>: AsyncSequence, Sendable {
     }
 
     struct Iterator: AsyncIteratorProtocol {
-        fileprivate var base: AsyncThrowingStream<Part, any Error>.AsyncIterator
+        fileprivate var base: AsyncStream<Result<Part, RPCError>>.AsyncIterator
         fileprivate let onConsume: @Sendable (Part) -> Void
 
         /// Credit goes out **after** the element has been handed over, so a consumer that never
         /// comes back for the next one has still had its window returned for the one it took.
+        ///
+        /// The `?.get()` is the widening described above: it throws the storage's concrete
+        /// `RPCError` into this method's `any Error`.
         mutating func next(isolation actor: isolated (any Actor)?) async throws(any Error) -> Part? {
-            let element = try await base.next(isolation: `actor`)
+            let element = try await base.next(isolation: `actor`)?.get()
             if let element { onConsume(element) }
             return element
         }
