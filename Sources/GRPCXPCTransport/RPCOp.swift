@@ -167,7 +167,7 @@ enum WireDecodeItem: Sendable {
 @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
 protocol WireCodec: Sendable {
     /// Encodes one or more ops into a single blob. The inverse of `decode(_:)`.
-    func encode(_ ops: [RPCOp]) throws -> GRPCSwiftData
+    func encode(_ ops: [RPCOp]) throws(RPCError) -> GRPCSwiftData
     /// Decodes a blob produced by `encode(_:)` (this conformer's own, or a wire-compatible peer's)
     /// back into the items it carries, in the order they were encoded -- see `WireDecodeItem` for
     /// why an item, not always an `RPCOp`.
@@ -177,7 +177,7 @@ protocol WireCodec: Sendable {
     ///   resynchronise past -- and, by §O2's carve-out, for a malformed `goAway` body, which has
     ///   no stream to name either even though the framing around it is fine. See
     ///   `WireDecodeItem`'s doc for why every other kind's body-level rejection does not throw.
-    func decode(_ blob: GRPCSwiftData) throws -> [WireDecodeItem]
+    func decode(_ blob: GRPCSwiftData) throws(RPCError) -> [WireDecodeItem]
 }
 
 // ===========================================================================================
@@ -209,7 +209,7 @@ protocol MessagePipe: Sendable {
 
     /// Hands one blob to the peer. Conformers queue or block as appropriate to their substrate;
     /// callers may call this from any queue.
-    func send(_ blob: GRPCSwiftData) throws
+    func send(_ blob: GRPCSwiftData) throws(RPCError)
 
     /// Registers the handler that receives blobs from the peer, in send order, on `queue`. Set
     /// once, before the pipe is activated — a conformer is not required to support replacing or

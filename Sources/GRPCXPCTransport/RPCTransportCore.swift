@@ -787,8 +787,8 @@ final class RPCTransportCore: Sendable {
     /// than diverge on this, and applies to **both** of this function's callers, including the
     /// pre-existing state-machine-violation path, not only the codec one added alongside it.
     ///
-    /// The rebuilt local error preserves the original error's `code` where available (an
-    /// `RPCError` today; always is, in practice) but **not** its `cause` chain: `RPCError`'s own
+    /// The rebuilt local error preserves the original error's `code` -- both callers now hand
+    /// this an `RPCError` by type, not by convention -- but **not** its `cause` chain: `RPCError`'s own
     /// `description` folds `cause` into the very string this truncates
     /// (`"\(code): \"\(message)\" (cause: \"\(cause)\")"`), so re-wrapping it necessarily flattens a
     /// decoder's live `cause` to text -- an application inspecting `(error as? RPCError)?.cause`
@@ -796,12 +796,11 @@ final class RPCTransportCore: Sendable {
     /// truncation existed it saw the decoder's original cause. Sourced from `error`'s own
     /// `message`, not its full `"\(error)"` description, specifically so the rebuilt `RPCError`
     /// does not end up stating its own `code` twice (`description` already prepends it).
-    private func failStream(_ id: RPCStreamID, dueTo error: any Error) {
-        let localMessage = (error as? RPCError)?.message ?? "\(error)"
-        let code = (error as? RPCError)?.code ?? .internalError
+    private func failStream(_ id: RPCStreamID, dueTo error: RPCError) {
         removeStream(
             id,
-            failingInboundWith: RPCError(code: code, message: Self.truncatedForWire(localMessage)),
+            failingInboundWith: RPCError(
+                code: error.code, message: Self.truncatedForWire(error.message)),
             sendingCancel: "\(error)")
     }
 
@@ -839,7 +838,7 @@ final class RPCTransportCore: Sendable {
                 [RPCResponsePart<GRPCSwiftData>],
                 AsyncThrowingStream<RPCResponsePart<GRPCSwiftData>, any Error>.Continuation,
                 remoteEnded: Bool)
-            case violation(any Error)
+            case violation(RPCError)
         }
 
         let outcome: Delivered = registry.withLock { registry in
@@ -874,7 +873,7 @@ final class RPCTransportCore: Sendable {
 
             switch entry.inbound {
             case .request(var decoder, let continuation):
-                do {
+                do throws(RPCError) {
                     let parts = try decoder.accept(op)
                     let ended = decoder.remoteEnded
                     entry.inbound = .request(decoder, continuation)
@@ -886,7 +885,7 @@ final class RPCTransportCore: Sendable {
                 }
 
             case .response(var decoder, let continuation):
-                do {
+                do throws(RPCError) {
                     let parts = try decoder.accept(op)
                     // `ResponseOpDecoder` has no `remoteEnded`: `status` *is* the terminator, so
                     // the terminal signal is the part itself.
@@ -1202,7 +1201,7 @@ final class RPCTransportCore: Sendable {
     ///   stream.
     /// - Throws: `RPCError(code: .unavailable)` if the connection is draining or closed;
     ///   `RPCError(code: .resourceExhausted)` if the odd-id space is exhausted.
-    func openStream(descriptor: MethodDescriptor, timeout: Duration?) throws -> (
+    func openStream(descriptor: MethodDescriptor, timeout: Duration?) throws(RPCError) -> (
         id: RPCStreamID, stream: ClientRPCStream
     ) {
         precondition(
@@ -1216,7 +1215,7 @@ final class RPCTransportCore: Sendable {
         // L7: the lifecycle check and the id allocation are one atomic take-and-transition, so a
         // `beginDraining()` racing this call either loses (the stream is allocated) or wins (this
         // throws) -- never both.
-        let id: RPCStreamID = try registry.withLock { registry in
+        let id: RPCStreamID = try registry.withLock { registry throws(RPCError) in
             // Contract line 8: **either** direction's drain stops us opening new streams -- ours
             // because we announced we are going away, the peer's because it announced it will not
             // accept any more.
@@ -1391,12 +1390,12 @@ final class RPCTransportCore: Sendable {
     ///
     /// - Throws: ``streamNoLongerOpen(_:)`` if the stream is gone (nothing was sent), the codec's
     ///   error, or the substrate's `RPCError(code: .unavailable)`.
-    fileprivate func send(_ ops: [RPCOp], forStream id: RPCStreamID) throws {
+    fileprivate func send(_ ops: [RPCOp], forStream id: RPCStreamID) throws(RPCError) {
         guard !ops.isEmpty else { return }
         // Deliberately outside the lock: encoding is pure, and it is the widest part of what used
         // to be the racing window. Wire order is submission order, not encode order.
         let blob = try codec.encode(ops)
-        try submission.withLock { _ in
+        try submission.withLock { _ throws(RPCError) in
             guard registry.withLock({ $0.streams[id] != nil }) else {
                 throw streamNoLongerOpen(id)
             }
@@ -1413,10 +1412,10 @@ final class RPCTransportCore: Sendable {
     /// the check inside it meaningless.
     ///
     /// - Throws: the codec's error, or the substrate's `RPCError(code: .unavailable)`.
-    private func sendEncoded(_ ops: [RPCOp]) throws {
+    private func sendEncoded(_ ops: [RPCOp]) throws(RPCError) {
         guard !ops.isEmpty else { return }
         let blob = try codec.encode(ops)
-        try submission.withLock { _ in try pipe.send(blob) }
+        try submission.withLock { _ throws(RPCError) in try pipe.send(blob) }
     }
 
     /// Sends control ops that have no caller to report a failure to -- credit, `goAway`, teardown
@@ -2022,8 +2021,8 @@ protocol OutboundOpEncoding: Sendable {
     static func messagePayload(of part: Part) -> GRPCSwiftData?
     static func closesLocalDirection(_ part: Part) -> Bool
 
-    mutating func encode(_ part: Part) throws -> [RPCOp]
-    mutating func finish() throws -> [RPCOp]
+    mutating func encode(_ part: Part) throws(RPCError) -> [RPCOp]
+    mutating func finish() throws(RPCError) -> [RPCOp]
 }
 
 @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
@@ -2060,7 +2059,7 @@ extension ResponseOpEncoder: OutboundOpEncoding {
     /// already been written as a part. So there is nothing to emit here, and
     /// ``finishClosesLocalDirection`` is `false` -- see the protocol's doc comment for why that
     /// asymmetry is load-bearing.
-    mutating func finish() throws -> [RPCOp] { [] }
+    mutating func finish() throws(RPCError) -> [RPCOp] { [] }
 }
 
 /// Bridges grpc-swift's outbound `RPCWriter` to the mux: §O4's flow control on `message` parts,

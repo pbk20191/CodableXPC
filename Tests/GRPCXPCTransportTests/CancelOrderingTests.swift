@@ -382,7 +382,7 @@ final class HookedCodec: WireCodec {
         pending.withLock { $0 = body }
     }
 
-    func encode(_ ops: [RPCOp]) throws -> GRPCSwiftData {
+    func encode(_ ops: [RPCOp]) throws(RPCError) -> GRPCSwiftData {
         let hook = pending.withLock { slot -> (@Sendable () -> Void)? in
             let taken = slot
             slot = nil
@@ -392,5 +392,5 @@ final class HookedCodec: WireCodec {
         return try inner.encode(ops)
     }
 
-    func decode(_ blob: GRPCSwiftData) throws -> [WireDecodeItem] { try inner.decode(blob) }
+    func decode(_ blob: GRPCSwiftData) throws(RPCError) -> [WireDecodeItem] { try inner.decode(blob) }
 }

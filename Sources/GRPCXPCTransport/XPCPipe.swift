@@ -608,7 +608,7 @@ final class XPCPipe: MessagePipe {
     /// Errors are shaped, never passed through: once the peer is gone libxpc fails the send with
     /// its own rich error, and every caller in this transport -- and gRPC's machinery above it --
     /// expects a transport failure as an `RPCError`.
-    func send(_ blob: GRPCSwiftData) throws {
+    func send(_ blob: GRPCSwiftData) throws(RPCError) {
         // Fail fast on a pipe that is already torn down. This is the only lock the send path
         // takes, and it is read-only.
         let phase = state.withLock { $0.phase }
@@ -763,8 +763,8 @@ final class XPCPipe: MessagePipe {
     ///   reported. Same for the `.activating -> someone cancelled` window after a successful
     ///   activate. Both windows funnel through the one safe disposal -- see the matrix at the top
     ///   of this file.
-    private func activate() throws {
-        let cancelledBeforeActivation = try state.withLock { st -> Bool in
+    private func activate() throws(RPCError) {
+        let cancelledBeforeActivation = try state.withLock { st throws(RPCError) -> Bool in
             switch st.phase {
             case .idle:
                 st.phase = .activating
@@ -962,7 +962,7 @@ extension XPCPipe {
         to endpoint: XPCEndpoint,
         queue: DispatchSerialQueue,
         building build: (XPCPipe) -> Void
-    ) throws -> XPCPipe {
+    ) throws(RPCError) -> XPCPipe {
         try dialling(queue: queue, building: build) {
             try XPCSession(endpoint: endpoint, targetQueue: queue, options: .inactive)
         }
@@ -973,7 +973,7 @@ extension XPCPipe {
         toMachService name: String,
         queue: DispatchSerialQueue,
         building build: (XPCPipe) -> Void
-    ) throws -> XPCPipe {
+    ) throws(RPCError) -> XPCPipe {
         try dialling(queue: queue, building: build) {
             try XPCSession(machService: name, targetQueue: queue, options: .inactive)
         }
@@ -984,7 +984,7 @@ extension XPCPipe {
         toXPCService name: String,
         queue: DispatchSerialQueue,
         building build: (XPCPipe) -> Void
-    ) throws -> XPCPipe {
+    ) throws(RPCError) -> XPCPipe {
         try dialling(queue: queue, building: build) {
             try XPCSession(xpcService: name, targetQueue: queue, options: .inactive)
         }
@@ -1021,7 +1021,7 @@ extension XPCPipe {
         queue: DispatchSerialQueue,
         building build: (XPCPipe) -> Void,
         _ makeSession: () throws -> XPCSession
-    ) throws -> XPCPipe {
+    ) throws(RPCError) -> XPCPipe {
         let delivery = Delivery(queue: queue)
         let session: XPCSession
         do {

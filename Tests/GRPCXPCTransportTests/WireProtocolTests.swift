@@ -159,10 +159,13 @@ final class WireProtocolTests: XCTestCase {
             do {
                 let items = try Self.codec.decode(blob)
                 XCTFail("\(label): decode returned \(Self.describe(items)) instead of throwing")
-            } catch let error as RPCError {
-                XCTAssertEqual(error.code, .internalError, label)
             } catch {
-                XCTFail("\(label): threw \(type(of: error)) rather than an RPCError")
+                // `error` is an `RPCError` by type -- `WireCodec.decode` is `throws(RPCError)`.
+                // This used to be `catch let error as RPCError` plus an `XCTFail` fallback for
+                // "threw something that is not an RPCError"; that fallback is now unrepresentable
+                // rather than merely unobserved, so the assertion it guarded is made by the
+                // compiler and the branch is gone.
+                XCTAssertEqual(error.code, .internalError, label)
             }
         }
 

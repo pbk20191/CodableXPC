@@ -133,7 +133,7 @@ struct RequestOpDecoder: Sendable {
     ///   `cancel` (§O2: terminal in both directions).
     /// - Precondition: `op` is never `.credit`/`.goAway` (connection-level; a mux bug if routed
     ///   here) and this instance has not previously thrown (dead; a mux bug to call again).
-    mutating func accept(_ op: RPCOp) throws -> [RPCRequestPart<GRPCSwiftData>] {
+    mutating func accept(_ op: RPCOp) throws(RPCError) -> [RPCRequestPart<GRPCSwiftData>] {
         precondition(
             !isFailed,
             "RequestOpDecoder.accept: called again after a previous call already threw; the "
@@ -277,7 +277,7 @@ struct RequestOpEncoder: Sendable {
     ///   second `.metadata`, or anything after `finish()`).
     /// - Precondition: this instance has not previously thrown (dead; a caller bug to call
     ///   again).
-    mutating func encode(_ part: RPCRequestPart<GRPCSwiftData>) throws -> [RPCOp] {
+    mutating func encode(_ part: RPCRequestPart<GRPCSwiftData>) throws(RPCError) -> [RPCOp] {
         precondition(
             !isFailed,
             "RequestOpEncoder.encode: called again after a previous call already threw; the "
@@ -312,7 +312,7 @@ struct RequestOpEncoder: Sendable {
     /// stream never wrote anything before finishing.
     ///
     /// - Throws: `RPCError(code: .internalError)` if called a second time.
-    mutating func finish() throws -> [RPCOp] {
+    mutating func finish() throws(RPCError) -> [RPCOp] {
         precondition(
             !isFailed,
             "RequestOpEncoder.finish: called again after a previous call already threw; the "
@@ -334,7 +334,7 @@ struct RequestOpEncoder: Sendable {
         .openStream(streamID, method: method, timeout: timeout)
     }
 
-    private mutating func fail(_ reason: String) throws -> Never {
+    private mutating func fail(_ reason: String) throws(RPCError) -> Never {
         isFailed = true
         throw RPCError(code: .internalError, message: "RequestOpEncoder(stream \(streamID)): \(reason)")
     }
@@ -381,7 +381,7 @@ struct ResponseOpEncoder: Sendable {
     ///   terminator; a second terminal, or a message after it, is a violation").
     /// - Precondition: this instance has not previously thrown (dead; a caller bug to call
     ///   again).
-    mutating func encode(_ part: RPCResponsePart<GRPCSwiftData>) throws -> [RPCOp] {
+    mutating func encode(_ part: RPCResponsePart<GRPCSwiftData>) throws(RPCError) -> [RPCOp] {
         precondition(
             !isFailed,
             "ResponseOpEncoder.encode: called again after a previous call already threw; the "
@@ -428,7 +428,7 @@ struct ResponseOpEncoder: Sendable {
         }
     }
 
-    private mutating func fail(_ reason: String) throws -> Never {
+    private mutating func fail(_ reason: String) throws(RPCError) -> Never {
         isFailed = true
         throw RPCError(code: .internalError, message: "ResponseOpEncoder(stream \(streamID)): \(reason)")
     }
@@ -478,7 +478,7 @@ struct ResponseOpDecoder: Sendable {
     ///   unrecognized status code (see the `.status` case).
     /// - Precondition: `op` is never `.credit`/`.goAway` (connection-level; a mux bug if routed
     ///   here) and this instance has not previously thrown (dead; a mux bug to call again).
-    mutating func accept(_ op: RPCOp) throws -> [RPCResponsePart<GRPCSwiftData>] {
+    mutating func accept(_ op: RPCOp) throws(RPCError) -> [RPCResponsePart<GRPCSwiftData>] {
         precondition(
             !isFailed,
             "ResponseOpDecoder.accept: called again after a previous call already threw; the "
@@ -561,12 +561,22 @@ struct ResponseOpDecoder: Sendable {
     /// own thrown `RPCError` (`.invalidArgument`) escape directly -- see the identically-purposed
     /// helper on `RequestOpDecoder` for the full rationale (§O2 violations are `.internalError`;
     /// `position` must not advance past the state that guarded this call before the throw).
-    private mutating func decodeMetadata(_ fields: [HTTPField]) throws -> Metadata {
+    private mutating func decodeMetadata(_ fields: [HTTPField]) throws(RPCError) -> Metadata {
         do {
             return try GRPCWireHeaders.parseUserMetadata(fields)
         } catch {
-            try fail("malformed metadata field list: \(error)")
+            try fail("malformed metadata field list", error: error)
         }
+    }
+
+    /// Fails this stream: marks the decoder terminal and throws, carrying the `GRPCWireHeaders`
+    /// error that caused it as a real `cause:` rather than interpolated into the message. The
+    /// mirror of `RequestOpDecoder`'s overload of the same name, and it exists for the same
+    /// reason: `\(error)` in the message would flatten the original error to text at the one
+    /// place its structure is still available, and the two decoders must not differ on that.
+    private mutating func fail(_ reason: String, error: RPCError) throws(RPCError) -> Never {
+        isFailed = true
+        throw RPCError(code: .internalError, message: "ResponseOpDecoder: \(reason)", cause: error)
     }
 
     private mutating func fail(_ reason: String) throws(RPCError) -> Never {

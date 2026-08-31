@@ -308,7 +308,7 @@ struct InspectableXPCPair: Sendable {
                 message: "an anonymous XPCServerTransport must have an endpoint")
         }
         let (core, pipe) = try XPCClientTransport.dialledCore(peer: "test:\(label)") {
-            queue, building in
+            (queue, building) throws(RPCError) in
             try XPCPipe.connecting(to: endpoint, queue: queue, building: building)
         }
         return InspectableXPCPair(

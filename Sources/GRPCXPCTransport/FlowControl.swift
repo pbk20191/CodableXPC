@@ -433,10 +433,10 @@ final class FlowControlWindow: Sendable {
     ///
     /// - Throws: `RPCError(code: .internalError)` if the credit would take the window above
     ///   §O4's 2³¹−1 ceiling -- a protocol violation by the peer.
-    func grant(_ bytes: UInt32) throws {
+    func grant(_ bytes: UInt32) throws(RPCError) {
         var toResume: [(continuation: CheckedContinuation<Int, any Error>, bytes: Int)] = []
 
-        try state.withLock { s in
+        try state.withLock { s throws(RPCError) in
             // Validate the peer's number whatever the window's state: a protocol violation is a
             // protocol violation, and the connection should hear about it.
             let total = Int64(s.available) + Int64(bytes)

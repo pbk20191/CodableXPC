@@ -69,7 +69,7 @@ struct CompactWireCodec: WireCodec {
     // MARK: - WireCodec
     // =======================================================================================
 
-    func encode(_ ops: [RPCOp]) throws -> GRPCSwiftData {
+    func encode(_ ops: [RPCOp]) throws(RPCError) -> GRPCSwiftData {
         var out = Data()
         out.reserveCapacity(Self.encodedLengthLowerBound(ops))
         for op in ops {
@@ -147,7 +147,7 @@ struct CompactWireCodec: WireCodec {
     /// blob would have survived past that call either way. A hostile peer gains no leverage over
     /// any *other* blob or connection by corrupting a `goAway`'s body, only over the one
     /// connection it was already entitled to end.
-    func decode(_ blob: GRPCSwiftData) throws -> [WireDecodeItem] {
+    func decode(_ blob: GRPCSwiftData) throws(RPCError) -> [WireDecodeItem] {
         let data = blob.data
         let end = data.endIndex
         var cursor = data.startIndex
@@ -191,7 +191,14 @@ struct CompactWireCodec: WireCodec {
             let body = GRPCSwiftData(viewing: data[bodyStart..<bodyEnd])
             do {
                 items.append(.op(try Self.decodeOne(kind: kind, streamID: streamID, body: body)))
-            } catch let error as RPCError {
+            } catch {
+                // `error` is an `RPCError`, by type: `decodeOne` is `throws(RPCError)`, and so is
+                // everything it calls (`decodeFieldList`, `GRPCWireHeaders.parseRequest`). This
+                // used to be `catch let error as RPCError` followed by a second, general `catch`
+                // that rethrew -- a hand-written stand-in for exactly the guarantee typed throws
+                // now makes, and one that could only ever have fired on a codec bug. The type
+                // system states it instead, so there is no second branch to keep correct.
+                //
                 // This switch is the policy seam: it assigns one of the three blast radii a body
                 // rejection can have. Spelled out case by case, deliberately not `default:` --
                 // §O3 anticipates the encoding growing new kinds, and a `default:` here would let
@@ -212,14 +219,6 @@ struct CompactWireCodec: WireCodec {
                 case .metadata, .message, .halfClose, .status, .cancel, .credit:
                     items.append(.streamFailure(streamID, error))
                 }
-            } catch {
-                // Every throw site in `decodeOne` (and everything it calls: `decodeFieldList`,
-                // `GRPCWireHeaders.parseRequest`) constructs `RPCError`, so this is unreachable in
-                // practice. If it is ever reached, it is a codec bug, not peer input, and deserves
-                // the loud connection-fatal treatment a header failure gets rather than being
-                // silently folded into a `.streamFailure` that would misrepresent it as an
-                // ordinary per-stream rejection.
-                throw error
             }
         }
 
@@ -230,7 +229,7 @@ struct CompactWireCodec: WireCodec {
     // MARK: - Per-op encode
     // =======================================================================================
 
-    private static func encodeOne(_ op: RPCOp, into out: inout Data) throws {
+    private static func encodeOne(_ op: RPCOp, into out: inout Data) throws(RPCError) {
         switch op {
         case .openStream(let streamID, let method, let timeout):
             // §O3: "openStream: field list ... containing :path and, if set, grpc-timeout --
@@ -297,7 +296,7 @@ struct CompactWireCodec: WireCodec {
     ///
     /// - Throws: `RPCError(code: .internalError)` if `bodyLength` exceeds the 16 MiB cap -- this
     ///   codec refuses to produce a blob its own `decode(_:)` would then reject.
-    private static func appendHeader(kind: Kind, streamID: RPCStreamID, bodyLength: Int, to out: inout Data) throws {
+    private static func appendHeader(kind: Kind, streamID: RPCStreamID, bodyLength: Int, to out: inout Data) throws(RPCError) {
         guard bodyLength <= maxBodyLength else {
             throw RPCError(
                 code: .internalError,
@@ -317,7 +316,7 @@ struct CompactWireCodec: WireCodec {
     /// - Precondition: `body`'s declared length has already been validated against the bytes
     ///   remaining in the enclosing blob by `decode(_:)`'s caller; this only validates each
     ///   kind's own internal shape.
-    private static func decodeOne(kind: Kind, streamID: RPCStreamID, body: GRPCSwiftData) throws -> RPCOp {
+    private static func decodeOne(kind: Kind, streamID: RPCStreamID, body: GRPCSwiftData) throws(RPCError) -> RPCOp {
         switch kind {
         case .openStream:
             let fields = try decodeFieldList(body)
@@ -426,7 +425,7 @@ struct CompactWireCodec: WireCodec {
     /// value length, value UTF-8." Names are already lowercased and reserved-name-filtered by
     /// `GRPCWireHeaders`, and `-bin` values are already base64 there -- this codec never
     /// interprets a field's value, only its length.
-    private static func encodeFieldList(_ fields: [HTTPField]) throws -> Data {
+    private static func encodeFieldList(_ fields: [HTTPField]) throws(RPCError) -> Data {
         guard let count = UInt16(exactly: fields.count) else {
             throw RPCError(
                 code: .internalError,
@@ -474,7 +473,7 @@ struct CompactWireCodec: WireCodec {
     ///   field count this field list cannot possibly hold, a declared length exceeding the bytes
     ///   remaining *in this field list*, a non-UTF-8 name or value, or trailing bytes left over
     ///   after the declared field count has been fully read.
-    private static func decodeFieldList(_ body: GRPCSwiftData) throws -> [HTTPField] {
+    private static func decodeFieldList(_ body: GRPCSwiftData) throws(RPCError) -> [HTTPField] {
         let data = body.data
         let end = data.endIndex
         var cursor = data.startIndex

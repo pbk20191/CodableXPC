@@ -244,12 +244,12 @@ public final class XPCClientTransport: ClientTransport {
     ///
     /// A peer that dies later still surfaces as peer death, which fails every stream with
     /// `.unavailable`.
-    public static func connecting(toMachService name: String) throws -> XPCClientTransport {
+    public static func connecting(toMachService name: String) throws(RPCError) -> XPCClientTransport {
         try dialling(.machService(name))
     }
 
     /// Dials an XPC service bundle inside the calling application, by bundle identifier.
-    public static func connecting(toXPCService name: String) throws -> XPCClientTransport {
+    public static func connecting(toXPCService name: String) throws(RPCError) -> XPCClientTransport {
         try dialling(.xpcService(name))
     }
     
@@ -264,7 +264,7 @@ public final class XPCClientTransport: ClientTransport {
     ///
     /// Taking an `XPCEndpoint` is what obliges this file to `import XPC`; the rest of the op
     /// layer stays substrate-agnostic.
-    public static func connecting(to endpoint: XPCEndpoint) throws -> XPCClientTransport {
+    public static func connecting(to endpoint: XPCEndpoint) throws(RPCError) -> XPCClientTransport {
         try dialling(.peer(endpoint))
     }
 
@@ -309,8 +309,8 @@ public final class XPCClientTransport: ClientTransport {
     /// - Returns: the live core and the pipe it was built on.
     static func dialledCore(
         peer: String,
-        _ dial: (DispatchSerialQueue, (XPCPipe) -> Void) throws -> XPCPipe
-    ) throws -> (core: RPCTransportCore, pipe: XPCPipe) {
+        _ dial: (DispatchSerialQueue, (XPCPipe) -> Void) throws(RPCError) -> XPCPipe
+    ) throws(RPCError) -> (core: RPCTransportCore, pipe: XPCPipe) {
         let queue = DispatchSerialQueue(
             label: ConnectionQueueLabel.mint(role: "client", peer: peer))
 
@@ -328,8 +328,8 @@ public final class XPCClientTransport: ClientTransport {
         return (core, pipe)
     }
 
-    private static func dialling(_ peer: Peer) throws -> XPCClientTransport {
-        let (core, _) = try dialledCore(peer: peer.label) { queue, building in
+    private static func dialling(_ peer: Peer) throws(RPCError) -> XPCClientTransport {
+        let (core, _) = try dialledCore(peer: peer.label) { (queue, building) throws(RPCError) in
             switch peer {
             case .machService(let name):
                 try XPCPipe.connecting(toMachService: name, queue: queue, building: building)

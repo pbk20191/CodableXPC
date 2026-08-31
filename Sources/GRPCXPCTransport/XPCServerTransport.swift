@@ -549,7 +549,7 @@ public final class XPCServerTransport: ServerTransport {
     ///
     /// - Precondition: this transport was built by ``anonymous()``; a named-service listener has
     ///   no endpoint to dial.
-    func connectingClient() throws -> XPCClientTransport {
+    func connectingClient() throws(RPCError) -> XPCClientTransport {
         guard let endpoint else {
             throw RPCError(
                 code: .failedPrecondition,
@@ -560,7 +560,8 @@ public final class XPCServerTransport: ServerTransport {
         // contributes is the one step the client file cannot: naming `XPCEndpoint`. The returned
         // pipe is discarded because the core holds it; that too is the factory's invariant, not a
         // local choice.
-        let (core, _) = try XPCClientTransport.dialledCore(peer: "endpoint") { queue, building in
+        let (core, _) = try XPCClientTransport.dialledCore(peer: "endpoint") {
+            (queue, building) throws(RPCError) in
             try XPCPipe.connecting(to: endpoint, queue: queue, building: building)
         }
         return XPCClientTransport(core: core)

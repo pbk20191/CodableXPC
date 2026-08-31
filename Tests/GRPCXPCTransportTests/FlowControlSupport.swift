@@ -47,8 +47,10 @@ import XCTest
 /// delivers whatever blobs the test chooses, in order, on the pipe's own serial queue.
 ///
 /// `@unchecked Sendable` for the house reason: the `Mutex` *is* the synchronisation for every
-/// mutable field, and the two handler closures are `@Sendable` by their own signatures. The
-/// existential `any Error` in `sendFailure` is what rules out a checked conformance.
+/// mutable field, and the two handler closures are `@Sendable` by their own signatures. This note
+/// used to name the existential `any Error` in `sendFailure` as what ruled out a checked
+/// conformance; `MessagePipe.send` is `throws(RPCError)` now, so that field holds an `RPCError`
+/// and the clause has been removed rather than left standing as a false reason.
 @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
 final class TestPipe: MessagePipe, @unchecked Sendable {
 
@@ -67,7 +69,7 @@ final class TestPipe: MessagePipe, @unchecked Sendable {
         var deliveredBlobs = 0
         /// When set, ``send(_:)`` throws this instead of recording -- for the "the substrate is
         /// gone" arm of a test that has nothing to do with XPC.
-        var sendFailure: (any Error)?
+        var sendFailure: RPCError?
         /// See ``onEachSend(_:)``. Nil for every test that does not ask for it, which is all but
         /// one.
         var sendObserver: (@Sendable (GRPCSwiftData) -> Void)?
@@ -84,14 +86,14 @@ final class TestPipe: MessagePipe, @unchecked Sendable {
     // MARK: MessagePipe
     // -------------------------------------------------------------------------------------
 
-    func send(_ blob: GRPCSwiftData) throws {
+    func send(_ blob: GRPCSwiftData) throws(RPCError) {
         // Read under the lock, called **outside** it. An observer runs inside whatever core call is
         // doing the sending, and may reach back into the core or the transport above it; doing that
         // with this pipe's lock held would deadlock the moment it sent anything. (It may not send
         // *anything* from in there either, but for a different reason and not because of this lock
         // -- see ``onEachSend(_:)``.)
         if let observer = state.withLock({ $0.sendObserver }) { observer(blob) }
-        try state.withLock { state in
+        try state.withLock { state throws(RPCError) in
             if let failure = state.sendFailure { throw failure }
             guard !state.isCancelled else {
                 throw RPCError(
@@ -138,7 +140,7 @@ final class TestPipe: MessagePipe, @unchecked Sendable {
     /// The substrate being gone is a state the core has to survive without a caller to report to:
     /// `sendControl(_:)` is documented as dropping its failure "here and only here". Read by
     /// `WireProtocolTests.testARefusalThatCannotBeSentIsDroppedNotFatal`.
-    func failNextSends(with error: any Error) { state.withLock { $0.sendFailure = error } }
+    func failNextSends(with error: RPCError) { state.withLock { $0.sendFailure = error } }
 
     /// Installs a hook run **on the sending thread, inside the core call that is sending**, before
     /// the blob is recorded.
