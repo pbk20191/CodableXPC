@@ -295,7 +295,19 @@ extension [RPCOp] {
 // MARK: - CoreUnderTest
 // ===========================================================================================
 
-/// One `RPCTransportCore` over a ``TestPipe``, with the accept loop already draining.
+/// The core instantiation these tests build: the mux over a ``TestPipe``, with the shipping codec.
+///
+/// `RPCTransportCore` is generic over its two seams rather than storing them as existentials, so
+/// naming it -- and reaching its parameter-independent nested names, `Role` and the
+/// `maxWireReasonLength` / `truncatedForWire` pair -- now goes through some instantiation. This is
+/// the one most of the unit tests use; `CancelOrderingTests` builds a second (`TestPipe` +
+/// `HookedCodec`) and the XPC-backed tests a third (``XPCTransportCore``). Three instantiations is
+/// the seam doing its job, not three different `Role`s: a static member of a generic type is
+/// per-instantiation *storage* for the same constant, not a per-instantiation value.
+@available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
+typealias TestPipeCore = RPCTransportCore<TestPipe, CompactWireCodec>
+
+/// One ``TestPipeCore`` over a ``TestPipe``, with the accept loop already draining.
 ///
 /// The accept loop matters even for a test that never looks at an accepted stream: pulling an item
 /// is what releases its slot against `maxConcurrentInboundStreams`
@@ -312,14 +324,14 @@ extension [RPCOp] {
 final class CoreUnderTest: Sendable {
 
     let pipe: TestPipe
-    let core: RPCTransportCore
+    let core: TestPipeCore
 
     private let accepted = Observed<[AcceptedRPCStream]>([])
     private let acceptTask: Task<Void, Never>
 
-    init(role: RPCTransportCore.Role, label: String) {
+    init(role: TestPipeCore.Role, label: String) {
         let pipe = TestPipe(label: label)
-        let core = RPCTransportCore(pipe: pipe, codec: CompactWireCodec(), role: role)
+        let core = TestPipeCore(pipe: pipe, codec: CompactWireCodec(), role: role)
         self.pipe = pipe
         self.core = core
 

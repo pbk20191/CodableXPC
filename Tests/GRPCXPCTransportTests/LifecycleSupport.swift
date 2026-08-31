@@ -294,7 +294,7 @@ enum RawSeamHandlers {
 struct InspectableXPCPair: Sendable {
     let server: XPCServerTransport
     let client: XPCClientTransport
-    let clientCore: RPCTransportCore
+    let clientCore: XPCTransportCore
     let clientPipe: XPCPipe
 
     /// - Parameter label: goes into the connection queue's label (as the factory's `peer`

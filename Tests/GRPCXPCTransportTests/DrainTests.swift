@@ -137,8 +137,15 @@ final class DrainTests: XCTestCase {
     /// shutdown never reads as the peer's" is the property.
     func testALocalDrainIsNotBlamedOnThePeerFromInsideTheShutdown() throws {
         let pipe = TestPipe(label: "shutdownFlagOrder")
-        let core = RPCTransportCore(pipe: pipe, codec: CompactWireCodec(), role: .client)
-        let transport = XPCClientTransport(core: core)
+        let core = TestPipeCore(pipe: pipe, codec: CompactWireCodec(), role: .client)
+        // `RPCClientTransport` rather than `XPCClientTransport`, and that is forced rather than
+        // chosen: the public façade is bound to `XPCPipe` (a public type cannot be generic over
+        // the internal `MessagePipe`/`WireCodec` seams -- see `XPCClientTransport`'s own doc for
+        // the two compiler errors), and this test's whole method is a substrate whose `send` can
+        // be frozen. The subject is unchanged: every gate, flag and refusal below belongs to
+        // `RPCClientTransport`, which is the entire implementation the façade forwards to, not a
+        // copy of it.
+        let transport = RPCClientTransport(core: core)
 
         let drainIsMidFlight = OneShotGate()
         let probeHasItsAnswer = DispatchSemaphore(value: 0)

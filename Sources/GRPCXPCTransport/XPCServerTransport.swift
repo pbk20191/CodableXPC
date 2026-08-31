@@ -70,7 +70,7 @@ public final class XPCServerTransport: ServerTransport {
         ///
         /// It is held here, strongly and untouched, until ``windowProvedClosed(_:)`` promotes it.
         private struct Pending {
-            let core: RPCTransportCore
+            let core: XPCTransportCore
             /// The strongest teardown that arrived while the window was open. Applied by
             /// ``windowProvedClosed(_:)`` the moment acting is legal.
             var deferred: DeferredTeardown = .none
@@ -136,13 +136,13 @@ public final class XPCServerTransport: ServerTransport {
             /// the accept window is open runs `deinit`, which cancels the session and kills the
             /// process (matrix row A1). Publishing into a table *before* returning the decision is
             /// what makes that impossible.
-            var connections: [ObjectIdentifier: RPCTransportCore] = [:]
+            var connections: [ObjectIdentifier: XPCTransportCore] = [:]
         }
         private let state = Mutex(State())
 
         /// Admitted connections, in accept order. Iterated exactly once, by `listen`.
-        let connections: AsyncStream<RPCTransportCore>
-        private let continuation: AsyncStream<RPCTransportCore>.Continuation
+        let connections: AsyncStream<XPCTransportCore>
+        private let continuation: AsyncStream<XPCTransportCore>.Continuation
 
         init() {
             (self.connections, self.continuation) = AsyncStream.makeStream(
@@ -203,9 +203,9 @@ public final class XPCServerTransport: ServerTransport {
                 // before any blob can be dispatched. Do NOT install `onReceive`/`onPeerDeath`
                 // here: `RPCTransportCore.init` installs both itself, weakly, and a second call
                 // replaces the core's and silently disconnects the mux.
-                var built: RPCTransportCore?
+                var built: XPCTransportCore?
                 let (decision, pipe) = XPCPipe.accepting(request, queue: queue) { pipe in
-                    let core = RPCTransportCore(
+                    let core = XPCTransportCore(
                         pipe: pipe, codec: CompactWireCodec(), role: .server)
                     built = core
 
@@ -294,8 +294,8 @@ public final class XPCServerTransport: ServerTransport {
         private func windowProvedClosed(_ key: ObjectIdentifier) {
             enum Action {
                 case none
-                case drain(RPCTransportCore)
-                case close(RPCTransportCore)
+                case drain(XPCTransportCore)
+                case close(XPCTransportCore)
             }
 
             let action: Action = state.withLock { state in
@@ -337,7 +337,7 @@ public final class XPCServerTransport: ServerTransport {
         /// would be a send into that window, which is row A5, a process death. Its drain is
         /// recorded and applied by ``windowProvedClosed(_:)``.
         func beginDraining() {
-            let cores = state.withLock { state -> [RPCTransportCore] in
+            let cores = state.withLock { state -> [XPCTransportCore] in
                 state.admitting = false
                 state.escalateEveryPending(to: .drain)
                 return Array(state.connections.values)
@@ -357,7 +357,7 @@ public final class XPCServerTransport: ServerTransport {
         /// delivery, and a delivery would have promoted it), so its recorded teardown is `.close`
         /// -- see ``DeferredTeardown``.
         func failAll(_ error: RPCError) {
-            let cores = state.withLock { state -> [RPCTransportCore] in
+            let cores = state.withLock { state -> [XPCTransportCore] in
                 state.admitting = false
                 state.escalateEveryPending(to: .close)
                 return Array(state.connections.values)
@@ -376,7 +376,7 @@ public final class XPCServerTransport: ServerTransport {
         /// incoming-session closure (row N2, 40/40), so no `pending` entry exists without a blob
         /// already in flight. A late close is a delayed release; an early one is a trap.
         func closeAll() {
-            let cores = state.withLock { state -> [RPCTransportCore] in
+            let cores = state.withLock { state -> [XPCTransportCore] in
                 state.admitting = false
                 state.escalateEveryPending(to: .close)
                 let taken = Array(state.connections.values)
@@ -406,7 +406,7 @@ public final class XPCServerTransport: ServerTransport {
         /// reachable for one while `listen()`'s task is cancelled (the child task's `for await`
         /// ends on cancellation rather than because the connection finished), and closing it here
         /// would be a cancel in the window.
-        func retire(_ core: RPCTransportCore) {
+        func retire(_ core: XPCTransportCore) {
             let key = ObjectIdentifier(core)
             let mayClose: Bool = state.withLock { state in
                 if state.connections.removeValue(forKey: key) != nil { return true }
@@ -730,7 +730,7 @@ public final class XPCServerTransport: ServerTransport {
     /// weakly (L6), and this is what keeps it alive while a handler is using it.
     private static func run(
         _ accepted: AcceptedRPCStream,
-        on core: RPCTransportCore,
+        on core: XPCTransportCore,
         with streamHandler: @escaping @Sendable (RPCStream<Inbound, Outbound>, ServerContext) async
             -> Void
     ) async {

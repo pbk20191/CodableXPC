@@ -387,7 +387,7 @@ final class ReceiveWindowTests: XCTestCase {
     private static func withExhaustedSendWindows(
         label: String
     ) async throws -> (
-        core: CoreUnderTest, stream: RPCTransportCore.ServerRPCStream,
+        core: CoreUnderTest, stream: ServerRPCStream,
         parkedOutcome: Observed<String?>
     ) {
         let core = CoreUnderTest(role: .server, label: label)

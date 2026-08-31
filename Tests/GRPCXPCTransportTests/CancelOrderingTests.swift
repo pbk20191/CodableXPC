@@ -350,7 +350,7 @@ final class CancelOrderingTests: XCTestCase {
             message.hasPrefix("the peer cancelled stream 1: "),
             "the local error must still say what happened; got \(message.prefix(64))")
         XCTAssertLessThan(
-            message.utf8.count, 2 * RPCTransportCore.maxWireReasonLength,
+            message.utf8.count, 2 * TestPipeCore.maxWireReasonLength,
             "the local error came back at \(message.utf8.count) byte(s) from a "
                 + "\(pathological.utf8.count)-byte peer reason; the peer's input size is driving "
                 + "the size of an allocation this process holds")

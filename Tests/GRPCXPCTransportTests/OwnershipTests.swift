@@ -57,7 +57,7 @@ final class OwnershipTests: XCTestCase {
         try runBounded("deinit reachability", timeout: 20) {
             weak var weakServer: XPCServerTransport?
             weak var weakClient: XPCClientTransport?
-            weak var weakCore: RPCTransportCore?
+            weak var weakCore: XPCTransportCore?
             weak var weakPipe: XPCPipe?
 
             do {
@@ -160,9 +160,9 @@ final class OwnershipTests: XCTestCase {
             var connectTask: Task<Void, any Error>?
             var client: XPCClientTransport?
             do {
-                var built: RPCTransportCore?
+                var built: XPCTransportCore?
                 pipe = try XPCPipe.connecting(to: endpoint, queue: queue) { pipe in
-                    built = RPCTransportCore(pipe: pipe, codec: CompactWireCodec(), role: .client)
+                    built = XPCTransportCore(pipe: pipe, codec: CompactWireCodec(), role: .client)
                 }
                 guard let core = built else {
                     XCTFail("XPCPipe.connecting did not run its `building` closure")

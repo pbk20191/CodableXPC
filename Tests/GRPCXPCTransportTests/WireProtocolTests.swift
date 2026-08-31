@@ -261,7 +261,7 @@ final class WireProtocolTests: XCTestCase {
             "a malformed `:path` must be a stream-open failure, not a connection failure")
 
         func refusal(
-            for input: Data, label: String, role: RPCTransportCore.Role = .server
+            for input: Data, label: String, role: TestPipeCore.Role = .server
         ) throws -> [GRPCSwiftData] {
             let core = CoreUnderTest(role: role, label: label)
             defer { core.shutDown() }
@@ -907,7 +907,7 @@ final class WireProtocolTests: XCTestCase {
                 + "Character-based prefix would not truncate this at all")
         XCTAssertEqual(pathological.utf8.count, 1 + 2 * 4_000_000)
 
-        let truncated = RPCTransportCore.truncatedForWire(pathological)
+        let truncated = TestPipeCore.truncatedForWire(pathological)
         let marker = "… [truncated]"
         // The bound is 512 bytes, plus the marker, plus a small measured allowance: the 512-byte
         // slice can land mid-scalar (here it splits the 256th combining mark), and
@@ -917,19 +917,19 @@ final class WireProtocolTests: XCTestCase {
         let replacementAllowance = 4
         XCTAssertLessThanOrEqual(
             truncated.utf8.count,
-            RPCTransportCore.maxWireReasonLength + marker.utf8.count + replacementAllowance,
+            TestPipeCore.maxWireReasonLength + marker.utf8.count + replacementAllowance,
             "the cap must bound bytes: \(truncated.utf8.count) byte(s) came back from a "
                 + "\(pathological.utf8.count)-byte input")
         XCTAssertTrue(truncated.hasSuffix(marker), "a truncation must say so")
 
         // The other two directions, so the cap is a boundary and not a one-sided clamp: a value at
         // the cap passes through untouched, and one byte over is truncated.
-        let atTheCap = String(repeating: "z", count: RPCTransportCore.maxWireReasonLength)
+        let atTheCap = String(repeating: "z", count: TestPipeCore.maxWireReasonLength)
         XCTAssertEqual(
-            RPCTransportCore.truncatedForWire(atTheCap), atTheCap,
+            TestPipeCore.truncatedForWire(atTheCap), atTheCap,
             "a value exactly at the cap must not be marked as truncated")
         let overByOne = atTheCap + "z"
-        XCTAssertTrue(RPCTransportCore.truncatedForWire(overByOne).hasSuffix(marker))
+        XCTAssertTrue(TestPipeCore.truncatedForWire(overByOne).hasSuffix(marker))
     }
 
     /// The same bound, where it actually matters: on the wire.
@@ -974,7 +974,7 @@ final class WireProtocolTests: XCTestCase {
         // the *local* message separately before `removeStream` truncates the wire reason. What is
         // asserted is that the peer's own 8 MB is not in there.
         XCTAssertLessThan(
-            reason.utf8.count, 4 * RPCTransportCore.maxWireReasonLength,
+            reason.utf8.count, 4 * TestPipeCore.maxWireReasonLength,
             "the cancel reason came back at \(reason.utf8.count) byte(s) from an "
                 + "\(pathological.utf8.count)-byte peer value; the peer's input size is driving "
                 + "the size of the op sent back at it")

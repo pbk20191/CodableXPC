@@ -407,6 +407,20 @@ private final class Delivery: Sendable {
 // MARK: - XPCPipe
 // ===========================================================================================
 
+/// The one ``RPCTransportCore`` instantiation the XPC transports ever build: the mux over an
+/// ``XPCPipe``, speaking `CompactWireCodec`'s encoding.
+///
+/// `RPCTransportCore` is generic over its two seams rather than holding them as existentials, so
+/// every `pipe.send` / `codec.encode` / `codec.decode` on the hot path is a static call the
+/// optimizer can specialize -- see that type for the release-vs-debug caveat. The seams are still
+/// seams: the test target instantiates the core over its own `TestPipe` and its own `HookedCodec`.
+/// XPC itself only ever needs this one pairing, and both of `XPCServerTransport.Acceptor`'s tables
+/// (`pending`, `connections`) and its `AsyncStream` hold exactly it -- **nothing in either
+/// transport wants a heterogeneous collection of cores**, which is the one thing that would have
+/// forced an existential back.
+@available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
+typealias XPCTransportCore = RPCTransportCore<XPCPipe, CompactWireCodec>
+
 /// A `MessagePipe` over one `XPCSession`.
 ///
 /// Build one with ``connecting(to:queue:building:)`` (client) or ``accepting(_:queue:building:)``

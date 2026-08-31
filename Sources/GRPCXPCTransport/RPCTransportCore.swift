@@ -171,6 +171,29 @@ import Synchronization
 //   `goAway`'s own directional meaning.
 
 // ===========================================================================================
+// MARK: - The two RPC stream shapes
+// ===========================================================================================
+
+/// A client-side RPC: response parts in, request parts out.
+///
+/// File scope rather than nested in ``RPCTransportCore``, and that is a consequence of the core
+/// becoming generic over its two seams. Neither alias mentions `Pipe` or `Codec`, and
+/// ``AcceptedRPCStream`` -- which is **not** generic, and must not become so, or the server's
+/// `AsyncStream<AcceptedRPCStream>` and both of `XPCServerTransport.Acceptor`'s tables would be --
+/// has to name one without choosing an instantiation to name it through.
+@available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
+typealias ClientRPCStream = RPCStream<
+    RPCAsyncSequence<RPCResponsePart<GRPCSwiftData>, any Error>,
+    RPCWriter<RPCRequestPart<GRPCSwiftData>>.Closable>
+
+/// A server-side RPC: request parts in, response parts out. File scope for the same reason as
+/// ``ClientRPCStream``.
+@available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
+typealias ServerRPCStream = RPCStream<
+    RPCAsyncSequence<RPCRequestPart<GRPCSwiftData>, any Error>,
+    RPCWriter<RPCResponsePart<GRPCSwiftData>>.Closable>
+
+// ===========================================================================================
 // MARK: - The accepted-stream payload
 // ===========================================================================================
 
@@ -190,7 +213,7 @@ struct AcceptedRPCStream: Sendable {
     let id: RPCStreamID
     let descriptor: MethodDescriptor
     let timeout: Duration?
-    let stream: RPCTransportCore.ServerRPCStream
+    let stream: ServerRPCStream
 }
 
 // ===========================================================================================
@@ -246,7 +269,7 @@ struct AcceptedRPCStream: Sendable {
 ///   worked example: it holds such a core untouched in a `pending` table and acts only from the
 ///   proof.
 @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
-final class RPCTransportCore: Sendable {
+final class RPCTransportCore<Pipe: MessagePipe, Codec: WireCodec>: Sendable {
 
     // =======================================================================================
     // MARK: - Vocabulary
@@ -259,16 +282,6 @@ final class RPCTransportCore: Sendable {
         case client
         case server
     }
-
-    /// A client-side RPC: response parts in, request parts out.
-    typealias ClientRPCStream = RPCStream<
-        RPCAsyncSequence<RPCResponsePart<GRPCSwiftData>, any Error>,
-        RPCWriter<RPCRequestPart<GRPCSwiftData>>.Closable>
-
-    /// A server-side RPC: request parts in, response parts out.
-    typealias ServerRPCStream = RPCStream<
-        RPCAsyncSequence<RPCRequestPart<GRPCSwiftData>, any Error>,
-        RPCWriter<RPCResponsePart<GRPCSwiftData>>.Closable>
 
     /// The cap on outstanding *inbound* streams -- a local resource guard, not protocol surface
     /// (§O5 deviation 6). §O4's byte credit bounds a stream's bytes; nothing in the op model bounds
@@ -293,15 +306,20 @@ final class RPCTransportCore: Sendable {
     ///
     /// 256 is chosen in the range HTTP/2 servers use for `SETTINGS_MAX_CONCURRENT_STREAMS`
     /// (gRPC's own default is 100, nginx's 128) and is far above anything the test suite needs.
-    static let maxConcurrentInboundStreams = 256
+    /// `static var { 256 }` rather than `static let`: Swift does not permit a static *stored*
+    /// property in a generic type, and this class is generic over its two seams. **The value is
+    /// unchanged at 256** -- still §O5 deviation 6's number, still one constant shared by every
+    /// instantiation, and still read only on the admission path (once per inbound `openStream`),
+    /// never per message.
+    static var maxConcurrentInboundStreams: Int { 256 }
 
     // =======================================================================================
     // MARK: - Immutable state
     // =======================================================================================
 
     let role: Role
-    private let pipe: any MessagePipe
-    private let codec: any WireCodec
+    private let pipe: Pipe
+    private let codec: Codec
 
     /// The serial queue every inbound blob is decoded and routed on -- the pipe's own (L4).
     var queue: DispatchSerialQueue { pipe.queue }
@@ -631,9 +649,12 @@ final class RPCTransportCore: Sendable {
     ///
     /// - Parameters:
     ///   - pipe: the substrate. Owned strongly; `deinit` cancels it.
-    ///   - codec: the encoding. `CompactWireCodec()` is the only conformer this plan ships.
+    ///   - codec: the encoding. `CompactWireCodec` is the only conformer this plan ships; the
+    ///     tests add one more (`HookedCodec`), which is what this seam is for. It has **no default
+    ///     any more** -- a default value cannot satisfy an arbitrary `Codec`, and every call site
+    ///     in the tree already passed one explicitly, so nothing lost a spelling.
     ///   - role: which half of the connection this is.
-    init(pipe: any MessagePipe, codec: any WireCodec = CompactWireCodec(), role: Role) {
+    init(pipe: Pipe, codec: Codec, role: Role) {
         self.pipe = pipe
         self.codec = codec
         self.role = role
@@ -810,6 +831,26 @@ final class RPCTransportCore: Sendable {
             sendingCancel: "\(error)")
     }
 
+    /// What ``deliver(_:toStream:)``'s registry section decided.
+    ///
+    /// Type scope rather than function scope only because Swift cannot nest a type in a generic
+    /// context, and this class is now generic over its two seams. Used by that one method and
+    /// nothing else; it did not become shared by moving.
+    private enum Delivered {
+        case unknownStream
+        case streamOverran(Int)
+        case connectionOverran(Int)
+        case request(
+            [RPCRequestPart<GRPCSwiftData>],
+            AsyncThrowingStream<RPCRequestPart<GRPCSwiftData>, any Error>.Continuation,
+            remoteEnded: Bool)
+        case response(
+            [RPCResponsePart<GRPCSwiftData>],
+            AsyncThrowingStream<RPCResponsePart<GRPCSwiftData>, any Error>.Continuation,
+            remoteEnded: Bool)
+        case violation(RPCError)
+    }
+
     /// Feeds one stream-scoped op to its machine and delivers whatever parts come out.
     ///
     /// Contract line 1's two halves both live here: the machine's throw is **not** `try?`-
@@ -831,22 +872,6 @@ final class RPCTransportCore: Sendable {
         } else {
             charge = 0
         }
-
-        enum Delivered {
-            case unknownStream
-            case streamOverran(Int)
-            case connectionOverran(Int)
-            case request(
-                [RPCRequestPart<GRPCSwiftData>],
-                AsyncThrowingStream<RPCRequestPart<GRPCSwiftData>, any Error>.Continuation,
-                remoteEnded: Bool)
-            case response(
-                [RPCResponsePart<GRPCSwiftData>],
-                AsyncThrowingStream<RPCResponsePart<GRPCSwiftData>, any Error>.Continuation,
-                remoteEnded: Bool)
-            case violation(RPCError)
-        }
-
         let outcome: Delivered = registry.withLock { registry in
             // §O4 (amended): ENFORCE the receive window, do not merely account for it.
             //
@@ -958,6 +983,15 @@ final class RPCTransportCore: Sendable {
     // MARK: - Inbound: accept (contract line 2, L5)
     // =======================================================================================
 
+    /// What ``openInbound(streamID:method:timeout:)``'s registry section decided. Type scope for
+    /// the same language reason as ``Delivered``, and used by that one method only.
+    private enum Admission {
+        case admitted
+        case draining
+        case closed
+        case tooMany(Int)
+    }
+
     /// An `openStream` op arrived.
     ///
     /// L5 in one function: the decoder, both windows, the inbound sequence, the outbound writer
@@ -1006,14 +1040,6 @@ final class RPCTransportCore: Sendable {
                 RequestOpDecoder(method: method, timeout: timeout), continuation),
             sendWindow: FlowControlWindow(),
             receive: WindowAccountant())
-
-        enum Admission {
-            case admitted
-            case draining
-            case closed
-            case tooMany(Int)
-        }
-
         let admission: Admission = registry.withLock { registry in
             // Advanced before the admission decision, so `goAway`'s `lastStreamID` names every id
             // the peer actually used -- including ones this side refused. (Structurally illegal ids
@@ -1464,7 +1490,10 @@ final class RPCTransportCore: Sendable {
     }
 
     /// The cap on any peer-derived text this file puts back on the wire, **in UTF-8 bytes**.
-    static let maxWireReasonLength = 512
+    /// Computed rather than stored for the reason on ``maxConcurrentInboundStreams``. **The value
+    /// is unchanged at 512**, and it is read only when peer text is being bounded for the wire --
+    /// error formatting, not the message path.
+    static var maxWireReasonLength: Int { 512 }
 
     /// Bounds what a `cancel` op's `reason` (or a refusal's `message`) can carry back to the peer.
     ///
@@ -1897,6 +1926,13 @@ final class RPCTransportCore: Sendable {
     // MARK: - Connection lifecycle (contract lines 8, 9, 10)
     // =======================================================================================
 
+    /// What ``beginDraining()``'s registry section decided. Type scope for the same language
+    /// reason as ``Delivered``, and used by that one method only.
+    private enum Action {
+        case none
+        case drain(lastStreamID: RPCStreamID, finishAccepted: Bool)
+    }
+
     /// Begins a graceful drain from this side: sends `goAway`, refuses new streams, and finishes
     /// `acceptedStreams` so a server's accept loop ends. Streams already open are **not**
     /// disturbed -- draining them is the transport's job (it stays inside its task group until the
@@ -1904,11 +1940,6 @@ final class RPCTransportCore: Sendable {
     ///
     /// Idempotent, and a no-op once closed.
     func beginDraining() {
-        enum Action {
-            case none
-            case drain(lastStreamID: RPCStreamID, finishAccepted: Bool)
-        }
-
         let action: Action = registry.withLock { registry in
             guard !registry.isClosed, !registry.localDraining else { return .none }
             registry.localDraining = true
@@ -2019,8 +2050,8 @@ final class RPCTransportCore: Sendable {
 /// `ClosableRPCWriterProtocol: RPCWriterProtocol: Sendable`, and a `Sendable` class may not have
 /// mutable stored properties -- which a `weak var` necessarily is.
 @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
-private struct WeakCore: Sendable {
-    weak var core: RPCTransportCore?
+private struct WeakCore<Pipe: MessagePipe, Codec: WireCodec>: Sendable {
+    weak var core: RPCTransportCore<Pipe, Codec>?
 }
 
 /// The three things the two outbound state machines have in common, so ``OutboundOpWriter`` can be
@@ -2136,11 +2167,13 @@ extension ResponseOpEncoder: OutboundOpEncoding {
 /// permanent for this instance either way: nothing reached the wire, but the encoder's position has
 /// moved, so this writer can no longer produce a well-formed continuation of the stream.
 @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
-final class OutboundOpWriter<Encoder: OutboundOpEncoding>: ClosableRPCWriterProtocol {
+final class OutboundOpWriter<Encoder: OutboundOpEncoding, Pipe: MessagePipe, Codec: WireCodec>:
+    ClosableRPCWriterProtocol
+{
     typealias Element = Encoder.Part
 
     private let streamID: RPCStreamID
-    private let weakCore: Mutex<WeakCore>
+    private let weakCore: Mutex<WeakCore<Pipe, Codec>>
 
     private struct EncoderState {
         var encoder: Encoder
@@ -2148,7 +2181,7 @@ final class OutboundOpWriter<Encoder: OutboundOpEncoding>: ClosableRPCWriterProt
     }
     private let state: Mutex<EncoderState>
 
-    fileprivate init(core: RPCTransportCore, encoder: Encoder) {
+    fileprivate init(core: RPCTransportCore<Pipe, Codec>, encoder: Encoder) {
         self.streamID = encoder.streamID
         self.weakCore = Mutex(WeakCore(core: core))
         self.state = Mutex(EncoderState(encoder: encoder))
@@ -2156,7 +2189,7 @@ final class OutboundOpWriter<Encoder: OutboundOpEncoding>: ClosableRPCWriterProt
 
     /// The core, or `nil` once it has been deinitialized. Deliberately returns the strong
     /// reference *out* of the lock, so no send ever runs under it.
-    private var core: RPCTransportCore? { weakCore.withLock { $0.core } }
+    private var core: RPCTransportCore<Pipe, Codec>? { weakCore.withLock { $0.core } }
 
     private func coreGone() -> RPCError {
         RPCError(

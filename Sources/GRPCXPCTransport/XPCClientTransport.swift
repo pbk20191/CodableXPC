@@ -53,10 +53,10 @@ enum ConnectionQueueLabel {
 /// A `final class`, not a struct, because `state`'s `Synchronization.Mutex` is `~Copyable` and a
 /// `Copyable` struct cannot store one.
 @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
-public final class XPCClientTransport: ClientTransport {
-    public typealias Bytes = GRPCSwiftData
+final class RPCClientTransport<Pipe: MessagePipe, Codec: WireCodec>: ClientTransport {
+    typealias Bytes = GRPCSwiftData
 
-    private let core: RPCTransportCore
+    private let core: RPCTransportCore<Pipe, Codec>
 
     /// The parked ``connect()`` caller's continuation -- and **the reason its payload is a
     /// `Result` rather than the continuation's own failure type**.
@@ -216,152 +216,12 @@ public final class XPCClientTransport: ClientTransport {
     /// Adopts an already-live client-role core. The factories below are the ordinary way in; this
     /// exists separately because the in-process pair (`XPCServerTransport.connectingClient()`)
     /// builds its core from an endpoint, which only the XPC-importing file can name.
-    init(core: RPCTransportCore) {
+    init(core: RPCTransportCore<Pipe, Codec>) {
         precondition(
             core.role == .client,
-            "XPCClientTransport requires a client-role RPCTransportCore: only a client allocates "
+            "RPCClientTransport requires a client-role core: only a client allocates "
                 + "stream ids")
         self.core = core
-    }
-
-    // =======================================================================================
-    // MARK: - Dialling
-    // =======================================================================================
-
-    /// How a client names its peer. Deliberately *not* including an `XPCEndpoint` case: naming
-    /// that type would mean `import XPC` in this file, and the accept/dial traps documented in
-    /// `XPCPipe` are only encapsulated while the set of files that can reach libxpc stays at
-    /// `XPCPipe.swift`, `GRPCDispatchData.swift` and `XPCServerTransport.swift`. Endpoint dialling
-    /// therefore lives on the server transport, which already owns an `XPCListener`.
-    private enum Peer {
-        case machService(String)
-        case xpcService(String)
-        case peer(XPCEndpoint)
-
-        var label: String {
-            switch self {
-            case .machService(let name): "machService:\(name)"
-            case .xpcService(let name): "xpcService:\(name)"
-            // No interpolation: an anonymous endpoint has no stable name a human could match
-            // against anything, and this string ends up as a dispatch queue label in crash logs.
-            // `dialledCore` already appends a process-wide counter, which is what distinguishes
-            // one anonymous dial from the next.
-            case .peer: "endpoint"
-            }
-        }
-    }
-
-    /// Dials a launchd Mach service by name and returns a transport speaking to it.
-    ///
-    /// The session is live when this returns -- `XPCPipe`'s dial factory activates it -- so
-    /// `connect()` has no connecting work to do.
-    ///
-    /// **This throws for a name that does not resolve**, which is a correction: it used to say a
-    /// missing peer "is not an error here" and would surface later as peer death. Measured in Task
-    /// 8b §6.1, and a change in the platform since Task 5 rather than a change here --
-    /// `XPCSession(machService:)` with a well-formed but nonexistent name now throws from
-    /// `activate()` ("Underlying connection was invalidated ... Bad file descriptor"), where it
-    /// used to activate successfully. A launchd job that exists but is not running still launches
-    /// on demand as before; it is a name with no job behind it that now fails early.
-    ///
-    /// A peer that dies later still surfaces as peer death, which fails every stream with
-    /// `.unavailable`.
-    public static func connecting(toMachService name: String) throws(RPCError) -> XPCClientTransport {
-        try dialling(.machService(name))
-    }
-
-    /// Dials an XPC service bundle inside the calling application, by bundle identifier.
-    public static func connecting(toXPCService name: String) throws(RPCError) -> XPCClientTransport {
-        try dialling(.xpcService(name))
-    }
-    
-    /// Dials an **anonymous** listener's endpoint -- the third topology, and the one a launchd
-    /// name cannot express.
-    ///
-    /// `XPCEndpoint` is not discoverable: the server side gets one from
-    /// ``XPCServerTransport/anonymous()``'s ``XPCServerTransport/endpoint`` and has to hand it to
-    /// this side over a channel that already exists, which is the ordinary XPC brokering pattern
-    /// (a broker service vends per-client endpoints over its own connection). That is why this
-    /// takes an endpoint rather than a name, and why there is nothing to look up.
-    ///
-    /// Taking an `XPCEndpoint` is what obliges this file to `import XPC`; the rest of the op
-    /// layer stays substrate-agnostic.
-    public static func connecting(to endpoint: XPCEndpoint) throws(RPCError) -> XPCClientTransport {
-        try dialling(.peer(endpoint))
-    }
-
-
-    /// **The one build-a-client-core recipe.** Mints the connection queue, builds the mux inside
-    /// `building`, and hands back both halves.
-    ///
-    /// Every dial in this package goes through here -- the two public factories above,
-    /// `XPCServerTransport.connectingClient()` (which dials an `XPCEndpoint`, a type this file may
-    /// not name), and the test suite's `InspectableXPCPair`. It was written out three times
-    /// before, invariant comments and all, which meant a change to pipe retention or handler
-    /// installation had to be made three times or the dial paths would diverge -- from each other,
-    /// and from the one the tests claim to be inspecting. This is not ordinary duplication to
-    /// tolerate: the accept/dial recipe is where both of this project's reproduced process deaths
-    /// lived.
-    ///
-    /// The invariants, all four of them, now stated once:
-    ///
-    /// * **One serial queue per connection** (Task 5 §6.4). Nothing else may share it: the mux
-    ///   decodes and routes every inbound blob on it, and `XPCPipe.accepting` blocks on the queue
-    ///   it is handed.
-    /// * **`building` installs no pipe handlers.** It constructs the core and nothing else;
-    ///   `RPCTransportCore.init` installs `onReceive`/`onPeerDeath` itself, and **weakly** (L6).
-    ///   Installing them here would *replace* the core's -- `XPCPipe`'s setters are set-once and
-    ///   trap on a `precondition` -- and silently disconnect the mux.
-    /// * **`building` runs synchronously**, inside the dial factory and before the session is
-    ///   activated, which is what makes the `guard` below unreachable and lets a `var` capture
-    ///   carry the core back out.
-    /// * **The pipe is not this function's to drop.** `core` holds it strongly, so the reference
-    ///   returned here is never its last one; a caller that wants only the transport discards it
-    ///   (`_ =`) and a caller whose *subject* is the pipe keeps it. Either is safe: a dialled
-    ///   pipe's one safe disposal is activate-then-cancel, and whichever of `core.close()` /
-    ///   `XPCPipe.deinit` gets there first performs exactly one cancel (the obligation is taken
-    ///   and cleared under the pipe's own lock). See `XPCPipe`'s disposal matrix.
-    ///
-    /// - Parameter peer: how the peer was named, for the queue label only -- see
-    ///   ``ConnectionQueueLabel``. Correctness never depends on it.
-    /// - Parameter dial: **exactly one of `XPCPipe`'s three dial factories**, applied to the queue
-    ///   and `building` closure this function supplies. A closure rather than a `Peer` case
-    ///   because `XPCEndpoint` cannot be named in this file (see ``Peer``), and the endpoint dial
-    ///   is one of the callers this recipe has to cover.
-    /// - Returns: the live core and the pipe it was built on.
-    static func dialledCore(
-        peer: String,
-        _ dial: (DispatchSerialQueue, (XPCPipe) -> Void) throws(RPCError) -> XPCPipe
-    ) throws(RPCError) -> (core: RPCTransportCore, pipe: XPCPipe) {
-        let queue = DispatchSerialQueue(
-            label: ConnectionQueueLabel.mint(role: "client", peer: peer))
-
-        var built: RPCTransportCore?
-        let pipe = try dial(queue) { pipe in
-            built = RPCTransportCore(pipe: pipe, codec: CompactWireCodec(), role: .client)
-        }
-
-        guard let core = built else {
-            // Unreachable: every dial factory calls `building` synchronously before returning. A
-            // trap rather than a thrown error, because the only way here is a broken `XPCPipe`,
-            // and recovering would mean handling a pipe with no mux behind it.
-            preconditionFailure("XPCPipe.connecting did not run its `building` closure")
-        }
-        return (core, pipe)
-    }
-
-    private static func dialling(_ peer: Peer) throws(RPCError) -> XPCClientTransport {
-        let (core, _) = try dialledCore(peer: peer.label) { (queue, building) throws(RPCError) in
-            switch peer {
-            case .machService(let name):
-                try XPCPipe.connecting(toMachService: name, queue: queue, building: building)
-            case .xpcService(let name):
-                try XPCPipe.connecting(toXPCService: name, queue: queue, building: building)
-            case .peer(let endPoint):
-                try XPCPipe.connecting(to: endPoint, queue: queue, building: building)
-            }
-        }
-        return XPCClientTransport(core: core)
     }
 
     // =======================================================================================
@@ -369,7 +229,7 @@ public final class XPCClientTransport: ClientTransport {
     // =======================================================================================
 
     /// No throttle: retry policy is a `MethodConfig` concern and this transport supplies none.
-    public var retryThrottle: RetryThrottle? { nil }
+    var retryThrottle: RetryThrottle? { nil }
 
     /// Blocks until `beginGracefulShutdown()` has been called **and every in-flight RPC has
     /// finished**, or until this call's own task is cancelled.
@@ -402,7 +262,7 @@ public final class XPCClientTransport: ClientTransport {
     /// `RPCError` rather than `any Error`. Narrowing a witness of `ClientTransport.connect()`'s
     /// untyped `throws` requirement is allowed (a `throws(E)` function is a subtype of a `throws`
     /// one) and costs a caller nothing: an existing `catch` still catches it.
-    public func connect() async throws(RPCError) {
+    func connect() async throws(RPCError) {
         // The concurrent-call refusal propagates from here, thrown before anything was parked,
         // and must **not** reach the tail below -- see the last paragraph of that comment. It is
         // an ordinary typed `try` and no longer a cast with an unreachable trap behind it,
@@ -524,21 +384,21 @@ public final class XPCClientTransport: ClientTransport {
     /// possible after some backoff". Telling a caller to back off and retry a transport that will
     /// never reopen would be a lie. `InProcessTransport+Client` reports the same condition the same
     /// way.
-    private static let localShutdownRefusal = RPCError(
+    private static var localShutdownRefusal: RPCError { RPCError(
         code: .failedPrecondition,
-        message: "no new streams: this transport has begun shutting down")
+        message: "no new streams: this transport has begun shutting down") }
 
     /// The peer's `goAway`, by contrast, *is* retryable in the sense `.unavailable` means: this
     /// connection is finished, another one to the same peer may work.
-    private static let peerDrainingRefusal = RPCError(
+    private static var peerDrainingRefusal: RPCError { RPCError(
         code: .unavailable,
         message: "no new streams: the connection is draining (the peer sent goAway, or it has "
-            + "been torn down)")
+            + "been torn down)") }
 
-    private static let concurrentConnect = RPCError(
+    private static var concurrentConnect: RPCError { RPCError(
         code: .failedPrecondition,
-        message: "XPCClientTransport.connect() is already running "
-            + "-- it must not be called more than once concurrently")
+        message: "connect() is already running "
+            + "-- it must not be called more than once concurrently") }
 
     /// Begins a **graceful** shutdown: sends `goAway`, refuses new calls, and lets the calls
     /// already in flight run to completion. Returns immediately -- the waiting happens in
@@ -576,7 +436,7 @@ public final class XPCClientTransport: ClientTransport {
     ///
     /// Idempotent: a second call finds `.draining`/`.shutDown` and changes nothing, and
     /// `beginDraining()` is itself a no-op once draining.
-    public func beginGracefulShutdown() {
+    func beginGracefulShutdown() {
         state.withLock { $0.localShutdownRequested = true }
         core.beginDraining()
         let completion: Completion = state.withLock { state in
@@ -666,7 +526,7 @@ public final class XPCClientTransport: ClientTransport {
     /// The same `defer` is the "send `cancel` if the stream did not terminate cleanly" rule: the
     /// *presence of a table entry* at that moment is the definition of "did not complete", so
     /// `clientCallFinished` needs no other signal to decide.
-    public func withStream<T: Sendable>(
+    func withStream<T: Sendable>(
         descriptor: MethodDescriptor,
         options: CallOptions,
         _ closure: (RPCStream<Inbound, Outbound>, ClientContext) async throws -> T
@@ -748,5 +608,235 @@ public final class XPCClientTransport: ClientTransport {
 
     /// No per-method configuration: this transport negotiates nothing (§O5) and supplies no
     /// retry or hedging policy.
-    public func config(forMethod descriptor: MethodDescriptor) -> MethodConfig? { nil }
+    func config(forMethod descriptor: MethodDescriptor) -> MethodConfig? { nil }
+}
+
+// ===========================================================================================
+// MARK: - XPCClientTransport (the public façade)
+// ===========================================================================================
+
+/// grpc-swift's `ClientTransport` over one XPC session: ``RPCClientTransport`` bound to the one
+/// instantiation XPC needs, plus the dialling this package ships.
+///
+/// # Why this is a façade and not simply a generic type
+///
+/// ``RPCClientTransport`` is generic over the mux's two seams, and `RPCTransportCore` is generic
+/// over them because that is what turns `pipe.send` / `codec.encode` / `codec.decode` into static
+/// calls. But `MessagePipe` and `WireCodec` are **internal**, and this type is **public**, and
+/// Swift will not let those meet. Measured, not assumed -- both spellings were tried and the
+/// compiler refused both:
+///
+/// ```
+/// error: generic class cannot be declared public because its generic parameter uses an
+///        internal type
+/// error: type alias cannot be declared public because its underlying type uses an
+///        internal type
+/// ```
+///
+/// So the public/internal boundary is the ceiling on the generic conversion: the generic type is
+/// internal, and every public type must name exactly one instantiation of it. Making the seams
+/// public was never an option -- `WireCodec.decode` returns `[WireDecodeItem]`, which would drag
+/// `RPCOp` and the whole op model into this package's public surface.
+///
+/// # What it costs, and what it does not
+///
+/// One forwarding hop **per RPC** (`withStream`), not per message: the per-message path is
+/// `OutboundOpWriter` → `RPCTransportCore.send(_:forStream:)` → `pipe.send`, and none of it comes
+/// through here. `Inbound` and `Outbound` are not restated -- `ClientTransport` derives both from
+/// `Bytes`, so they are the *same* two types on both sides of the hop and every forward below is a
+/// straight pass-through with no conversion in it.
+///
+/// The alternative considered was a send hook on ``XPCPipe`` so a test could freeze a send without
+/// this split. It was rejected on cost, not taste: `XPCPipe.send` takes exactly one lock today and
+/// its comment says so in as many words -- *"This is the only lock the send path takes, and it is
+/// read-only"* -- and a stored hook would add a second closure read to **every outbound blob in
+/// production** to buy a test affordance, and falsify a comment that is currently a precise claim.
+/// One hop per RPC is cheaper than one read per message.
+///
+/// # Ownership (L6)
+///
+/// Unchanged, and it all lives one layer down: ``RPCClientTransport`` holds the core strongly, the
+/// core holds the pipe, the pipe holds the `XPCSession`, and libxpc's end reaches back weakly.
+/// There is no `deinit` here and deliberately is not one.
+@available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
+public final class XPCClientTransport: ClientTransport {
+    public typealias Bytes = GRPCSwiftData
+
+    /// The mux-facing transport this type is a binding of. `private`: the façade is the whole of
+    /// the public surface, and nothing outside may reach past it.
+    private let impl: RPCClientTransport<XPCPipe, CompactWireCodec>
+
+    /// Adopts an already-live client-role core. The factories below are the ordinary way in; this
+    /// exists separately because the in-process pair (`XPCServerTransport.connectingClient()`)
+    /// builds its core from an endpoint, which only the XPC-importing file can name.
+    init(core: XPCTransportCore) {
+        self.impl = RPCClientTransport(core: core)
+    }
+
+    // =======================================================================================
+    // MARK: - Dialling
+    // =======================================================================================
+
+    /// How a client names its peer. Deliberately *not* including an `XPCEndpoint` case: naming
+    /// that type would mean `import XPC` in this file, and the accept/dial traps documented in
+    /// `XPCPipe` are only encapsulated while the set of files that can reach libxpc stays at
+    /// `XPCPipe.swift`, `GRPCDispatchData.swift` and `XPCServerTransport.swift`. Endpoint dialling
+    /// therefore lives on the server transport, which already owns an `XPCListener`.
+    private enum Peer {
+        case machService(String)
+        case xpcService(String)
+        case peer(XPCEndpoint)
+
+        var label: String {
+            switch self {
+            case .machService(let name): "machService:\(name)"
+            case .xpcService(let name): "xpcService:\(name)"
+            // No interpolation: an anonymous endpoint has no stable name a human could match
+            // against anything, and this string ends up as a dispatch queue label in crash logs.
+            // `dialledCore` already appends a process-wide counter, which is what distinguishes
+            // one anonymous dial from the next.
+            case .peer: "endpoint"
+            }
+        }
+    }
+
+    /// Dials a launchd Mach service by name and returns a transport speaking to it.
+    ///
+    /// The session is live when this returns -- `XPCPipe`'s dial factory activates it -- so
+    /// `connect()` has no connecting work to do.
+    ///
+    /// **This throws for a name that does not resolve**, which is a correction: it used to say a
+    /// missing peer "is not an error here" and would surface later as peer death. Measured in Task
+    /// 8b §6.1, and a change in the platform since Task 5 rather than a change here --
+    /// `XPCSession(machService:)` with a well-formed but nonexistent name now throws from
+    /// `activate()` ("Underlying connection was invalidated ... Bad file descriptor"), where it
+    /// used to activate successfully. A launchd job that exists but is not running still launches
+    /// on demand as before; it is a name with no job behind it that now fails early.
+    ///
+    /// A peer that dies later still surfaces as peer death, which fails every stream with
+    /// `.unavailable`.
+    public static func connecting(toMachService name: String) throws(RPCError) -> XPCClientTransport {
+        try dialling(.machService(name))
+    }
+
+    /// Dials an XPC service bundle inside the calling application, by bundle identifier.
+    public static func connecting(toXPCService name: String) throws(RPCError) -> XPCClientTransport {
+        try dialling(.xpcService(name))
+    }
+    
+    /// Dials an **anonymous** listener's endpoint -- the third topology, and the one a launchd
+    /// name cannot express.
+    ///
+    /// `XPCEndpoint` is not discoverable: the server side gets one from
+    /// ``XPCServerTransport/anonymous()``'s ``XPCServerTransport/endpoint`` and has to hand it to
+    /// this side over a channel that already exists, which is the ordinary XPC brokering pattern
+    /// (a broker service vends per-client endpoints over its own connection). That is why this
+    /// takes an endpoint rather than a name, and why there is nothing to look up.
+    ///
+    /// Taking an `XPCEndpoint` is what obliges this file to `import XPC`; the rest of the op
+    /// layer stays substrate-agnostic.
+    public static func connecting(to endpoint: XPCEndpoint) throws(RPCError) -> XPCClientTransport {
+        try dialling(.peer(endpoint))
+    }
+
+
+    /// **The one build-a-client-core recipe.** Mints the connection queue, builds the mux inside
+    /// `building`, and hands back both halves.
+    ///
+    /// Every dial in this package goes through here -- the two public factories above,
+    /// `XPCServerTransport.connectingClient()` (which dials an `XPCEndpoint`, a type this file may
+    /// not name), and the test suite's `InspectableXPCPair`. It was written out three times
+    /// before, invariant comments and all, which meant a change to pipe retention or handler
+    /// installation had to be made three times or the dial paths would diverge -- from each other,
+    /// and from the one the tests claim to be inspecting. This is not ordinary duplication to
+    /// tolerate: the accept/dial recipe is where both of this project's reproduced process deaths
+    /// lived.
+    ///
+    /// The invariants, all four of them, now stated once:
+    ///
+    /// * **One serial queue per connection** (Task 5 §6.4). Nothing else may share it: the mux
+    ///   decodes and routes every inbound blob on it, and `XPCPipe.accepting` blocks on the queue
+    ///   it is handed.
+    /// * **`building` installs no pipe handlers.** It constructs the core and nothing else;
+    ///   `RPCTransportCore.init` installs `onReceive`/`onPeerDeath` itself, and **weakly** (L6).
+    ///   Installing them here would *replace* the core's -- `XPCPipe`'s setters are set-once and
+    ///   trap on a `precondition` -- and silently disconnect the mux.
+    /// * **`building` runs synchronously**, inside the dial factory and before the session is
+    ///   activated, which is what makes the `guard` below unreachable and lets a `var` capture
+    ///   carry the core back out.
+    /// * **The pipe is not this function's to drop.** `core` holds it strongly, so the reference
+    ///   returned here is never its last one; a caller that wants only the transport discards it
+    ///   (`_ =`) and a caller whose *subject* is the pipe keeps it. Either is safe: a dialled
+    ///   pipe's one safe disposal is activate-then-cancel, and whichever of `core.close()` /
+    ///   `XPCPipe.deinit` gets there first performs exactly one cancel (the obligation is taken
+    ///   and cleared under the pipe's own lock). See `XPCPipe`'s disposal matrix.
+    ///
+    /// - Parameter peer: how the peer was named, for the queue label only -- see
+    ///   ``ConnectionQueueLabel``. Correctness never depends on it.
+    /// - Parameter dial: **exactly one of `XPCPipe`'s three dial factories**, applied to the queue
+    ///   and `building` closure this function supplies. A closure rather than a `Peer` case
+    ///   because `XPCEndpoint` cannot be named in this file (see ``Peer``), and the endpoint dial
+    ///   is one of the callers this recipe has to cover.
+    /// - Returns: the live core and the pipe it was built on.
+    static func dialledCore(
+        peer: String,
+        _ dial: (DispatchSerialQueue, (XPCPipe) -> Void) throws(RPCError) -> XPCPipe
+    ) throws(RPCError) -> (core: XPCTransportCore, pipe: XPCPipe) {
+        let queue = DispatchSerialQueue(
+            label: ConnectionQueueLabel.mint(role: "client", peer: peer))
+
+        var built: XPCTransportCore?
+        let pipe = try dial(queue) { pipe in
+            built = XPCTransportCore(pipe: pipe, codec: CompactWireCodec(), role: .client)
+        }
+
+        guard let core = built else {
+            // Unreachable: every dial factory calls `building` synchronously before returning. A
+            // trap rather than a thrown error, because the only way here is a broken `XPCPipe`,
+            // and recovering would mean handling a pipe with no mux behind it.
+            preconditionFailure("XPCPipe.connecting did not run its `building` closure")
+        }
+        return (core, pipe)
+    }
+
+    private static func dialling(_ peer: Peer) throws(RPCError) -> XPCClientTransport {
+        let (core, _) = try dialledCore(peer: peer.label) { (queue, building) throws(RPCError) in
+            switch peer {
+            case .machService(let name):
+                try XPCPipe.connecting(toMachService: name, queue: queue, building: building)
+            case .xpcService(let name):
+                try XPCPipe.connecting(toXPCService: name, queue: queue, building: building)
+            case .peer(let endPoint):
+                try XPCPipe.connecting(to: endPoint, queue: queue, building: building)
+            }
+        }
+        return XPCClientTransport(core: core)
+    }
+
+    // =======================================================================================
+    // MARK: - ClientTransport, forwarded
+    // =======================================================================================
+    //
+    // Six requirements, every one a straight pass-through. `Inbound`/`Outbound` are absent on
+    // purpose: `ClientTransport` derives them from `Bytes`, which both sides set to
+    // `GRPCSwiftData`, so `RPCStream<Inbound, Outbound>` names one type here and there and the
+    // closure crosses the hop untouched.
+
+    public var retryThrottle: RetryThrottle? { impl.retryThrottle }
+
+    public func connect() async throws(RPCError) { try await impl.connect() }
+
+    public func beginGracefulShutdown() { impl.beginGracefulShutdown() }
+
+    public func withStream<T: Sendable>(
+        descriptor: MethodDescriptor,
+        options: CallOptions,
+        _ closure: (RPCStream<Inbound, Outbound>, ClientContext) async throws -> T
+    ) async throws -> T {
+        try await impl.withStream(descriptor: descriptor, options: options, closure)
+    }
+
+    public func config(forMethod descriptor: MethodDescriptor) -> MethodConfig? {
+        impl.config(forMethod: descriptor)
+    }
 }
