@@ -513,12 +513,54 @@ public final class XPCServerTransport: ServerTransport {
     /// Note the contrast with `Demo/`'s `XPCActors` service, which *does* need `xpc_main` -- that
     /// stack speaks to a raw `xpc_connection_t` rather than to the overlay's listener. Both are
     /// correct for what they talk to.
-    public static func service(named name: String) throws -> XPCServerTransport {
+    ///
+    /// # Why this is `throws(RPCError)`, and why `.unavailable`
+    ///
+    /// `XPCListener.init` and `activate()` throw the XPC overlay's own errors, and until this
+    /// round they escaped raw -- so "could not stand up the listener" arrived at a consumer as one
+    /// error type here and as `RPCError` from ``XPCClientTransport/connecting(toMachService:)``,
+    /// which is the *same failure class* named the *same way* (a launchd Mach service or bundle
+    /// identifier) on the other half of the same transport. Two catch types for one condition is a
+    /// consumer's problem, not a stylistic one, so both overlay throws are wrapped here.
+    ///
+    /// `.unavailable` rather than `.failedPrecondition`, deliberately, and the two are not
+    /// interchangeable in this file's vocabulary. `ClientTransport.withStream`'s documented mapping
+    /// -- which ``XPCClientTransport`` follows throughout -- gives `.failedPrecondition` to "the
+    /// transport is closing or has been closed", i.e. to a **statement about this object's own
+    /// lifecycle**, and `.unavailable` to "temporarily not possible... may be possible after some
+    /// backoff". A listener that cannot be created or activated is neither closing nor closed:
+    /// there is no object whose state was wrong. It is a statement about *the name* -- not
+    /// registered, claimed by an instance that has not yet exited, refused by the sandbox -- which
+    /// is exactly what `.unavailable` means, and it is what ``XPCPipe`` already reports for the
+    /// mirror-image failure on the dialling side ("could not create the XPC session", "could not
+    /// activate the XPC session"). ``connectingClient()`` keeps `.failedPrecondition` for its own
+    /// case *because* that one really is a statement about this object: it was built by
+    /// ``service(named:)`` and therefore has no endpoint.
+    ///
+    /// The overlay's error is preserved as `cause:` rather than interpolated into the message.
+    /// `RPCError.description` renders it (`code: "message" (cause: "...")`), so nothing is lost in
+    /// a log, and a caller that wants the underlying `NSError` domain and code can still reach it.
+    public static func service(named name: String) throws(RPCError) -> XPCServerTransport {
         let acceptor = Acceptor()
-        let listener = try XPCListener(
-            service: name, targetQueue: nil, options: .inactive,
-            incomingSessionHandler: { request in acceptor.accept(request) })
-        try listener.activate()
+        let listener: XPCListener
+        do {
+            listener = try XPCListener(
+                service: name, targetQueue: nil, options: .inactive,
+                incomingSessionHandler: { request in acceptor.accept(request) })
+        } catch {
+            throw RPCError(
+                code: .unavailable,
+                message: "could not create an XPC listener for service \"\(name)\"",
+                cause: error)
+        }
+        do {
+            try listener.activate()
+        } catch {
+            throw RPCError(
+                code: .unavailable,
+                message: "could not activate the XPC listener for service \"\(name)\"",
+                cause: error)
+        }
         return XPCServerTransport(acceptor: acceptor, listener: listener, endpoint: nil)
     }
 
@@ -530,12 +572,24 @@ public final class XPCServerTransport: ServerTransport {
     /// already exists. That is the ordinary XPC brokering pattern, and it is the one topology a
     /// launchd name cannot express -- see ``XPCClientTransport/connecting(to:)`` for the other
     /// half. The in-process pair below is the same machinery with both ends here.
-    public static func anonymous() throws -> XPCServerTransport {
+    ///
+    /// `throws(RPCError)` with `.unavailable` for the same reasons as ``service(named:)``, whose
+    /// doc comment carries the argument. Only one call can fail here: the anonymous
+    /// `XPCListener.init` does not throw (there is no name to claim), so `activate()` is the whole
+    /// of this factory's failure surface.
+    public static func anonymous() throws(RPCError) -> XPCServerTransport {
         let acceptor = Acceptor()
         let listener = XPCListener(
             targetQueue: nil, options: .inactive,
             incomingSessionHandler: { request in acceptor.accept(request) })
-        try listener.activate()
+        do {
+            try listener.activate()
+        } catch {
+            throw RPCError(
+                code: .unavailable,
+                message: "could not activate the anonymous XPC listener",
+                cause: error)
+        }
         // `endpoint` is only valid after `activate()`.
         return XPCServerTransport(
             acceptor: acceptor, listener: listener, endpoint: listener.endpoint)
@@ -592,10 +646,18 @@ public final class XPCServerTransport: ServerTransport {
     ///   `GRPCServer.serve()` expects, since it wraps *any* thrown error from `listen` in a
     ///   `RuntimeError(code: .transportError, ...)` and would misreport an ordinary cancelled
     ///   shutdown as a transport failure.
+    ///
+    /// **`throws(RPCError)`, and the refusal is the only thing it can throw.** `streamHandler` is
+    /// `async -> Void` -- non-throwing -- so nothing an application supplies can escape here;
+    /// ``run(_:on:with:)`` swallows what a handler does; and the body is
+    /// `await withTaskCancellationHandler { await withDiscardingTaskGroup { ... } }`, neither of
+    /// which can throw when what they wrap cannot. A previous round left this bare on the grounds
+    /// that a handler's error might reach it. It cannot: that would need a `throws` handler
+    /// parameter, and this one is not.
     public func listen(
         streamHandler: @escaping @Sendable (RPCStream<Inbound, Outbound>, ServerContext) async ->
             Void
-    ) async throws {
+    ) async throws(RPCError) {
         // L7: one atomic take-and-transition decides whether this call runs at all.
         let previous: ListenState = state.withLock { current in
             let previous = current

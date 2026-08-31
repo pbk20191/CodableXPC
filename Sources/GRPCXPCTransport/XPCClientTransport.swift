@@ -99,8 +99,8 @@ public final class XPCClientTransport: ClientTransport {
         /// it rather than parking forever.
         enum Phase {
             case idle
-            case connected(CheckedContinuation<Void, any Error>)
-            case draining(CheckedContinuation<Void, any Error>?)
+            case connected(CheckedContinuation<Void, RPCError>)
+            case draining(CheckedContinuation<Void, RPCError>?)
             case shutDown
         }
 
@@ -137,7 +137,7 @@ public final class XPCClientTransport: ClientTransport {
 
         /// Whatever continuation is parked, whichever phase holds it. Read-only: every caller
         /// assigns a new phase immediately afterwards, which is what empties the slot.
-        var parked: CheckedContinuation<Void, any Error>? {
+        var parked: CheckedContinuation<Void, RPCError>? {
             switch phase {
             case .connected(let continuation): continuation
             case .draining(let continuation): continuation
@@ -175,7 +175,7 @@ public final class XPCClientTransport: ClientTransport {
     /// * nothing was parked -> no `connect()` tail will ever run, so **this** caller closes.
     private enum Completion {
         case nothing
-        case resume(CheckedContinuation<Void, any Error>)
+        case resume(CheckedContinuation<Void, RPCError>)
         case closeSubstrate
     }
 
@@ -372,60 +372,29 @@ public final class XPCClientTransport: ClientTransport {
     /// `runConnections()` is misused this way, so a thrown error is the precedent this follows; a
     /// caller that never calls `connect()` twice concurrently (the documented, correct usage)
     /// never sees it.
-    public func connect() async throws {
-        try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation {
-                (continuation: CheckedContinuation<Void, any Error>) in
-                // L7: take-and-transition under the lock, resume *outside* it.
-                let immediate: Result<Void, any Error>? = state.withLock { state in
-                    if state.parked != nil {
-                        return .failure(Self.concurrentConnect)
-                    }
-                    switch state.phase {
-                    case .idle:
-                        state.phase = .connected(continuation)
-                        return nil  // parked; resumed by the drain or by cancellation
-                    case .connected:
-                        // Unreachable: `.connected` always carries a continuation, so the
-                        // `parked != nil` test above caught it. Kept exhaustive rather than
-                        // `default:` so a future phase cannot fall through silently.
-                        return .failure(Self.concurrentConnect)
-                    case .draining:
-                        // A shutdown is already under way with RPCs still in flight. Park: the
-                        // last of them to finish releases this call, which is the same contract
-                        // as parking before the shutdown.
-                        state.phase = .draining(continuation)
-                        return nil
-                    case .shutDown:
-                        return .success(())
-                    }
-                }
-                switch immediate {
-                case .success: continuation.resume()
-                case .failure(let error): continuation.resume(throwing: error)
-                case nil: break  // parked above; nothing to resume yet
-                }
-            }
-        } onCancel: {
-            // `beginGracefulShutdown()`'s own documentation names this as *the* forceful lever:
-            // "If you want to forcefully cancel all active streams then cancel the task running
-            // `connect()`." So this is not a quiet variant of the graceful path -- it fails every
-            // live stream (which also wakes every waiter parked on a flow-control window, since
-            // `failAll` fails the connection window too) and only then releases `connect()`.
-            //
-            // **`failAll` fails the streams; it does not touch the pipe.** Releasing the XPC
-            // session is `core.close()`'s job and happens in this method's tail, below, which both
-            // this path and a completed graceful drain pass through. Saying it here instead would
-            // be the round-1 mistake again: a comment claiming a teardown the code does not do,
-            // in the file's most lifecycle-critical spot.
-            //
-            // Safe from a cancellation handler: `failAll` takes its snapshot under the registry
-            // lock and resumes/fails everything outside it.
-            self.core.failAll(
-                RPCError(
-                    code: .unavailable,
-                    message: "the client's connect() task was cancelled"))
-            self.shutDownForcefully()?.resume()
+    ///
+    /// **That refusal is the only error this can produce, which is why it is `throws(RPCError)`.**
+    /// The parked continuation is resumed with `resume()` on every path that releases it -- the
+    /// drain, the last in-flight call finishing, and cancellation -- so nothing but
+    /// ``concurrentConnect`` ever travels through it, and the continuation's failure type is
+    /// `RPCError` rather than `any Error`. Narrowing a witness of `ClientTransport.connect()`'s
+    /// untyped `throws` requirement is allowed (a `throws(E)` function is a subtype of a `throws`
+    /// one) and costs a caller nothing: an existing `catch` still catches it.
+    public func connect() async throws(RPCError) {
+        do {
+            try await parkUntilReleased()
+        } catch let error as RPCError {
+            // The concurrent-call refusal, thrown before anything was parked. It must **not**
+            // reach the tail below -- see the last paragraph of that comment.
+            throw error
+        } catch {
+            // Unreachable: ``parkUntilReleased()`` suspends on a
+            // `CheckedContinuation<Void, RPCError>` and does nothing else that can throw, so the
+            // only error that can arrive here is the one the cast above already took. A trap
+            // rather than a wrap, because reaching it would mean the continuation resumed with
+            // something its own type forbids.
+            preconditionFailure(
+                "XPCClientTransport.connect() saw a non-RPCError \(type(of: error)): \(error)")
         }
 
         // **This is where the XPC session is released**, and it is deliberately in the tail rather
@@ -464,6 +433,74 @@ public final class XPCClientTransport: ClientTransport {
         // this line -- which is required, not incidental: it must not close the session out from
         // under the first `connect()`.
         core.close()
+    }
+
+    /// ``connect()``'s suspension, and **the whole reason ``connect()`` has to cast**.
+    ///
+    /// `withTaskCancellationHandler` is `rethrows`, not typed-`rethrows`: it erases the
+    /// `CheckedContinuation<Void, RPCError>` below back to `any Error`, so a body declared
+    /// `throws(RPCError)` cannot host it directly (measured -- the compiler reports "thrown
+    /// expression type 'any Error' cannot be converted to error type 'RPCError'"). Splitting the
+    /// suspension out keeps that erasure, and the one cast that undoes it, in a single place
+    /// instead of putting a bare `catch` in the middle of the drain barrier.
+    ///
+    /// Bare `throws` here is therefore **the stdlib's type, not this transport's**: the only value
+    /// that can ever be thrown is the `RPCError` the continuation carries.
+    private func parkUntilReleased() async throws {
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation {
+                (continuation: CheckedContinuation<Void, RPCError>) in
+                // L7: take-and-transition under the lock, resume *outside* it.
+                let immediate: Result<Void, RPCError>? = state.withLock { state in
+                    if state.parked != nil {
+                        return .failure(Self.concurrentConnect)
+                    }
+                    switch state.phase {
+                    case .idle:
+                        state.phase = .connected(continuation)
+                        return nil  // parked; resumed by the drain or by cancellation
+                    case .connected:
+                        // Unreachable: `.connected` always carries a continuation, so the
+                        // `parked != nil` test above caught it. Kept exhaustive rather than
+                        // `default:` so a future phase cannot fall through silently.
+                        return .failure(Self.concurrentConnect)
+                    case .draining:
+                        // A shutdown is already under way with RPCs still in flight. Park: the
+                        // last of them to finish releases this call, which is the same contract
+                        // as parking before the shutdown.
+                        state.phase = .draining(continuation)
+                        return nil
+                    case .shutDown:
+                        return .success(())
+                    }
+                }
+                switch immediate {
+                case .success: continuation.resume()
+                case .failure(let error): continuation.resume(throwing: error)
+                case nil: break  // parked above; nothing to resume yet
+                }
+            }
+        } onCancel: {
+            // `beginGracefulShutdown()`'s own documentation names this as *the* forceful lever:
+            // "If you want to forcefully cancel all active streams then cancel the task running
+            // `connect()`." So this is not a quiet variant of the graceful path -- it fails every
+            // live stream (which also wakes every waiter parked on a flow-control window, since
+            // `failAll` fails the connection window too) and only then releases `connect()`.
+            //
+            // **`failAll` fails the streams; it does not touch the pipe.** Releasing the XPC
+            // session is `core.close()`'s job and happens in ``connect()``'s tail, which both
+            // this path and a completed graceful drain pass through. Saying it here instead would
+            // be the round-1 mistake again: a comment claiming a teardown the code does not do,
+            // in the file's most lifecycle-critical spot.
+            //
+            // Safe from a cancellation handler: `failAll` takes its snapshot under the registry
+            // lock and resumes/fails everything outside it.
+            self.core.failAll(
+                RPCError(
+                    code: .unavailable,
+                    message: "the client's connect() task was cancelled"))
+            self.shutDownForcefully()?.resume()
+        }
     }
 
     /// A local shutdown is **permanent** for this transport -- there is no reconnect -- so
@@ -582,7 +619,7 @@ public final class XPCClientTransport: ClientTransport {
     ///
     /// The continuation is *returned* rather than resumed here so the resume happens outside the
     /// lock (L7).
-    private func shutDownForcefully() -> CheckedContinuation<Void, any Error>? {
+    private func shutDownForcefully() -> CheckedContinuation<Void, RPCError>? {
         state.withLock { state in
             let parked = state.parked
             state.phase = .shutDown

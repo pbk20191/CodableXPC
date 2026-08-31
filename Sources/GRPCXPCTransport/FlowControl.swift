@@ -156,6 +156,22 @@ final class FlowControlWindow: Sendable {
     /// *same* `withLock`: bytes leave the window exactly when a slot becomes their owner, so a
     /// grant is never in flight without an owner obliged to return it (see ``reserve(upTo:)``,
     /// which returns `k` even to a task that was cancelled in the interim).
+    ///
+    /// # Why the continuation's failure type is `any Error` and not `RPCError`
+    ///
+    /// Everywhere else in this package a continuation that can only ever carry an ``RPCError`` now
+    /// says so (`CheckedContinuation<Void, RPCError>` in ``XPCClientTransport``). This one cannot,
+    /// and the reason is `reserve(upTo:)`'s contract rather than a missed opportunity: it throws
+    /// **two unrelated error types on purpose** -- `CancellationError` when the waiting task is
+    /// cancelled, and whatever ``fail(_:)`` was handed when the window died. The second is `any
+    /// Error` all the way up, because ``RPCTransportCore/failAll(_:)`` takes `any Error`. Narrowing
+    /// to `RPCError` was attempted and the compiler names all three blockers: `.failed`'s payload,
+    /// `onCancel`'s `CancellationError`, and ``fail(_:)``'s parameter.
+    ///
+    /// Making it typed would therefore mean changing what a cancelled or torn-down sender
+    /// *observes* -- a two-case error enum, or `CancellationError` rewritten as
+    /// `RPCError(code: .cancelled)` -- and that is a decision about this transport's behaviour, not
+    /// a re-spelling of it. Left as it is deliberately.
     private enum Slot {
         /// Waiting. `continuation` is `nil` in the window between taking a token and actually
         /// parking; a resolution landing in that window is remembered by the terminal cases below

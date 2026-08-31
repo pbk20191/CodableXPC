@@ -1,3 +1,4 @@
+import Foundation
 import GRPCCore
 import XCTest
 import XPC
@@ -86,5 +87,64 @@ final class BrokeredEndpointTests: XCTestCase {
         XCTAssertEqual(
             echoed, ["echo:hello"],
             "the RPC must complete over the brokered endpoint, not merely fail to throw")
+    }
+
+    /// **The server factories' error surface**, and the counterpart to
+    /// ``XPCClientTransport/connecting(toMachService:)``'s.
+    ///
+    /// "Could not stand up the listener/session for this launchd name" is one failure class, and
+    /// until this round a consumer had to catch it two ways: `RPCError` from the client factory,
+    /// and the XPC overlay's own error from ``XPCServerTransport/service(named:)``, which let
+    /// `XPCListener.init` / `activate()` escape raw. This case pins the fix at the only place it
+    /// is observable -- the public API, without `@testable`.
+    ///
+    /// It asserts three things, and the first two are compile-time:
+    ///
+    /// 1. **the factory is `throws(RPCError)`.** `error` below is bound by an untyped `catch`, so
+    ///    `error.code` only resolves because the thrown type is statically `RPCError`. Widen the
+    ///    signature back to bare `throws` and this file stops compiling -- which is the same kind
+    ///    of proof the plain `import` at the top of this file gives for `public`;
+    /// 2. **the wrapping happens in the package, not in this test** -- there is no `as?` here;
+    /// 3. **the overlay's error survives as `cause:`**, rather than being flattened into the
+    ///    message. That is the project's standing rule about typed throws (a narrower error type
+    ///    is not worth a lost `cause:`), and it is the assertion with teeth: a wrapper written as
+    ///    `message: "... \(error)"` passes "it threw an RPCError with code .unavailable" and fails
+    ///    here.
+    ///
+    /// The name is a well-formed bundle identifier that no launchd job claims, freshly minted per
+    /// run so a previous run cannot have left one behind.
+    ///
+    /// # Which of the factory's two wraps this reaches -- measured, not assumed
+    ///
+    /// `XPCListener.init(service:)` **succeeds** for an unclaimed name; `activate()` is what fails
+    /// (`"Unable to activate listener: Connection init failed at listener activation with error
+    /// 1 - Operation not permitted"`). That is the same late-failure shape
+    /// ``XPCClientTransport/connecting(toMachService:)`` documents on the dialling side. So this
+    /// case exercises the **activate** wrap only: deleting `cause:` from the `init` wrap leaves it
+    /// green, which was verified rather than reasoned about. The `init` wrap exists because that
+    /// initialiser is declared `throws` and an unwrapped throw there would reopen exactly the
+    /// asymmetry this case pins -- not because a way to reach it is known.
+    func testServiceNamedReportsAnRPCErrorAndKeepsTheOverlaysErrorAsCause() {
+        let name = "com.example.grpcxpc.no-such-service.\(UUID().uuidString)"
+        do {
+            _ = try XPCServerTransport.service(named: name)
+            XCTFail(
+                "a launchd name no job claims must not produce a listener; if the platform "
+                    + "started allowing this, the wrapping below is untested rather than wrong")
+        } catch {
+            XCTAssertEqual(
+                error.code, .unavailable,
+                "a listener that cannot be stood up is a statement about the name, not about "
+                    + "this transport's own lifecycle -- .failedPrecondition is reserved for the "
+                    + "latter. Got: \(error)")
+            XCTAssertNotNil(
+                error.cause,
+                "the XPC overlay's error must survive as `cause:`; interpolating it into the "
+                    + "message loses the underlying domain and code for every caller. Got: "
+                    + "\(error)")
+            XCTAssertTrue(
+                error.message.contains(name),
+                "the message must name the service that could not be listened on. Got: \(error)")
+        }
     }
 }
