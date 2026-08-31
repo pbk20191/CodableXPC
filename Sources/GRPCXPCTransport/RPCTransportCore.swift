@@ -464,7 +464,13 @@ final class RPCTransportCore: Sendable {
         var deadlineTimer: DispatchSourceTimer?
 
         /// Ends this stream's inbound sequence. `error == nil` is the clean end-of-stream.
-        func finishInbound(throwing error: (any Error)?) {
+        ///
+        /// `RPCError?` rather than `(any Error)?` even though the `AsyncThrowingStream` beneath is
+        /// gRPC's `..., any Error>`: the two callers (``removeStream(_:failingInboundWith:_:)`` and
+        /// ``failAll(_:)``) both hold an `RPCError` now, and widening back to the existential here
+        /// would only re-open a door nothing walks through. The upcast to the stream's own failure
+        /// type happens at `finish(throwing:)`.
+        func finishInbound(throwing error: RPCError?) {
             switch inbound {
             case .request(_, let continuation):
                 if let error { continuation.finish(throwing: error) } else { continuation.finish() }
@@ -1621,7 +1627,7 @@ final class RPCTransportCore: Sendable {
     @discardableResult
     private func removeStream(
         _ id: RPCStreamID,
-        failingInboundWith error: (any Error)?,
+        failingInboundWith error: RPCError?,
         sendingCancel reason: String?
     ) -> Bool {
         var taken: StreamEntry?
@@ -1926,7 +1932,7 @@ final class RPCTransportCore: Sendable {
     /// about-to-park waiters alike -- see `FlowControlWindow.fail(_:)`).
     ///
     /// No `cancel` ops are sent and no credit is flushed: the peer is gone, or is about to be.
-    func failAll(_ error: any Error) {
+    func failAll(_ error: RPCError) {
         var taken: [StreamEntry] = []
         var finishAccepted = false
 
@@ -1965,7 +1971,7 @@ final class RPCTransportCore: Sendable {
     /// line 3). Both are statements that the peer's framing or accounting has diverged from ours,
     /// which no per-stream failure can repair -- so unlike a §O2 grammar violation, this really
     /// does take the connection with it.
-    private func failConnection(_ error: any Error) {
+    private func failConnection(_ error: RPCError) {
         failAll(error)
         pipe.cancel()
     }

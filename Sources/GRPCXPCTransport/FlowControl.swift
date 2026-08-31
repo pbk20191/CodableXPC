@@ -159,19 +159,25 @@ final class FlowControlWindow: Sendable {
     ///
     /// # Why the continuation's failure type is `any Error` and not `RPCError`
     ///
-    /// Everywhere else in this package a continuation that can only ever carry an ``RPCError`` now
-    /// says so (`CheckedContinuation<Void, RPCError>` in ``XPCClientTransport``). This one cannot,
-    /// and the reason is `reserve(upTo:)`'s contract rather than a missed opportunity: it throws
-    /// **two unrelated error types on purpose** -- `CancellationError` when the waiting task is
-    /// cancelled, and whatever ``fail(_:)`` was handed when the window died. The second is `any
-    /// Error` all the way up, because ``RPCTransportCore/failAll(_:)`` takes `any Error`. Narrowing
-    /// to `RPCError` was attempted and the compiler names all three blockers: `.failed`'s payload,
-    /// `onCancel`'s `CancellationError`, and ``fail(_:)``'s parameter.
+    /// **One blocker, and it is a behaviour question rather than a typing one.** An earlier round
+    /// named three -- `.failed`'s payload, ``fail(_:)``'s parameter, and `onCancel`'s
+    /// `CancellationError` -- and said the second was forced from above, because
+    /// ``RPCTransportCore/failAll(_:)`` took `any Error`. Two of those three are gone: the whole
+    /// failure chain (`failAll`, `failConnection`, `removeStream(_:failingInboundWith:_:)`,
+    /// ``fail(_:)``, `.failed`, `State.failure`, `Admission.failed`) is now `RPCError`, because a
+    /// trace of every call site found every one of them already constructing an `RPCError` literal
+    /// -- the two that passed a variable through resolve to `RPCError` literals one hop away, and
+    /// the two `catch`-derived paths *wrap* the caught value as `cause:` rather than forwarding it.
+    /// Nothing was widened to make that fit.
     ///
-    /// Making it typed would therefore mean changing what a cancelled or torn-down sender
-    /// *observes* -- a two-case error enum, or `CancellationError` rewritten as
-    /// `RPCError(code: .cancelled)` -- and that is a decision about this transport's behaviour, not
-    /// a re-spelling of it. Left as it is deliberately.
+    /// What remains is `onCancel`. ``reserve(upTo:)`` throws **two unrelated error identities on
+    /// purpose**: the window's `RPCError` when it died, and `CancellationError` when the waiting
+    /// task was cancelled. `any Error` is their only common type, so any narrower slot -- a
+    /// two-case enum, or `CancellationError` rewritten as `RPCError(code: .cancelled)` -- changes
+    /// what a cancelled sender *observes*. `FlowControlWindowTests` asserts that identity directly
+    /// (`error is CancellationError`, in four places), so this is a decision about the transport's
+    /// behaviour and not a re-spelling of it. Left as it is deliberately, and now for a reason that
+    /// is entirely about cancellation rather than half about plumbing.
     private enum Slot {
         /// Waiting. `continuation` is `nil` in the window between taking a token and actually
         /// parking; a resolution landing in that window is remembered by the terminal cases below
@@ -184,7 +190,7 @@ final class FlowControlWindow: Sendable {
         /// Resolved by cancellation before the waiter parked. Holds no bytes. Terminal.
         case cancelled
         /// Resolved by ``fail(_:)`` before the waiter parked. Holds no bytes. Terminal.
-        case failed(any Error)
+        case failed(RPCError)
     }
 
     private struct State {
@@ -207,7 +213,7 @@ final class FlowControlWindow: Sendable {
         var order: [UInt64] = []
         var nextToken: UInt64 = 0
         /// Sticky. Set by ``fail(_:)``; later reservations throw it rather than parking forever.
-        var failure: (any Error)?
+        var failure: RPCError?
 
         /// Removes `token` from the FIFO. Linear in the number of *waiters*, which is the number
         /// of concurrent senders on this window -- never a peer-supplied count.
@@ -311,7 +317,7 @@ final class FlowControlWindow: Sendable {
 
     private enum Admission {
         case reserved(Int)
-        case failed(any Error)
+        case failed(RPCError)
         case parked(UInt64)
     }
 
@@ -550,12 +556,19 @@ final class FlowControlWindow: Sendable {
     /// substrate is gone, no `credit` op will ever arrive, so nothing else would wake those tasks.
     /// Pass `RPCError(code: .unavailable)` for a teardown.
     ///
+    /// **`RPCError`, not `any Error`.** Every caller -- ``RPCTransportCore/failAll(_:)``,
+    /// `removeStream`, and the two tests -- already had one; nothing was ever narrowed or wrapped
+    /// to make that fit. The value is stored verbatim in `State.failure` and rethrown verbatim by
+    /// ``reserve(upTo:)``, so what a torn-down sender observes is unchanged by the typing. What a
+    /// *cancelled* sender observes is a separate question and is still `CancellationError` -- see
+    /// ``Slot``.
+    ///
     /// Racing ``grant(_:)`` is well-defined in both directions, because both only transition slots
     /// that are still `.pending`: a waiter that `grant` already resolved keeps its `.granted(k)`
     /// and still returns `k` from `reserve` (the alternative -- failing it -- would drop bytes the
     /// window has already deducted, which is exactly L1). Its sender then discovers the failure on
     /// its next reservation, or from the substrate when the send fails.
-    func fail(_ error: any Error) {
+    func fail(_ error: RPCError) {
         var toResume: [CheckedContinuation<Int, any Error>] = []
 
         state.withLock { s in

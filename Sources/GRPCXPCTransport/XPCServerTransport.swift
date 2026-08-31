@@ -356,7 +356,7 @@ public final class XPCServerTransport: ServerTransport {
         /// A connection still inside its accept window has no streams to fail (an op requires a
         /// delivery, and a delivery would have promoted it), so its recorded teardown is `.close`
         /// -- see ``DeferredTeardown``.
-        func failAll(_ error: any Error) {
+        func failAll(_ error: RPCError) {
             let cores = state.withLock { state -> [RPCTransportCore] in
                 state.admitting = false
                 state.escalateEveryPending(to: .close)

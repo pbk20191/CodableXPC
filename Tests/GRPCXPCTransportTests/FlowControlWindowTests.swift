@@ -28,9 +28,18 @@ import XCTest
 @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
 final class FlowControlWindowTests: XCTestCase {
 
-    /// A distinguishable error for the `fail(_:)` paths, so an assertion cannot pass on some other
-    /// error the window synthesised.
-    private struct ProbeFailure: Error, Equatable {}
+    /// A distinguishable failure for the `fail(_:)` paths, so an assertion cannot pass on some
+    /// other error the window synthesised.
+    ///
+    /// This was a bespoke `private struct ProbeFailure: Error` and the assertions below keyed on
+    /// its **type**. `FlowControlWindow.fail(_:)` now takes an `RPCError` -- a trace of every
+    /// caller found all of them already constructing one -- so the probe is an `RPCError` and the
+    /// assertions key on **identity** instead, which `RPCError`'s `Hashable` conformance gives for
+    /// free. Just as distinguishing: the sticky failure is stored and rethrown verbatim, so
+    /// `reserve` never substitutes an error of its own, and `.unknown` is a code no path in
+    /// `FlowControl.swift` produces.
+    private static let probeFailure = RPCError(
+        code: .unknown, message: "FlowControlWindowTests probe failure")
 
     // =======================================================================================
     // MARK: - L1: the grant/cancel race
@@ -487,7 +496,7 @@ final class FlowControlWindowTests: XCTestCase {
 
         // On a failed window the bytes are dropped, exactly as credit is.
         let dead = FlowControlWindow(initial: 0)
-        dead.fail(ProbeFailure())
+        dead.fail(Self.probeFailure)
         dead.release(50)
         XCTAssertEqual(
             dead.available, 0,
@@ -568,12 +577,14 @@ final class FlowControlWindowTests: XCTestCase {
                 let second = try await window.reserve(upTo: 4)
                 log.append("second=\(second)")
                 window.release(second)
-                window.fail(ProbeFailure())
+                window.fail(Self.probeFailure)
                 do {
                     _ = try await window.reserve(upTo: 1)
                     log.append("third=returned")
+                } catch let error as RPCError where error == Self.probeFailure {
+                    log.append("third=probeFailure")
                 } catch {
-                    log.append("third=\(type(of: error))")
+                    log.append("third=\(type(of: error)): \(error)")
                 }
                 return log
             }
@@ -585,7 +596,7 @@ final class FlowControlWindowTests: XCTestCase {
 
         XCTAssertEqual(
             log,
-            ["first=5", "second=4", "third=ProbeFailure"],
+            ["first=5", "second=4", "third=probeFailure"],
             "a reentrant reserve/grant/release/fail from a resumed waiter must all complete, and "
                 + "fail must be sticky")
     }

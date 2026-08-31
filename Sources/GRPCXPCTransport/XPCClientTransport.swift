@@ -58,6 +58,28 @@ public final class XPCClientTransport: ClientTransport {
 
     private let core: RPCTransportCore
 
+    /// The parked ``connect()`` caller's continuation -- and **the reason its payload is a
+    /// `Result` rather than the continuation's own failure type**.
+    ///
+    /// The obvious spelling is `CheckedContinuation<Void, RPCError>`, and it was that until this
+    /// commit. It does not survive contact with `withTaskCancellationHandler`, which is plain
+    /// `rethrows` and **not** typed-`rethrows`: a `throws(RPCError)` operation closure comes back
+    /// out of it as `any Error` (measured -- "thrown expression type 'any Error' cannot be
+    /// converted to error type 'RPCError'"), so ``parkUntilReleased()`` could not be
+    /// `throws(RPCError)` and ``connect()`` had to cast the erased error back with an unreachable
+    /// trap for the case the cast could not rule out.
+    ///
+    /// Carrying the outcome as a **value** removes the erasure at its source instead of undoing
+    /// it afterwards: the operation closure no longer throws, so there is nothing for `rethrows`
+    /// to widen, and `Result.get()` is `throws(Failure)` -- the concrete `RPCError` survives the
+    /// unwrap on the far side. No cast, and no unreachable branch to justify.
+    ///
+    /// The failure case is reachable only *before* anything parks (the concurrent-`connect()`
+    /// refusal, resolved inside the same `withLock` that would otherwise have parked). Every
+    /// resume of a slot that actually parked carries `.success(())`, which is why each of them
+    /// below reads `resume(returning: .success(()))` and none of them can spell a failure.
+    private typealias ParkedConnect = CheckedContinuation<Result<Void, RPCError>, Never>
+
     /// `connect()`'s state and the live-call count, under **one** lock because they are one
     /// decision: whether a shutdown may release `connect()` yet.
     ///
@@ -99,8 +121,8 @@ public final class XPCClientTransport: ClientTransport {
         /// it rather than parking forever.
         enum Phase {
             case idle
-            case connected(CheckedContinuation<Void, RPCError>)
-            case draining(CheckedContinuation<Void, RPCError>?)
+            case connected(ParkedConnect)
+            case draining(ParkedConnect?)
             case shutDown
         }
 
@@ -137,7 +159,7 @@ public final class XPCClientTransport: ClientTransport {
 
         /// Whatever continuation is parked, whichever phase holds it. Read-only: every caller
         /// assigns a new phase immediately afterwards, which is what empties the slot.
-        var parked: CheckedContinuation<Void, RPCError>? {
+        var parked: ParkedConnect? {
             switch phase {
             case .connected(let continuation): continuation
             case .draining(let continuation): continuation
@@ -175,7 +197,7 @@ public final class XPCClientTransport: ClientTransport {
     /// * nothing was parked -> no `connect()` tail will ever run, so **this** caller closes.
     private enum Completion {
         case nothing
-        case resume(CheckedContinuation<Void, RPCError>)
+        case resume(ParkedConnect)
         case closeSubstrate
     }
 
@@ -185,7 +207,7 @@ public final class XPCClientTransport: ClientTransport {
         case .nothing:
             break
         case .resume(let continuation):
-            continuation.resume()
+            continuation.resume(returning: .success(()))
         case .closeSubstrate:
             core.close()
         }
@@ -381,21 +403,12 @@ public final class XPCClientTransport: ClientTransport {
     /// untyped `throws` requirement is allowed (a `throws(E)` function is a subtype of a `throws`
     /// one) and costs a caller nothing: an existing `catch` still catches it.
     public func connect() async throws(RPCError) {
-        do {
-            try await parkUntilReleased()
-        } catch let error as RPCError {
-            // The concurrent-call refusal, thrown before anything was parked. It must **not**
-            // reach the tail below -- see the last paragraph of that comment.
-            throw error
-        } catch {
-            // Unreachable: ``parkUntilReleased()`` suspends on a
-            // `CheckedContinuation<Void, RPCError>` and does nothing else that can throw, so the
-            // only error that can arrive here is the one the cast above already took. A trap
-            // rather than a wrap, because reaching it would mean the continuation resumed with
-            // something its own type forbids.
-            preconditionFailure(
-                "XPCClientTransport.connect() saw a non-RPCError \(type(of: error)): \(error)")
-        }
+        // The concurrent-call refusal propagates from here, thrown before anything was parked,
+        // and must **not** reach the tail below -- see the last paragraph of that comment. It is
+        // an ordinary typed `try` and no longer a cast with an unreachable trap behind it,
+        // because ``ParkedConnect`` keeps the outcome a value across
+        // `withTaskCancellationHandler` instead of letting it be erased and re-narrowed.
+        try await parkUntilReleased()
 
         // **This is where the XPC session is released**, and it is deliberately in the tail rather
         // than in either of the two paths that get here, because it is the one point both of them
@@ -435,21 +448,20 @@ public final class XPCClientTransport: ClientTransport {
         core.close()
     }
 
-    /// ``connect()``'s suspension, and **the whole reason ``connect()`` has to cast**.
+    /// ``connect()``'s suspension.
     ///
-    /// `withTaskCancellationHandler` is `rethrows`, not typed-`rethrows`: it erases the
-    /// `CheckedContinuation<Void, RPCError>` below back to `any Error`, so a body declared
-    /// `throws(RPCError)` cannot host it directly (measured -- the compiler reports "thrown
-    /// expression type 'any Error' cannot be converted to error type 'RPCError'"). Splitting the
-    /// suspension out keeps that erasure, and the one cast that undoes it, in a single place
-    /// instead of putting a bare `catch` in the middle of the drain barrier.
+    /// `throws(RPCError)` across a `withTaskCancellationHandler`, which is plain `rethrows` and
+    /// would erase a typed throw to `any Error`. It does not erase this one because **nothing is
+    /// thrown inside it**: the operation closure is non-throwing and yields a
+    /// `Result<Void, RPCError>` (see ``ParkedConnect``), and the `try` happens on the far side of
+    /// the erasing call, where `Result.get()`'s `throws(Failure)` gives back the concrete type.
     ///
-    /// Bare `throws` here is therefore **the stdlib's type, not this transport's**: the only value
-    /// that can ever be thrown is the `RPCError` the continuation carries.
-    private func parkUntilReleased() async throws {
-        try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation {
-                (continuation: CheckedContinuation<Void, RPCError>) in
+    /// Still split out from ``connect()`` so the drain barrier's tail reads as a tail rather than
+    /// as the continuation of a suspension.
+    private func parkUntilReleased() async throws(RPCError) {
+        let outcome: Result<Void, RPCError> = await withTaskCancellationHandler {
+            await withCheckedContinuation {
+                (continuation: ParkedConnect) in
                 // L7: take-and-transition under the lock, resume *outside* it.
                 let immediate: Result<Void, RPCError>? = state.withLock { state in
                     if state.parked != nil {
@@ -475,8 +487,8 @@ public final class XPCClientTransport: ClientTransport {
                     }
                 }
                 switch immediate {
-                case .success: continuation.resume()
-                case .failure(let error): continuation.resume(throwing: error)
+                case .success: continuation.resume(returning: .success(()))
+                case .failure(let error): continuation.resume(returning: .failure(error))
                 case nil: break  // parked above; nothing to resume yet
                 }
             }
@@ -499,8 +511,11 @@ public final class XPCClientTransport: ClientTransport {
                 RPCError(
                     code: .unavailable,
                     message: "the client's connect() task was cancelled"))
-            self.shutDownForcefully()?.resume()
+            self.shutDownForcefully()?.resume(returning: .success(()))
         }
+        // `Result.get()` is `throws(Failure)`, so this is where the concrete `RPCError` comes
+        // back -- outside the `rethrows` call that would have erased it.
+        return try outcome.get()
     }
 
     /// A local shutdown is **permanent** for this transport -- there is no reconnect -- so
@@ -619,7 +634,7 @@ public final class XPCClientTransport: ClientTransport {
     ///
     /// The continuation is *returned* rather than resumed here so the resume happens outside the
     /// lock (L7).
-    private func shutDownForcefully() -> CheckedContinuation<Void, RPCError>? {
+    private func shutDownForcefully() -> ParkedConnect? {
         state.withLock { state in
             let parked = state.parked
             state.phase = .shutDown
