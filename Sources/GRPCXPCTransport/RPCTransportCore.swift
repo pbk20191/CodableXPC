@@ -211,15 +211,19 @@ typealias ServerRPCStream = RPCStream<
 /// deleted it (`XPCConnection.swift`). This is the same collision `RPCStreamID` avoided by the
 /// same means, for the same reason: no rename churn at the swap.
 ///
-/// Every field is final by the time this value exists -- L5. `timeout` is the deadline the client
-/// asked for on its `openStream` op, surfaced here because `RPCRequestPart` has no case for it;
-/// the core has already armed the matching deadline timer by the time this is yielded, so a
-/// consumer does not have to.
+/// Every field is final by the time this value exists -- L5.
+///
+/// It used to carry a third field, `timeout` -- the deadline the client asked for on its
+/// `openStream` op -- "because `RPCRequestPart` has no case for it". Nothing ever read it: not the
+/// server transport, not a test, not the demo. It is gone rather than annotated, because the core
+/// arms the matching deadline timer itself before this value is yielded, so a consumer has nothing
+/// to do with the number today. It comes back the day handler-visible deadlines become a feature
+/// ("how long do I have?"), which is a design question about the surface a handler sees, not a
+/// field to leave lying about until someone asks.
 @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
 struct AcceptedRPCStream: Sendable {
     let id: RPCStreamID
     let descriptor: MethodDescriptor
-    let timeout: Duration?
     let stream: ServerRPCStream
 }
 
@@ -327,9 +331,6 @@ final class RPCTransportCore<Pipe: MessagePipe, Codec: WireCodec>: Sendable {
     let role: Role
     private let pipe: Pipe
     private let codec: Codec
-
-    /// The serial queue every inbound blob is decoded and routed on -- the pipe's own (L4).
-    var queue: DispatchSerialQueue { pipe.queue }
 
     /// The connection's outbound flow-control window: §O4's second reservation, taken after the
     /// stream's. One per connection, shared by every stream, and the window whose FIFO makes two
@@ -837,11 +838,10 @@ final class RPCTransportCore<Pipe: MessagePipe, Codec: WireCodec>: Sendable {
 
     /// What ``deliver(_:toStream:)``'s registry section decided.
     ///
-    /// Type scope rather than function scope only because Swift cannot nest a type in a generic
-    /// context, and this class is now generic over its two seams. Used by that one method and
-    /// nothing else; it did not become shared by moving.
     /// Private type scope rather than local to `deliver`, because Swift forbids a method-local
-    /// type in a generic context and the core is generic over its two seams. The payloads are
+    /// type in a generic context and the core is generic over its two seams. (Nesting a type in a
+    /// generic *type* is fine; it is the function-local spelling that is not.) Used by that one
+    /// method and nothing else; it did not become shared by moving. The payloads are
     /// ``InboundContinuation``s: a `.failure` can only be emitted by `finish(throwing:)`, which
     /// terminates in the same call, so "a failure is the last thing on this stream" is a shape
     /// rather than a rule anyone has to keep.
@@ -1114,7 +1114,7 @@ final class RPCTransportCore<Pipe: MessagePipe, Codec: WireCodec>: Sendable {
         // table entry goes away, which can happen while the item is still buffered.
         registry.withLock { $0.outstandingAccepts += 1 }
         let delivery = acceptedContinuation.yield(
-            AcceptedRPCStream(id: id, descriptor: descriptor, timeout: timeout, stream: stream))
+            AcceptedRPCStream(id: id, descriptor: descriptor, stream: stream))
 
         switch delivery {
         case .enqueued:

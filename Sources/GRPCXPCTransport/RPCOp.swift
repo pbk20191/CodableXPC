@@ -6,7 +6,7 @@ import GRPCCore
 // ===========================================================================================
 
 /// A wire-level header field name/value pair. Shared by name across the module (`GRPCWireHeaders`
-/// builds these from gRPC metadata; a future `WireCodec` consumes the decoded form) --
+/// builds these from gRPC metadata; `CompactWireCodec` encodes and decodes them) --
 /// `(String, String)` and `(name: String, value: String)` are structurally the same tuple type,
 /// but the labels are what let call sites write `field.name` / `field.value` instead of `.0` /
 /// `.1`.

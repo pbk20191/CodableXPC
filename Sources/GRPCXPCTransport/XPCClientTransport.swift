@@ -215,7 +215,7 @@ final class RPCClientTransport<Pipe: MessagePipe, Codec: WireCodec>: ClientTrans
 
     /// Adopts an already-live client-role core. The factories below are the ordinary way in; this
     /// exists separately because the in-process pair (`XPCServerTransport.connectingClient()`)
-    /// builds its core from an endpoint, which only the XPC-importing file can name.
+    /// builds its core from the listener's *own* endpoint -- a value only that transport holds.
     init(core: RPCTransportCore<Pipe, Codec>) {
         precondition(
             core.role == .client,
@@ -668,7 +668,7 @@ public final class XPCClientTransport: ClientTransport {
 
     /// Adopts an already-live client-role core. The factories below are the ordinary way in; this
     /// exists separately because the in-process pair (`XPCServerTransport.connectingClient()`)
-    /// builds its core from an endpoint, which only the XPC-importing file can name.
+    /// builds its core from the listener's *own* endpoint -- a value only that transport holds.
     init(core: XPCTransportCore) {
         self.impl = RPCClientTransport(core: core)
     }
@@ -677,11 +677,19 @@ public final class XPCClientTransport: ClientTransport {
     // MARK: - Dialling
     // =======================================================================================
 
-    /// How a client names its peer. Deliberately *not* including an `XPCEndpoint` case: naming
-    /// that type would mean `import XPC` in this file, and the accept/dial traps documented in
-    /// `XPCPipe` are only encapsulated while the set of files that can reach libxpc stays at
-    /// `XPCPipe.swift`, `GRPCDispatchData.swift` and `XPCServerTransport.swift`. Endpoint dialling
-    /// therefore lives on the server transport, which already owns an `XPCListener`.
+    /// How a client names its peer -- one case per dial topology, including the endpoint one.
+    ///
+    /// This doc used to say the opposite: that `.peer(XPCEndpoint)` was deliberately *absent*
+    /// because naming that type would force `import XPC` into this file, and that endpoint
+    /// dialling therefore lived on the server transport. Both halves are stale. ``connecting(to:)``
+    /// moved the public endpoint dial here, this file's line 4 is `import XPC`, and the set of
+    /// files that can reach libxpc is **four** -- `XPCPipe.swift`, `GRPCDispatchData.swift`,
+    /// `XPCServerTransport.swift` and this one -- not three.
+    ///
+    /// What did *not* change is the reason that set is worth keeping small: the accept/dial traps
+    /// documented in `XPCPipe` are encapsulated behind its factories, and no file here constructs
+    /// or disposes of an `XPCSession` itself. `XPCEndpoint` is a name, not one of those
+    /// primitives -- it appears in neither disposal matrix.
     private enum Peer {
         case machService(String)
         case xpcService(String)
@@ -743,9 +751,9 @@ public final class XPCClientTransport: ClientTransport {
     /// **The one build-a-client-core recipe.** Mints the connection queue, builds the mux inside
     /// `building`, and hands back both halves.
     ///
-    /// Every dial in this package goes through here -- the two public factories above,
-    /// `XPCServerTransport.connectingClient()` (which dials an `XPCEndpoint`, a type this file may
-    /// not name), and the test suite's `InspectableXPCPair`. It was written out three times
+    /// Every dial in this package goes through here -- the three public factories above,
+    /// `XPCServerTransport.connectingClient()` (which dials the endpoint its own listener vended),
+    /// and the test suite's `InspectableXPCPair`. It was written out three times
     /// before, invariant comments and all, which meant a change to pipe retention or handler
     /// installation had to be made three times or the dial paths would diverge -- from each other,
     /// and from the one the tests claim to be inspecting. This is not ordinary duplication to

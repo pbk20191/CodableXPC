@@ -9,10 +9,12 @@ import XPC
 /// # Why this file is allowed to `import XPC`
 ///
 /// A server-role `RPCTransportCore` can only be built inside an `XPCListener`'s incoming-session
-/// closure -- that is where the session comes from -- so something has to own a listener, and
-/// `XPCListener` is the one XPC type this file names. It appears in *neither* of `XPCPipe`'s
-/// disposal matrices (create / `activate()` / `endpoint` / `cancel()` are all ordinary), and both
-/// trap-bearing primitives stay encapsulated behind ``XPCPipe/accepting(_:queue:building:)`` and
+/// closure -- that is where the session comes from -- so something has to own a listener. This
+/// file names two XPC types, `XPCListener` and `XPCEndpoint` (the stored property, ``anonymous()``
+/// and ``connectingClient()``), and neither appears in *either* of `XPCPipe`'s disposal matrices:
+/// create / `activate()` / `endpoint` / `cancel()` on a listener are all ordinary, and an endpoint
+/// is an inert name. Both trap-bearing primitives -- accepting a session, and disposing of one --
+/// stay encapsulated behind ``XPCPipe/accepting(_:queue:building:)`` and
 /// ``XPCPipe/rejecting(_:reason:)``. `RPCTransportCore` and the codec still must not, and do not,
 /// import XPC.
 ///
@@ -598,8 +600,11 @@ public final class XPCServerTransport: ServerTransport {
     /// Dials this transport's own endpoint and returns a client transport speaking to it over
     /// **real XPC** -- two sessions, two mutexed cores, one process.
     ///
-    /// This is the only place an `XPCEndpoint` is dialled, and it lives here because naming that
-    /// type is what would otherwise force `import XPC` into a third file.
+    /// It lives here because this is where the endpoint is: ``endpoint`` is *this* transport's
+    /// listener's, and no other object holds it. (It is no longer the only place an `XPCEndpoint`
+    /// is dialled, and was not the only one for long: the public
+    /// ``XPCClientTransport/connecting(to:)`` dials a brokered endpoint, and that file names
+    /// `XPCEndpoint` too.)
     ///
     /// - Precondition: this transport was built by ``anonymous()``; a named-service listener has
     ///   no endpoint to dial.
@@ -611,9 +616,9 @@ public final class XPCServerTransport: ServerTransport {
         }
         // The recipe -- queue, `building`, pipe retention, handler installation -- is
         // `XPCClientTransport.dialledCore(peer:_:)`'s, and is documented there. All this file
-        // contributes is the one step the client file cannot: naming `XPCEndpoint`. The returned
-        // pipe is discarded because the core holds it; that too is the factory's invariant, not a
-        // local choice.
+        // contributes is the endpoint itself, which only this transport holds. The returned pipe is
+        // discarded because the core holds it; that too is the factory's invariant, not a local
+        // choice.
         let (core, _) = try XPCClientTransport.dialledCore(peer: "endpoint") {
             (queue, building) throws(RPCError) in
             try XPCPipe.connecting(to: endpoint, queue: queue, building: building)

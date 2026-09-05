@@ -41,8 +41,32 @@ import XPC
 //    that queue all the same -- **once**, and by whichever route its kind allows: a dialled
 //    session gets it as the initializer's `targetQueue:` argument, an accepted one through
 //    `setTargetQueue(queue)` (it is handed back already built, so there is no initializer to pass
-//    it to) -- so the hop is usually a same-queue re-enqueue rather than a thread switch.
-//    **Affinity** does not depend on that call having taken effect -- the hop alone guarantees it.
+//    it to).
+//
+//    **The hop is a real cross-queue enqueue, not a same-queue re-enqueue** -- this doc said the
+//    latter until it was measured, and the measurement says otherwise. With the target queue set
+//    exactly as this file sets it, libxpc delivers on **its own** `com.apple.session.queue`, which
+//    *targets* ours: `__dispatch_queue_get_label(nil)` inside the callback reads
+//    `com.apple.session.queue` for 5 000/5 000 messages on an accepted session and 3 000/3 000 on
+//    a dialled one, and the `queue.async` block then runs on the connection queue. Because the two
+//    queues share a target chain there is no separate worker thread to wake, so it is *cheap*
+//    (~0.2-0.5 µs CPU, ~2.25 µs scheduling latency in situ, n=20 000) -- but it is a genuine async
+//    boundary with a block allocation and an enqueue, not the near-free re-post "re-enqueue"
+//    implies. Do not budget it at zero, and do not delete it on the theory that it is one: the hop
+//    has two jobs neither of which the target chain supplies.
+//
+//    * **Off-stack execution.** Without it, `receive()` runs *inside* libxpc's incoming-message
+//      callback for this session, and a routing turn that sends -- a `cancel`, a `credit`, an
+//      accept refusal -- would then take `RPCTransportCore`'s blocking `submission` lock and issue
+//      an `xpc_session_send` **from inside libxpc's own delivery context**, stalling delivery of
+//      every subsequent message behind that syscall. The hop is what keeps routing off that stack.
+//    * **The affinity/label contract**, i.e. point 2 itself: the hop is what makes
+//      `__dispatch_queue_get_label(nil)` inside `receive` read the connection queue's label. (The
+//      core's L4 `dispatchPrecondition(.onQueue:)` tripwire is target-chain permissive and would
+//      pass without it, so this is a contract the hop keeps, not one it is checked against.)
+//
+//    **Affinity** does not depend on the target-queue call having taken effect -- the hop alone
+//    guarantees it.
 //    **Ordering does**, and the two must not be conflated: order survives only because libxpc
 //    issues one session's inbound callbacks serially, and pointing the session at a
 //    `DispatchSerialQueue` is what makes that explicit. If those callbacks ever ran concurrently
@@ -274,6 +298,16 @@ private final class Delivery: Sendable {
     /// whole life of the connection, and a dialled pipe never installs a handler at all.
     private let windowProofClaimed = Atomic<Bool>(false)
 
+    /// Whether either libxpc-ordered exit from the accept window has fired: the first inbound
+    /// message, or the session's cancellation.
+    ///
+    /// This is the **authoritative** answer to "has this accepted session's accept window closed?",
+    /// and `XPCPipe` reads it instead of storing a guess. It lives here rather than on the pipe
+    /// because only this object is on the receiving end of libxpc's callbacks -- and it is
+    /// deliberately independent of whether anyone installed a handler, because it records a
+    /// platform fact rather than an interest in one.
+    var windowIsProvedClosed: Bool { windowProofClaimed.load(ordering: .acquiring) }
+
     /// Takes the window-proof handler, if it has not already been taken, and fires it on ``queue``.
     ///
     /// Called from **both** libxpc-ordered exits from the accept window, and for every inbound
@@ -291,16 +325,6 @@ private final class Delivery: Sendable {
     ///
     /// In both cases the hop is enqueued *before* the caller's own hop, so an owner learns the
     /// window is closed before the first op, or the peer-death notification, reaches it.
-    /// Whether either libxpc-ordered exit from the accept window has fired: the first inbound
-    /// message, or the session's cancellation.
-    ///
-    /// This is the **authoritative** answer to "has this accepted session's accept window closed?",
-    /// and `XPCPipe` reads it instead of storing a guess. It lives here rather than on the pipe
-    /// because only this object is on the receiving end of libxpc's callbacks -- and it is
-    /// deliberately independent of whether anyone installed a handler, because it records a
-    /// platform fact rather than an interest in one.
-    var windowIsProvedClosed: Bool { windowProofClaimed.load(ordering: .acquiring) }
-
     private func noteWindowProvedClosed() {
         // Fast path, and the only work done for all but one message in a connection's life.
         guard !windowProofClaimed.load(ordering: .relaxed) else { return }
@@ -851,19 +875,29 @@ extension XPCPipe {
     /// ```swift
     /// let listener = XPCListener(options: .inactive) { request in
     ///     let queue = DispatchSerialQueue(label: "…")
+    ///     // `building` runs synchronously, so this is assigned before `accepting` returns.
+    ///     var built: XPCTransportCore?
     ///     let (decision, pipe) = XPCPipe.accepting(request, queue: queue) { pipe in
-    ///         let core = RPCTransportCore(pipe: pipe, codec: CompactWireCodec())
-    ///         // Installed here, not later -- and `[weak core]`, not by style but because `core`
-    ///         // holds `pipe`: a strong capture closes the retain cycle described on
-    ///         // `onReceive(_:)` and leaks the XPC session.
-    ///         pipe.onReceive   { [weak core] blob in core?.receive(blob) }
-    ///         pipe.onPeerDeath { [weak core] in      core?.peerDied()    }
+    ///         // Building the core is the whole of the recipe. **Do not install `onReceive` or
+    ///         // `onPeerDeath` yourself**: `RPCTransportCore.init` installs both -- weakly, for
+    ///         // the retain-cycle reason on `onReceive(_:)` -- and a second call trips the
+    ///         // set-once `precondition` on each setter.
+    ///         let core = XPCTransportCore(pipe: pipe, codec: CompactWireCodec(), role: .server)
+    ///         built = core
+    ///         // The one handler an owner does install, and here is the only place it cannot miss
+    ///         // the triggering message. It captures a *value* (never the core: L6), because it
+    ///         // is held at libxpc's end of the retain path.
+    ///         let key = ObjectIdentifier(core)
+    ///         pipe.onWindowProvedClosed { [weak owner] in owner?.windowProvedClosed(key) }
     ///     }
-    ///     …publish `pipe` (or the core built from it) to whoever will own it…
+    ///     …publish `built` -- which owns `pipe` -- to whoever will own the connection…
     ///     return decision
     /// }
     /// try listener.activate()
     /// ```
+    ///
+    /// `XPCServerTransport.Acceptor.accept(_:)` is that example as shipped, one admission check
+    /// wider.
     ///
     /// # Why `building:` is a closure and not "return the pipe and configure it after"
     ///
@@ -888,7 +922,14 @@ extension XPCPipe {
     ///   incoming-session handler runs on the listener's own queue, and each accepted session gets
     ///   a queue of its own.
     /// - Parameter queue: this connection's serial queue. Every handler will run on it, and it is
-    ///   set as the session's target queue so the delivery hop is a same-queue re-enqueue.
+    ///   set as the session's target queue. That does **not** make the delivery hop a same-queue
+    ///   re-enqueue -- this doc said so until it was measured, and libxpc in fact delivers on its
+    ///   own `com.apple.session.queue` (5 000/5 000 on an accepted session), which merely *targets*
+    ///   this one. Setting the target queue buys the shared target chain -- so the hop wakes no
+    ///   second thread, and an inline delivery would be excluded by this function's own
+    ///   `queue.sync` -- but the hop itself is a real cross-queue enqueue that exists to keep
+    ///   routing off libxpc's delivery stack and to hold the label/affinity contract. See point 2
+    ///   of the header.
     /// - Parameter building: called synchronously with the finished pipe, before the decision is
     ///   handed back to libxpc and before any blob can be dispatched. Install `onReceive` and
     ///   `onPeerDeath` here.
