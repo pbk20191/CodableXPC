@@ -13,8 +13,8 @@ import XCTest
 /// completed every call while delivering the wrong bytes would pass a "did it throw" suite.
 ///
 /// Payloads are all comfortably past `Data`'s 14-byte inline-storage threshold, so the messages
-/// that cross libxpc are the ones `GRPCSwiftData` actually borrows rather than copies. That does
-/// not *prove* the borrow (`GRPCSwiftDataTests` does that, by comparing base addresses) but it
+/// that cross libxpc are the ones `GRPCDispatchDataPayload` actually borrows rather than copies. That does
+/// not *prove* the borrow (`GRPCDispatchDataPayloadTests` does that, by comparing base addresses) but it
 /// keeps these cases on the same side of the boundary as real traffic.
 @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
 final class CallTypeTests: XCTestCase {
@@ -526,7 +526,7 @@ final class CallTypeTests: XCTestCase {
                         }
                     }
                     for body in bodies {
-                        let reply = GRPCSwiftData(Array(("echo:" + body).utf8))
+                        let reply = GRPCDispatchDataPayload(Array(("echo:" + body).utf8))
                         try await stream.outbound.write(.message(reply))
                     }
                     try await stream.outbound.write(.status(Status(code: .ok, message: ""), [:]))
@@ -545,7 +545,7 @@ final class CallTypeTests: XCTestCase {
                     try await stream.outbound.write(
                         .metadata([Keys.requestString: .string(rawSeamRequestMetadata)]))
                     for message in sent {
-                        let body = GRPCSwiftData(Array(message.utf8))
+                        let body = GRPCDispatchDataPayload(Array(message.utf8))
                         try await stream.outbound.write(.message(body))
                     }
                     await stream.outbound.finish()

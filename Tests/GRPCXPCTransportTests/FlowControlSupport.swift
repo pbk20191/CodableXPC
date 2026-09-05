@@ -57,11 +57,11 @@ final class TestPipe: MessagePipe, @unchecked Sendable {
     let queue: DispatchSerialQueue
 
     private struct State {
-        var onReceive: (@Sendable (GRPCSwiftData) -> Void)?
+        var onReceive: (@Sendable (GRPCDispatchDataPayload) -> Void)?
         var onPeerDeath: (@Sendable () -> Void)?
         /// Every blob handed to ``send(_:)``, in send order. Never cleared by the pipe itself --
         /// ``takeSentOps()`` is the test's own reset.
-        var sent: [GRPCSwiftData] = []
+        var sent: [GRPCDispatchDataPayload] = []
         var isCancelled = false
         /// How many blobs the test has delivered. A test whose subject is *how ops were packed
         /// into blobs* has no other way to see it: `sent` records the outbound direction, and the
@@ -72,7 +72,7 @@ final class TestPipe: MessagePipe, @unchecked Sendable {
         var sendFailure: RPCError?
         /// See ``onEachSend(_:)``. Nil for every test that does not ask for it, which is all but
         /// one.
-        var sendObserver: (@Sendable (GRPCSwiftData) -> Void)?
+        var sendObserver: (@Sendable (GRPCDispatchDataPayload) -> Void)?
     }
 
     private let state = Mutex(State())
@@ -89,11 +89,11 @@ final class TestPipe: MessagePipe, @unchecked Sendable {
     /// The blob itself. A `TestPipe` has no substrate message to build, so there is nothing for
     /// ``prepare(_:)`` to do and the split costs this conformer nothing -- which is the point of
     /// `Prepared` being an associated type: a substrate that needs no preparation declares so.
-    typealias Prepared = GRPCSwiftData
+    typealias Prepared = GRPCDispatchDataPayload
 
-    func prepare(_ blob: GRPCSwiftData) -> GRPCSwiftData { blob }
+    func prepare(_ blob: GRPCDispatchDataPayload) -> GRPCDispatchDataPayload { blob }
 
-    func send(_ blob: GRPCSwiftData) throws(RPCError) {
+    func send(_ blob: GRPCDispatchDataPayload) throws(RPCError) {
         // Read under the lock, called **outside** it. An observer runs inside whatever core call is
         // doing the sending, and may reach back into the core or the transport above it; doing that
         // with this pipe's lock held would deadlock the moment it sent anything. (It may not send
@@ -111,7 +111,7 @@ final class TestPipe: MessagePipe, @unchecked Sendable {
         }
     }
 
-    func onReceive(_ handler: @escaping @Sendable (GRPCSwiftData) -> Void) {
+    func onReceive(_ handler: @escaping @Sendable (GRPCDispatchDataPayload) -> Void) {
         state.withLock { state in
             precondition(
                 state.onReceive == nil,
@@ -170,7 +170,7 @@ final class TestPipe: MessagePipe, @unchecked Sendable {
     ///   back into the core for anything that does *not* send is fine, and so is handing the send to
     ///   another thread: `CancelOrderingTests` does exactly that, and the other thread blocking on
     ///   the submission lock until this hook returns is the property it measures.
-    func onEachSend(_ observer: @escaping @Sendable (GRPCSwiftData) -> Void) {
+    func onEachSend(_ observer: @escaping @Sendable (GRPCDispatchDataPayload) -> Void) {
         state.withLock { $0.sendObserver = observer }
     }
 
@@ -182,7 +182,7 @@ final class TestPipe: MessagePipe, @unchecked Sendable {
     /// Delivers bytes the codec did not produce -- the hostile-input path. Blocks until the core
     /// has finished routing the blob, which is what makes every assertion after it a statement
     /// about a completed routing turn rather than a race.
-    func deliverRaw(_ blob: GRPCSwiftData) {
+    func deliverRaw(_ blob: GRPCDispatchDataPayload) {
         guard let handler = state.withLock({ $0.onReceive }) else {
             XCTFail("no onReceive handler is installed on this TestPipe")
             return
@@ -202,7 +202,7 @@ final class TestPipe: MessagePipe, @unchecked Sendable {
         queue.sync { handler() }
     }
 
-    var sentBlobs: [GRPCSwiftData] { state.withLock { $0.sent } }
+    var sentBlobs: [GRPCDispatchDataPayload] { state.withLock { $0.sent } }
 
     /// Every op this side has sent since the last ``takeSentOps()``, decoded back through the
     /// codec, and the buffer cleared.
@@ -211,7 +211,7 @@ final class TestPipe: MessagePipe, @unchecked Sendable {
     /// went out*, and a byte-level assertion would also pin the encoding, which is a different
     /// test's job (`testAMalformedOpenStreamRefusalIsAFixedLiteral` is the one that wants bytes).
     func takeSentOps() -> [RPCOp] {
-        let blobs = state.withLock { state -> [GRPCSwiftData] in
+        let blobs = state.withLock { state -> [GRPCDispatchDataPayload] in
             let taken = state.sent
             state.sent = []
             return taken
@@ -219,7 +219,7 @@ final class TestPipe: MessagePipe, @unchecked Sendable {
         return Self.ops(in: blobs)
     }
 
-    private static func ops(in blobs: [GRPCSwiftData]) -> [RPCOp] {
+    private static func ops(in blobs: [GRPCDispatchDataPayload]) -> [RPCOp] {
         let codec = CompactWireCodec()
         var ops: [RPCOp] = []
         for blob in blobs {
@@ -483,22 +483,22 @@ enum RawOpBytes {
         withUnsafeBytes(of: value.bigEndian) { out.append(contentsOf: $0) }
     }
 
-    static func blob(_ parts: Data...) -> GRPCSwiftData {
+    static func blob(_ parts: Data...) -> GRPCDispatchDataPayload {
         var out = Data()
         for part in parts { out.append(part) }
-        return GRPCSwiftData(viewing: out)
+        return GRPCDispatchDataPayload(viewing: out)
     }
 
     /// A blob whose bytes do **not** start at index 0.
     ///
     /// `CompactWireCodec` derives every offset from the buffer's own `startIndex` because in
-    /// production its input is always a slice of a received XPC payload -- `GRPCSwiftData` indices
+    /// production its input is always a slice of a received XPC payload -- `GRPCDispatchDataPayload` indices
     /// do not rebase to zero. A codec test whose input always starts at 0 cannot tell a correct
     /// offset from a hardcoded one, so the field-list and boundary cases run against a slice.
-    static func offsetBlob(_ data: Data, leadingPadding: Int = 7) -> GRPCSwiftData {
+    static func offsetBlob(_ data: Data, leadingPadding: Int = 7) -> GRPCDispatchDataPayload {
         var padded = Data(repeating: 0xEE, count: leadingPadding)
         padded.append(data)
-        return GRPCSwiftData(viewing: padded[(padded.startIndex + leadingPadding)...])
+        return GRPCDispatchDataPayload(viewing: padded[(padded.startIndex + leadingPadding)...])
     }
 }
 
@@ -523,7 +523,7 @@ enum WindowSizes {
     static let backpressureWritesThatFit = initial / backpressureMessage           // 13
     static let backpressureBytesThatFit = backpressureWritesThatFit * backpressureMessage  // 65 000
 
-    static func payload(_ byteCount: Int, seed: UInt8 = 0x41) -> GRPCSwiftData {
-        GRPCSwiftData(repeating: seed, count: byteCount)
+    static func payload(_ byteCount: Int, seed: UInt8 = 0x41) -> GRPCDispatchDataPayload {
+        GRPCDispatchDataPayload(repeating: seed, count: byteCount)
     }
 }

@@ -492,8 +492,12 @@ the target in `Package.swift` (add `XPCDispatchDataBridge` as a direct dependenc
 
 - `@available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)` on every public type.
 - Swift 6 language mode, strict-concurrency clean, **zero warnings**.
-- `Bytes = GRPCSwiftData` throughout; **never `Codable`**, never `CodableXPC`. `GRPCSwiftData`
-  crosses to libxpc through exactly `init(from:)` and `createXPCRepresentation()`.
+- `Bytes = GRPCDispatchDataPayload` throughout; **never `Codable`**, never `CodableXPC`.
+  `GRPCDispatchDataPayload` crosses to libxpc through exactly `init(from:)` and
+  `createXPCRepresentation()`.
+  - *Renamed late in the branch from `GRPCSwiftData`, which collides with Apple's SwiftData
+    framework in user code importing both. Type and file only; narrative elsewhere in this plan
+    still says `GRPCSwiftData` and is left alone as a record of what was written then.*
 - Dependencies of the target: `GRPCCore` + `XPCDispatchDataBridge`. **NIO is forbidden.**
 - `RPCTransportCore` and the codec **must not import `XPC`**. If a task needs to, report it.
 - Build/test only with `--scratch-path <scratch>/build`.

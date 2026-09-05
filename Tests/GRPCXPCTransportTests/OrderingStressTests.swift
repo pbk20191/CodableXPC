@@ -56,12 +56,12 @@ final class OrderingStressTests: XCTestCase {
     /// The sequence number is **in the payload**, not inferred from arrival: that is what makes a
     /// reorder detectable at all. A test that trusted arrival order to define the sequence could not
     /// fail.
-    private static func payload(tag: Int, seq: Int) -> GRPCSwiftData {
-        GRPCSwiftData(Array("ord-\(tag)-\(String(format: "%04d", seq))-pad12345".utf8))
+    private static func payload(tag: Int, seq: Int) -> GRPCDispatchDataPayload {
+        GRPCDispatchDataPayload(Array("ord-\(tag)-\(String(format: "%04d", seq))-pad12345".utf8))
     }
 
     /// Recovers `(tag, seq)`, or `nil` if the body is not one of ours.
-    private static func parse(_ body: GRPCSwiftData) -> (tag: Int, seq: Int)? {
+    private static func parse(_ body: GRPCDispatchDataPayload) -> (tag: Int, seq: Int)? {
         let text = String(decoding: Array(body), as: UTF8.self)
         let parts = text.split(separator: "-")
         guard parts.count == 4, parts[0] == "ord",
@@ -384,7 +384,7 @@ final class OrderingStressTests: XCTestCase {
     /// deterministic -- there is no scheduling left for it to depend on.
     func testInterleavedBlobsPreserveEveryStreamsOrderThroughTheMux() throws {
         typealias PartIterator = RPCAsyncSequence<
-            RPCRequestPart<GRPCSwiftData>, any Error
+            RPCRequestPart<GRPCDispatchDataPayload>, any Error
         >.AsyncIterator
 
         // Stream ids are odd and client-allocated (§O1): 1, 3, 5 … 19.

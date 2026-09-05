@@ -190,15 +190,15 @@ import Synchronization
 /// widening happens and why it can only happen there.
 @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
 typealias ClientRPCStream = RPCStream<
-    RPCAsyncSequence<RPCResponsePart<GRPCSwiftData>, any Error>,
-    RPCWriter<RPCRequestPart<GRPCSwiftData>>.Closable>
+    RPCAsyncSequence<RPCResponsePart<GRPCDispatchDataPayload>, any Error>,
+    RPCWriter<RPCRequestPart<GRPCDispatchDataPayload>>.Closable>
 
 /// A server-side RPC: request parts in, response parts out. File scope for the same reason as
 /// ``ClientRPCStream``.
 @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
 typealias ServerRPCStream = RPCStream<
-    RPCAsyncSequence<RPCRequestPart<GRPCSwiftData>, any Error>,
-    RPCWriter<RPCResponsePart<GRPCSwiftData>>.Closable>
+    RPCAsyncSequence<RPCRequestPart<GRPCDispatchDataPayload>, any Error>,
+    RPCWriter<RPCResponsePart<GRPCDispatchDataPayload>>.Closable>
 
 // ===========================================================================================
 // MARK: - The accepted-stream payload
@@ -545,8 +545,8 @@ final class RPCTransportCore<Pipe: MessagePipe, Codec: WireCodec>: Sendable {
     }
 
     private enum InboundMachine {
-        case request(RequestOpDecoder, InboundContinuation<RPCRequestPart<GRPCSwiftData>>)
-        case response(ResponseOpDecoder, InboundContinuation<RPCResponsePart<GRPCSwiftData>>)
+        case request(RequestOpDecoder, InboundContinuation<RPCRequestPart<GRPCDispatchDataPayload>>)
+        case response(ResponseOpDecoder, InboundContinuation<RPCResponsePart<GRPCDispatchDataPayload>>)
     }
 
     /// L7: the connection's lifecycle, explicit and under the one lock.
@@ -754,7 +754,7 @@ final class RPCTransportCore<Pipe: MessagePipe, Codec: WireCodec>: Sendable {
     /// ``refuseOpen(_:dueTo:)`` because that is the one kind whose rejection cannot be silently
     /// dropped without hanging a peer that is definitionally waiting on this id -- see
     /// `WireDecodeItem`'s doc.
-    private func receive(_ blob: GRPCSwiftData) {
+    private func receive(_ blob: GRPCDispatchDataPayload) {
         // L4 tripwire. Measured caveat from Task 5: `.onQueue` is target-chain permissive, so this
         // catches "delivered from an unrelated queue" but would not catch "delivered from a child
         // queue targeting this one". It is cheap and it did catch a real inlined-delivery
@@ -896,12 +896,12 @@ final class RPCTransportCore<Pipe: MessagePipe, Codec: WireCodec>: Sendable {
         case streamOverran(Int)
         case connectionOverran(Int)
         case request(
-            [RPCRequestPart<GRPCSwiftData>],
-            InboundContinuation<RPCRequestPart<GRPCSwiftData>>,
+            [RPCRequestPart<GRPCDispatchDataPayload>],
+            InboundContinuation<RPCRequestPart<GRPCDispatchDataPayload>>,
             remoteEnded: Bool)
         case response(
-            [RPCResponsePart<GRPCSwiftData>],
-            InboundContinuation<RPCResponsePart<GRPCSwiftData>>,
+            [RPCResponsePart<GRPCDispatchDataPayload>],
+            InboundContinuation<RPCResponsePart<GRPCDispatchDataPayload>>,
             remoteEnded: Bool)
         case violation(RPCError)
     }
@@ -1093,7 +1093,7 @@ final class RPCTransportCore<Pipe: MessagePipe, Codec: WireCodec>: Sendable {
             return
         }
 
-        let (inbound, continuation) = InboundContinuation<RPCRequestPart<GRPCSwiftData>>
+        let (inbound, continuation) = InboundContinuation<RPCRequestPart<GRPCDispatchDataPayload>>
             .makeStream()
         let entry = StreamEntry(
             id: id,
@@ -1302,7 +1302,7 @@ final class RPCTransportCore<Pipe: MessagePipe, Codec: WireCodec>: Sendable {
             "RPCTransportCore.openStream: only a client-role core allocates streams; a server "
                 + "accepts them through `acceptedStreams`")
 
-        let (inbound, continuation) = InboundContinuation<RPCResponsePart<GRPCSwiftData>>
+        let (inbound, continuation) = InboundContinuation<RPCResponsePart<GRPCDispatchDataPayload>>
             .makeStream()
 
         // L7: the lifecycle check and the id allocation are one atomic take-and-transition, so a
@@ -2150,7 +2150,7 @@ protocol OutboundOpEncoding: Sendable {
     var streamID: RPCStreamID { get }
 
     static var finishClosesLocalDirection: Bool { get }
-    static func messagePayload(of part: Part) -> GRPCSwiftData?
+    static func messagePayload(of part: Part) -> GRPCDispatchDataPayload?
     static func closesLocalDirection(_ part: Part) -> Bool
 
     mutating func encode(_ part: Part) throws(RPCError) -> [RPCOp]
@@ -2159,11 +2159,11 @@ protocol OutboundOpEncoding: Sendable {
 
 @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
 extension RequestOpEncoder: OutboundOpEncoding {
-    typealias Part = RPCRequestPart<GRPCSwiftData>
+    typealias Part = RPCRequestPart<GRPCDispatchDataPayload>
 
     static var finishClosesLocalDirection: Bool { true }
 
-    static func messagePayload(of part: Part) -> GRPCSwiftData? {
+    static func messagePayload(of part: Part) -> GRPCDispatchDataPayload? {
         if case .message(let payload) = part { return payload }
         return nil
     }
@@ -2173,11 +2173,11 @@ extension RequestOpEncoder: OutboundOpEncoding {
 
 @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
 extension ResponseOpEncoder: OutboundOpEncoding {
-    typealias Part = RPCResponsePart<GRPCSwiftData>
+    typealias Part = RPCResponsePart<GRPCDispatchDataPayload>
 
     static var finishClosesLocalDirection: Bool { false }
 
-    static func messagePayload(of part: Part) -> GRPCSwiftData? {
+    static func messagePayload(of part: Part) -> GRPCDispatchDataPayload? {
         if case .message(let payload) = part { return payload }
         return nil
     }

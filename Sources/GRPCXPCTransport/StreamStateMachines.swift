@@ -133,7 +133,7 @@ struct RequestOpDecoder: Sendable {
     ///   `cancel` (§O2: terminal in both directions).
     /// - Precondition: `op` is never `.credit`/`.goAway` (connection-level; a mux bug if routed
     ///   here) and this instance has not previously thrown (dead; a mux bug to call again).
-    mutating func accept(_ op: RPCOp) throws(RPCError) -> [RPCRequestPart<GRPCSwiftData>] {
+    mutating func accept(_ op: RPCOp) throws(RPCError) -> [RPCRequestPart<GRPCDispatchDataPayload>] {
         precondition(
             !isFailed,
             "RequestOpDecoder.accept: called again after a previous call already threw; the "
@@ -277,7 +277,7 @@ struct RequestOpEncoder: Sendable {
     ///   second `.metadata`, or anything after `finish()`).
     /// - Precondition: this instance has not previously thrown (dead; a caller bug to call
     ///   again).
-    mutating func encode(_ part: RPCRequestPart<GRPCSwiftData>) throws(RPCError) -> [RPCOp] {
+    mutating func encode(_ part: RPCRequestPart<GRPCDispatchDataPayload>) throws(RPCError) -> [RPCOp] {
         precondition(
             !isFailed,
             "RequestOpEncoder.encode: called again after a previous call already threw; the "
@@ -381,7 +381,7 @@ struct ResponseOpEncoder: Sendable {
     ///   terminator; a second terminal, or a message after it, is a violation").
     /// - Precondition: this instance has not previously thrown (dead; a caller bug to call
     ///   again).
-    mutating func encode(_ part: RPCResponsePart<GRPCSwiftData>) throws(RPCError) -> [RPCOp] {
+    mutating func encode(_ part: RPCResponsePart<GRPCDispatchDataPayload>) throws(RPCError) -> [RPCOp] {
         precondition(
             !isFailed,
             "ResponseOpEncoder.encode: called again after a previous call already threw; the "
@@ -478,7 +478,7 @@ struct ResponseOpDecoder: Sendable {
     ///   unrecognized status code (see the `.status` case).
     /// - Precondition: `op` is never `.credit`/`.goAway` (connection-level; a mux bug if routed
     ///   here) and this instance has not previously thrown (dead; a mux bug to call again).
-    mutating func accept(_ op: RPCOp) throws(RPCError) -> [RPCResponsePart<GRPCSwiftData>] {
+    mutating func accept(_ op: RPCOp) throws(RPCError) -> [RPCResponsePart<GRPCDispatchDataPayload>] {
         precondition(
             !isFailed,
             "ResponseOpDecoder.accept: called again after a previous call already threw; the "

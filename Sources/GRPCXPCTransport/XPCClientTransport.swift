@@ -52,9 +52,18 @@ enum ConnectionQueueLabel {
 ///
 /// A `final class`, not a struct, because `state`'s `Synchronization.Mutex` is `~Copyable` and a
 /// `Copyable` struct cannot store one.
+///
+/// # The name
+///
+/// This was `RPCClientTransport` until this branch: one character from ``XPCClientTransport``
+/// (`R` ↔ `X`), in the same file, conforming to the same protocol -- a misread waiting to happen in
+/// a review diff, an Xcode jump bar, or a grep, and one the architecture review flagged. The `Core`
+/// suffix also matches the convention `RPCTransportCore` already sets in this module: an `RPC`
+/// prefix marks the substrate-agnostic layer, and `Core` marks the thing a public `XPC`-prefixed
+/// façade is a binding of.
 @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
-final class RPCClientTransport<Pipe: MessagePipe, Codec: WireCodec>: ClientTransport {
-    typealias Bytes = GRPCSwiftData
+final class RPCClientTransportCore<Pipe: MessagePipe, Codec: WireCodec>: ClientTransport {
+    typealias Bytes = GRPCDispatchDataPayload
 
     private let core: RPCTransportCore<Pipe, Codec>
 
@@ -219,7 +228,7 @@ final class RPCClientTransport<Pipe: MessagePipe, Codec: WireCodec>: ClientTrans
     init(core: RPCTransportCore<Pipe, Codec>) {
         precondition(
             core.role == .client,
-            "RPCClientTransport requires a client-role core: only a client allocates "
+            "RPCClientTransportCore requires a client-role core: only a client allocates "
                 + "stream ids")
         self.core = core
     }
@@ -615,12 +624,12 @@ final class RPCClientTransport<Pipe: MessagePipe, Codec: WireCodec>: ClientTrans
 // MARK: - XPCClientTransport (the public façade)
 // ===========================================================================================
 
-/// grpc-swift's `ClientTransport` over one XPC session: ``RPCClientTransport`` bound to the one
+/// grpc-swift's `ClientTransport` over one XPC session: ``RPCClientTransportCore`` bound to the one
 /// instantiation XPC needs, plus the dialling this package ships.
 ///
 /// # Why this is a façade and not simply a generic type
 ///
-/// ``RPCClientTransport`` is generic over the mux's two seams, and `RPCTransportCore` is generic
+/// ``RPCClientTransportCore`` is generic over the mux's two seams, and `RPCTransportCore` is generic
 /// over them because that is what turns `pipe.send` / `codec.encode` / `codec.decode` into static
 /// calls. But `MessagePipe` and `WireCodec` are **internal**, and this type is **public**, and
 /// Swift will not let those meet. Measured, not assumed -- both spellings were tried and the
@@ -655,22 +664,22 @@ final class RPCClientTransport<Pipe: MessagePipe, Codec: WireCodec>: ClientTrans
 ///
 /// # Ownership (L6)
 ///
-/// Unchanged, and it all lives one layer down: ``RPCClientTransport`` holds the core strongly, the
+/// Unchanged, and it all lives one layer down: ``RPCClientTransportCore`` holds the core strongly, the
 /// core holds the pipe, the pipe holds the `XPCSession`, and libxpc's end reaches back weakly.
 /// There is no `deinit` here and deliberately is not one.
 @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
 public final class XPCClientTransport: ClientTransport {
-    public typealias Bytes = GRPCSwiftData
+    public typealias Bytes = GRPCDispatchDataPayload
 
     /// The mux-facing transport this type is a binding of. `private`: the façade is the whole of
     /// the public surface, and nothing outside may reach past it.
-    private let impl: RPCClientTransport<XPCPipe, CompactWireCodec>
+    private let impl: RPCClientTransportCore<XPCPipe, CompactWireCodec>
 
     /// Adopts an already-live client-role core. The factories below are the ordinary way in; this
     /// exists separately because the in-process pair (`XPCServerTransport.connectingClient()`)
     /// builds its core from the listener's *own* endpoint -- a value only that transport holds.
     init(core: XPCTransportCore) {
-        self.impl = RPCClientTransport(core: core)
+        self.impl = RPCClientTransportCore(core: core)
     }
 
     // =======================================================================================
@@ -827,7 +836,7 @@ public final class XPCClientTransport: ClientTransport {
     //
     // Six requirements, every one a straight pass-through. `Inbound`/`Outbound` are absent on
     // purpose: `ClientTransport` derives them from `Bytes`, which both sides set to
-    // `GRPCSwiftData`, so `RPCStream<Inbound, Outbound>` names one type here and there and the
+    // `GRPCDispatchDataPayload`, so `RPCStream<Inbound, Outbound>` names one type here and there and the
     // closure crosses the hop untouched.
 
     public var retryThrottle: RetryThrottle? { impl.retryThrottle }

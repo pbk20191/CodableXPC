@@ -1,5 +1,5 @@
 //
-//  GRPCDispatchData.swift
+//  GRPCDispatchDataPayload.swift
 //  CodableXPC
 //
 //  Created by 박병관 on 8/25/26.
@@ -19,8 +19,17 @@ import XPC
 /// out. `Data` can instead *reference* the bytes libxpc already holds, which is the whole reason
 /// this type exists. See ``init(from:)`` for the inbound half and ``createXPCRepresentation()``
 /// for the outbound half.
+///
+/// # The name
+///
+/// This was `GRPCSwiftData` until this branch, and the rename is the whole of what changed -- no
+/// member, no behaviour and no wire byte moved with it. `GRPCSwiftData` reads as "gRPC + SwiftData",
+/// i.e. as something to do with Apple's persistence framework, which an adopter importing both
+/// `SwiftData` and this module would have to disambiguate at every mention of a bytes type that has
+/// nothing to do with persistence. It is a public type, so before this branch merges was the last
+/// moment the rename was free rather than API churn.
 @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
-public struct GRPCSwiftData: GRPCContiguousBytes, Sendable, Equatable {
+public struct GRPCDispatchDataPayload: GRPCContiguousBytes, Sendable, Equatable {
 
     /// The bytes. **Read-only from outside**, and that is load-bearing rather than tidiness: this
     /// value carries ``borrowsXPCStorage`` alongside it, and a setter would let a caller drop in a
@@ -34,7 +43,7 @@ public struct GRPCSwiftData: GRPCContiguousBytes, Sendable, Equatable {
     ///
     /// It exists because `Data`'s own copy-on-write cannot tell: `Data(bytesNoCopy:deallocator:)`
     /// believes it owns its buffer, so a mutation through the *sole* reference to it writes
-    /// straight into libxpc's storage (measured — `GRPCSwiftDataTests`). Every other `Data` in
+    /// straight into libxpc's storage (measured — `GRPCDispatchDataPayloadTests`). Every other `Data` in
     /// this type is genuinely owned, so the flag, not the `Data`, is what says which.
     private var borrowsXPCStorage: Bool
 
@@ -103,7 +112,7 @@ public struct GRPCSwiftData: GRPCContiguousBytes, Sendable, Equatable {
     /// Hand-written because the synthesized `==` would compare ``borrowsXPCStorage`` too, and
     /// where a value's bytes live is not part of its value: the same payload read out of an
     /// `xpc_data` and built from an array literal must compare equal.
-    public static func == (lhs: GRPCSwiftData, rhs: GRPCSwiftData) -> Bool {
+    public static func == (lhs: GRPCDispatchDataPayload, rhs: GRPCDispatchDataPayload) -> Bool {
         lhs.data == rhs.data
     }
 
@@ -169,7 +178,7 @@ public struct GRPCSwiftData: GRPCContiguousBytes, Sendable, Equatable {
 /// Subscripting from a hardcoded `0` would trap; that is `Data`'s own contract and copying it here
 /// is deliberate, since hiding it would mean copying the payload to rebase it.
 @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
-extension GRPCSwiftData: RandomAccessCollection {
+extension GRPCDispatchDataPayload: RandomAccessCollection {
     public typealias Element = UInt8
     public typealias Index = Data.Index
 
@@ -180,7 +189,7 @@ extension GRPCSwiftData: RandomAccessCollection {
 
 /// So a test or a caller can write `[0x01, 0x02]` where a payload is expected.
 @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
-extension GRPCSwiftData: ExpressibleByArrayLiteral {
+extension GRPCDispatchDataPayload: ExpressibleByArrayLiteral {
     public init(arrayLiteral elements: UInt8...) {
         self.data = Data(elements)
         self.borrowsXPCStorage = false

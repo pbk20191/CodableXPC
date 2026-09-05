@@ -123,7 +123,7 @@ final class CancelOrderingTests: XCTestCase {
             for attempt in 1...2 {
                 var thrown: (any Error)?
                 do {
-                    try await opened.stream.outbound.write(.message(GRPCSwiftData([1, 2, 3])))
+                    try await opened.stream.outbound.write(.message(GRPCDispatchDataPayload([1, 2, 3])))
                 } catch {
                     thrown = error
                 }
@@ -382,7 +382,7 @@ final class HookedCodec: WireCodec {
         pending.withLock { $0 = body }
     }
 
-    func encode(_ ops: [RPCOp]) throws(RPCError) -> GRPCSwiftData {
+    func encode(_ ops: [RPCOp]) throws(RPCError) -> GRPCDispatchDataPayload {
         let hook = pending.withLock { slot -> (@Sendable () -> Void)? in
             let taken = slot
             slot = nil
@@ -392,5 +392,5 @@ final class HookedCodec: WireCodec {
         return try inner.encode(ops)
     }
 
-    func decode(_ blob: GRPCSwiftData) throws(RPCError) -> [WireDecodeItem] { try inner.decode(blob) }
+    func decode(_ blob: GRPCDispatchDataPayload) throws(RPCError) -> [WireDecodeItem] { try inner.decode(blob) }
 }

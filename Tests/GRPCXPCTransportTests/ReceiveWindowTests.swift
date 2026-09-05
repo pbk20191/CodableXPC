@@ -351,7 +351,7 @@ final class ReceiveWindowTests: XCTestCase {
             try await core.waitForAccepts(1)
             _ = core.pipe.takeSentOps()
 
-            let empty = GRPCSwiftData([])
+            let empty = GRPCDispatchDataPayload([])
             XCTAssertEqual(empty.count, 0)
 
             // Exactly the window's worth, in one blob, as a peer would pack them.

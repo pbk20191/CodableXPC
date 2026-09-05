@@ -17,7 +17,7 @@ import XPC
 // -- and the payload crosses to libxpc through exactly two calls:
 //
 //   outbound: `blob.createXPCRepresentation()`   (GRPCDispatchData.swift)
-//   inbound:  `GRPCSwiftData(from: xpc_object_t)` (GRPCDispatchData.swift, zero-copy at >= 15 bytes)
+//   inbound:  `GRPCDispatchDataPayload(from: xpc_object_t)` (GRPCDispatchData.swift, zero-copy at >= 15 bytes)
 //
 // Nothing else in this file -- and nothing at all outside it -- touches an `xpc_object_t` carrying
 // payload bytes.
@@ -243,7 +243,7 @@ private final class Delivery: Sendable {
     let queue: DispatchSerialQueue
 
     private struct Handlers: Sendable {
-        var onReceive: (@Sendable (GRPCSwiftData) -> Void)?
+        var onReceive: (@Sendable (GRPCDispatchDataPayload) -> Void)?
         var onPeerDeath: (@Sendable () -> Void)?
         /// Fires at most once, from whichever libxpc-ordered event proves this session's accept
         /// window closed first -- the first inbound message, or the session's cancellation. Taken
@@ -264,7 +264,7 @@ private final class Delivery: Sendable {
 
     /// Registers the blob handler. Set-once: a second registration is a caller bug and traps
     /// rather than silently discarding the first handler's stream of blobs.
-    func setReceiveHandler(_ handler: @escaping @Sendable (GRPCSwiftData) -> Void) {
+    func setReceiveHandler(_ handler: @escaping @Sendable (GRPCDispatchDataPayload) -> Void) {
         handlers.withLock {
             guard !$0.isShutDown else { return }   // a dead pipe delivers nothing; installing is moot
             precondition(!$0.receiveInstalled, "XPCPipe.onReceive may only be set once")
@@ -344,7 +344,7 @@ private final class Delivery: Sendable {
     /// Called from libxpc's incoming-message callback, on whatever queue libxpc chose.
     ///
     /// The blob is decoded *here*, synchronously on the callback, and only the resulting
-    /// `GRPCSwiftData` is carried across the hop. That is deliberate: `GRPCSwiftData(from:)` is a
+    /// `GRPCDispatchDataPayload` is carried across the hop. That is deliberate: `GRPCDispatchDataPayload(from:)` is a
     /// no-copy view whose deallocator holds the `xpc_object_t` alive, so the value is safe to
     /// escape, while the `XPCDictionary` it came out of is not `Sendable` and must not.
     ///
@@ -415,14 +415,14 @@ private final class Delivery: Sendable {
 
     // MARK: The inbound libxpc crossing
 
-    /// Reads `{"b": xpc_data}` and wraps the payload with `GRPCSwiftData(from:)` -- one of the two
+    /// Reads `{"b": xpc_data}` and wraps the payload with `GRPCDispatchDataPayload(from:)` -- one of the two
     /// places in this target where payload bytes cross to or from libxpc.
-    private static func blob(in message: XPCDictionary) -> GRPCSwiftData? {
-        message.withUnsafeUnderlyingDictionary { raw -> GRPCSwiftData? in
+    private static func blob(in message: XPCDictionary) -> GRPCDispatchDataPayload? {
+        message.withUnsafeUnderlyingDictionary { raw -> GRPCDispatchDataPayload? in
             guard let value = xpc_dictionary_get_value(raw, XPCPipe.blobKey),
                   xpc_get_type(value) == XPC_TYPE_DATA
             else { return nil }
-            return GRPCSwiftData(from: value)
+            return GRPCDispatchDataPayload(from: value)
         }
     }
 }
@@ -653,7 +653,7 @@ final class XPCPipe: MessagePipe {
     /// Deliberately **not** phase-checked. A pipe torn down between this call and ``send(_:)``
     /// would defeat a check here anyway, and the check that matters is the one that guards the
     /// libxpc call -- see `send`. The worst a shut-down pipe costs here is one wasted message.
-    func prepare(_ blob: GRPCSwiftData) -> Prepared {
+    func prepare(_ blob: GRPCDispatchDataPayload) -> Prepared {
         let message = xpc_dictionary_create(nil, nil, 0)
         // The outbound libxpc crossing -- the only one in this target.
         xpc_dictionary_set_value(message, Self.blobKey, blob.createXPCRepresentation())
@@ -726,7 +726,7 @@ final class XPCPipe: MessagePipe {
     ///   For Task 6 this means the mux's handler closure must reach the core **weakly**
     ///   (`[weak core]`), exactly as the plan's L6 already requires of outbound writers -- the
     ///   cycle runs through the core just as readily as through the pipe.
-    func onReceive(_ handler: @escaping @Sendable (GRPCSwiftData) -> Void) {
+    func onReceive(_ handler: @escaping @Sendable (GRPCDispatchDataPayload) -> Void) {
         delivery.setReceiveHandler(handler)
     }
 

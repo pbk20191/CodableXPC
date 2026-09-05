@@ -50,7 +50,7 @@ final class BrokeredEndpointTests: XCTestCase {
                                 guard case .message(let bytes) = part else { continue }
                                 let body = String(decoding: Array(bytes), as: UTF8.self)
                                 try await stream.outbound.write(
-                                    .message(GRPCSwiftData(Array(("echo:" + body).utf8))))
+                                    .message(GRPCDispatchDataPayload(Array(("echo:" + body).utf8))))
                             }
                             try await stream.outbound.write(.status(Status(code: .ok, message: ""), [:]))
                         } catch {
@@ -70,7 +70,7 @@ final class BrokeredEndpointTests: XCTestCase {
                     descriptor: Self.descriptor, options: .defaults
                 ) { stream, _ in
                     try await stream.outbound.write(.metadata([:]))
-                    try await stream.outbound.write(.message(GRPCSwiftData(Array("hello".utf8))))
+                    try await stream.outbound.write(.message(GRPCDispatchDataPayload(Array("hello".utf8))))
                     await stream.outbound.finish()
 
                     var bodies: [String] = []

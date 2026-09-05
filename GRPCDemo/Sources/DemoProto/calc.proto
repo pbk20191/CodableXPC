@@ -1,6 +1,6 @@
 // The demo's contract. Deliberately boring: the interesting part is that these four methods are
 // the four gRPC call types, and that every byte on the wire below is real protobuf produced by
-// generated code rather than a `GRPCSwiftData` a test built by hand.
+// generated code rather than a `GRPCDispatchDataPayload` a test built by hand.
 //
 // One message pair serves all four methods. A demo that also exercised nested messages, maps and
 // oneofs would be testing swift-protobuf, which is not what is unverified here.

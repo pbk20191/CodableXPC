@@ -300,7 +300,7 @@ final class TeardownTests: XCTestCase {
             let listenTask = Task { try await pair.server.listen(streamHandler: handler) }
             let connectTask = Task { try await pair.client.connect() }
 
-            let big = GRPCSwiftData([UInt8](repeating: 0x5A, count: 40_000))
+            let big = GRPCDispatchDataPayload([UInt8](repeating: 0x5A, count: 40_000))
             let outcomes = Observed<[String]>([])
             let parked = Observed(0)
 
@@ -540,7 +540,7 @@ final class TeardownTests: XCTestCase {
     /// "make failure terminal" change from over-reaching into discarding the buffer.
     func testAFailureIsTheLastThingAnInboundSequenceDelivers() throws {
         try runBounded("a failure is terminal", timeout: 20) {
-            let (stream, continuation) = InboundContinuation<RPCRequestPart<GRPCSwiftData>>
+            let (stream, continuation) = InboundContinuation<RPCRequestPart<GRPCDispatchDataPayload>>
                 .makeStream()
 
             let first = RPCError(code: .internalError, message: "the first and only failure")
@@ -554,7 +554,7 @@ final class TeardownTests: XCTestCase {
             continuation.finish(throwing: second)
             continuation.finish()
 
-            var delivered: [Result<RPCRequestPart<GRPCSwiftData>, RPCError>] = []
+            var delivered: [Result<RPCRequestPart<GRPCDispatchDataPayload>, RPCError>] = []
             for await element in stream { delivered.append(element) }
 
             XCTAssertEqual(
@@ -593,7 +593,7 @@ final class TeardownTests: XCTestCase {
     /// would see a cancellation.
     func testACleanEndCannotLaterBeTurnedIntoAFailure() throws {
         try runBounded("a clean end is terminal", timeout: 20) {
-            let (stream, continuation) = InboundContinuation<RPCRequestPart<GRPCSwiftData>>
+            let (stream, continuation) = InboundContinuation<RPCRequestPart<GRPCDispatchDataPayload>>
                 .makeStream()
 
             continuation.yield(.metadata([:]))
@@ -602,7 +602,7 @@ final class TeardownTests: XCTestCase {
                 throwing: RPCError(code: .cancelled, message: "a late cancel, arriving after the "
                     + "stream had already completed cleanly"))
 
-            var delivered: [Result<RPCRequestPart<GRPCSwiftData>, RPCError>] = []
+            var delivered: [Result<RPCRequestPart<GRPCDispatchDataPayload>, RPCError>] = []
             for await element in stream { delivered.append(element) }
 
             XCTAssertEqual(

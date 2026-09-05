@@ -63,7 +63,7 @@ enum RPCOp: Sendable {
     /// Leading metadata, either direction.
     case metadata(RPCStreamID, fields: [HTTPField])
     /// One whole message, already delimited by this op — no length prefix needed or added.
-    case message(RPCStreamID, payload: GRPCSwiftData)
+    case message(RPCStreamID, payload: GRPCDispatchDataPayload)
     /// Client: no more messages will be sent on this stream.
     case halfClose(RPCStreamID)
     /// Server: the final status. Terminal — nothing else follows on this stream's response
@@ -204,7 +204,7 @@ enum WireDecodeItem: Sendable {
 @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
 protocol WireCodec: Sendable {
     /// Encodes one or more ops into a single blob. The inverse of `decode(_:)`.
-    func encode(_ ops: [RPCOp]) throws(RPCError) -> GRPCSwiftData
+    func encode(_ ops: [RPCOp]) throws(RPCError) -> GRPCDispatchDataPayload
     /// Decodes a blob produced by `encode(_:)` (this conformer's own, or a wire-compatible peer's)
     /// back into the items it carries, in the order they were encoded -- see `WireDecodeItem` for
     /// why an item, not always an `RPCOp`.
@@ -219,7 +219,7 @@ protocol WireCodec: Sendable {
     ///   no stream to name either even though the framing around it is fine. See
     ///   `WireDecodeItem`'s doc for why every other kind's body-level rejection does not throw.
     ///   A rejectable `message` body joins this list, for the conservation reason above.
-    func decode(_ blob: GRPCSwiftData) throws(RPCError) -> [WireDecodeItem]
+    func decode(_ blob: GRPCDispatchDataPayload) throws(RPCError) -> [WireDecodeItem]
 }
 
 // ===========================================================================================
@@ -283,7 +283,7 @@ protocol MessagePipe: Sendable {
     /// fail between the two calls anyway.
     ///
     /// Callable from any queue, like ``send(_:)``.
-    func prepare(_ blob: GRPCSwiftData) -> Prepared
+    func prepare(_ blob: GRPCDispatchDataPayload) -> Prepared
 
     /// Hands one prepared blob to the peer. Conformers queue or block as appropriate to their
     /// substrate; callers may call this from any queue.
@@ -297,7 +297,7 @@ protocol MessagePipe: Sendable {
     /// Registers the handler that receives blobs from the peer, in send order, on `queue`. Set
     /// once, before the pipe is activated — a conformer is not required to support replacing or
     /// removing the handler afterward.
-    func onReceive(_ handler: @escaping @Sendable (GRPCSwiftData) -> Void)
+    func onReceive(_ handler: @escaping @Sendable (GRPCDispatchDataPayload) -> Void)
 
     /// Registers the handler invoked, on `queue`, if the peer process goes away. A conformer with
     /// no way to detect peer death simply never calls this handler.

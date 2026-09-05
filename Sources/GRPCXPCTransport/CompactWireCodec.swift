@@ -24,7 +24,7 @@ import GRPCCore
 ///
 /// **Every length is peer-controlled input.** Each is checked against the bytes actually
 /// remaining *before* it is used to slice, and every offset is derived from the buffer's own
-/// `startIndex` -- `GRPCSwiftData` indices do not rebase to zero, and in production this codec's
+/// `startIndex` -- `GRPCDispatchDataPayload` indices do not rebase to zero, and in production this codec's
 /// input is always a slice of a received XPC payload, never a fresh buffer starting at 0.
 @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
 struct CompactWireCodec: WireCodec {
@@ -69,7 +69,7 @@ struct CompactWireCodec: WireCodec {
     // MARK: - WireCodec
     // =======================================================================================
 
-    func encode(_ ops: [RPCOp]) throws(RPCError) -> GRPCSwiftData {
+    func encode(_ ops: [RPCOp]) throws(RPCError) -> GRPCDispatchDataPayload {
         var out = Data()
         out.reserveCapacity(Self.encodedLengthLowerBound(ops))
         for op in ops {
@@ -79,7 +79,7 @@ struct CompactWireCodec: WireCodec {
         // mutation of the result has nothing to corrupt. The default is `true` because that is the
         // safe answer for a caller who did not think about it (the decode side at `:187` really is
         // slicing a received `xpc_data`), and this is the one call site entitled to say otherwise.
-        return GRPCSwiftData(viewing: out, borrowsXPCStorage: false)
+        return GRPCDispatchDataPayload(viewing: out, borrowsXPCStorage: false)
     }
 
     /// A lower bound on the blob `ops` encodes to: **exact** for every kind whose body size is
@@ -147,7 +147,7 @@ struct CompactWireCodec: WireCodec {
     /// blob would have survived past that call either way. A hostile peer gains no leverage over
     /// any *other* blob or connection by corrupting a `goAway`'s body, only over the one
     /// connection it was already entitled to end.
-    func decode(_ blob: GRPCSwiftData) throws(RPCError) -> [WireDecodeItem] {
+    func decode(_ blob: GRPCDispatchDataPayload) throws(RPCError) -> [WireDecodeItem] {
         let data = blob.data
         let end = data.endIndex
         var cursor = data.startIndex
@@ -188,7 +188,7 @@ struct CompactWireCodec: WireCodec {
                 continue
             }
 
-            let body = GRPCSwiftData(viewing: data[bodyStart..<bodyEnd])
+            let body = GRPCDispatchDataPayload(viewing: data[bodyStart..<bodyEnd])
             do {
                 items.append(.op(try Self.decodeOne(kind: kind, streamID: streamID, body: body)))
             } catch {
@@ -323,7 +323,7 @@ struct CompactWireCodec: WireCodec {
     /// - Precondition: `body`'s declared length has already been validated against the bytes
     ///   remaining in the enclosing blob by `decode(_:)`'s caller; this only validates each
     ///   kind's own internal shape.
-    private static func decodeOne(kind: Kind, streamID: RPCStreamID, body: GRPCSwiftData) throws(RPCError) -> RPCOp {
+    private static func decodeOne(kind: Kind, streamID: RPCStreamID, body: GRPCDispatchDataPayload) throws(RPCError) -> RPCOp {
         switch kind {
         case .openStream:
             let fields = try decodeFieldList(body)
@@ -485,7 +485,7 @@ struct CompactWireCodec: WireCodec {
     ///   field count this field list cannot possibly hold, a declared length exceeding the bytes
     ///   remaining *in this field list*, a non-UTF-8 name or value, or trailing bytes left over
     ///   after the declared field count has been fully read.
-    private static func decodeFieldList(_ body: GRPCSwiftData) throws(RPCError) -> [HTTPField] {
+    private static func decodeFieldList(_ body: GRPCDispatchDataPayload) throws(RPCError) -> [HTTPField] {
         let data = body.data
         let end = data.endIndex
         var cursor = data.startIndex
@@ -584,7 +584,7 @@ struct CompactWireCodec: WireCodec {
     /// **`index` is a `Data.Index`, not an offset.** `withUnsafeBytes` hands back a buffer over
     /// the slice's *own* bytes -- byte 0 of that buffer is `data.startIndex`, whatever
     /// `data.startIndex` happens to be -- so the byte offset is `index - data.startIndex`, never
-    /// `index`. `GRPCSwiftData` indices do not rebase to zero (a decoded body's `startIndex` is
+    /// `index`. `GRPCDispatchDataPayload` indices do not rebase to zero (a decoded body's `startIndex` is
     /// 10, and a blob received over XPC starts wherever libxpc's buffer put it), and
     /// `WireProtocolTests` runs several cases through `RawOpBytes.offsetBlob` precisely so a
     /// hardcoded `0` here fails instead of passing by coincidence.

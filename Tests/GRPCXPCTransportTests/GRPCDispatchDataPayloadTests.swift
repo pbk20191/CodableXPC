@@ -3,11 +3,11 @@ import Foundation
 import XPC
 @testable import GRPCXPCTransport
 
-/// `GRPCSwiftData` exists for one reason: to carry a gRPC payload without copying it in or out of
+/// `GRPCDispatchDataPayload` exists for one reason: to carry a gRPC payload without copying it in or out of
 /// libxpc. These tests assert that property directly — by comparing base addresses — because a
 /// version that quietly copies would pass every behavioural test in the suite.
 @available(macOS 15.0, *)
-final class GRPCSwiftDataTests: XCTestCase {
+final class GRPCDispatchDataPayloadTests: XCTestCase {
 
     private func makeXPCData(_ bytes: [UInt8]) -> xpc_object_t {
         bytes.withUnsafeBytes { xpc_data_create($0.baseAddress, $0.count) }
@@ -18,7 +18,7 @@ final class GRPCSwiftDataTests: XCTestCase {
         let object = makeXPCData(Array(0..<128))
         let libxpcBase = xpc_data_get_bytes_ptr(object)
 
-        let wrapped = GRPCSwiftData(from: object)
+        let wrapped = GRPCDispatchDataPayload(from: object)
         let wrappedBase = wrapped.withUnsafeBytes { $0.baseAddress }
 
         XCTAssertEqual(wrappedBase, libxpcBase, "the payload was copied out of the xpc_data")
@@ -28,9 +28,9 @@ final class GRPCSwiftDataTests: XCTestCase {
     /// The borrowed buffer must outlive the caller's reference to the `xpc_object_t` — that is what
     /// the custom deallocator is for. Without it this reads freed memory.
     func testTheBorrowedBufferSurvivesTheOriginalXPCReference() {
-        func detach() -> GRPCSwiftData {
+        func detach() -> GRPCDispatchDataPayload {
             let object = makeXPCData([9, 8, 7, 6])
-            return GRPCSwiftData(from: object)
+            return GRPCDispatchDataPayload(from: object)
         }
         let survived = detach()
         for _ in 0..<64 { _ = Data(repeating: 0xAA, count: 1 << 16) }   // churn the allocator
@@ -38,7 +38,7 @@ final class GRPCSwiftDataTests: XCTestCase {
     }
 
     /// The two libxpc crossings, back to back: `createXPCRepresentation()` out and
-    /// ``GRPCSwiftData/init(from:)`` back in. The value that comes back must still *reference* the
+    /// ``GRPCDispatchDataPayload/init(from:)`` back in. The value that comes back must still *reference* the
     /// `xpc_data` rather than duplicate it.
     ///
     /// This case used to go through `Codable`/`XPCNativeObject`, which was the outbound path while
@@ -46,11 +46,11 @@ final class GRPCSwiftDataTests: XCTestCase {
     /// `xpc_data` under one dictionary key — so the same property is asserted over the crossings
     /// that survive.
     func testTheOutboundRepresentationIsStillBorrowableOnTheWayBackIn() {
-        let payload = GRPCSwiftData(Array(0..<200))
+        let payload = GRPCDispatchDataPayload(Array(0..<200))
         let crossed = payload.createXPCRepresentation()
         let receivedBase = xpc_data_get_bytes_ptr(crossed)
 
-        let received = GRPCSwiftData(from: crossed)
+        let received = GRPCDispatchDataPayload(from: crossed)
         let receivedViewBase = received.withUnsafeBytes { $0.baseAddress }
 
         XCTAssertEqual(receivedViewBase, receivedBase, "the crossing copied the payload")
@@ -59,7 +59,7 @@ final class GRPCSwiftDataTests: XCTestCase {
 
     /// A message body sliced out of a received blob is still a view onto that blob — the property
     /// `CompactWireCodec.decode` depends on when it hands each op's body out as
-    /// `GRPCSwiftData(viewing: data[bodyStart..<bodyEnd])`.
+    /// `GRPCDispatchDataPayload(viewing: data[bodyStart..<bodyEnd])`.
     ///
     /// The payload here is deliberately larger than `Data`'s 14-byte inline-storage threshold
     /// (measured): below it `Data` copies the value into the struct regardless of what it is given,
@@ -71,12 +71,12 @@ final class GRPCSwiftDataTests: XCTestCase {
     func testSlicingABodyOutOfABlobDoesNotCopyIt() {
         let headerLength = 10
         let blobBytes = [UInt8](repeating: 0xEE, count: headerLength) + Array<UInt8>(0..<64)
-        let object = GRPCSwiftData(blobBytes).createXPCRepresentation()
-        let received = GRPCSwiftData(from: object)
+        let object = GRPCDispatchDataPayload(blobBytes).createXPCRepresentation()
+        let received = GRPCDispatchDataPayload(from: object)
         let blobBase = received.withUnsafeBytes { $0.baseAddress }
 
         let bodyStart = received.startIndex + headerLength
-        let sliced = GRPCSwiftData(viewing: received.data[bodyStart..<received.endIndex])
+        let sliced = GRPCDispatchDataPayload(viewing: received.data[bodyStart..<received.endIndex])
         let bodyBase = sliced.withUnsafeBytes { $0.baseAddress }
 
         XCTAssertEqual(bodyBase, blobBase?.advanced(by: headerLength),
@@ -91,7 +91,7 @@ final class GRPCSwiftDataTests: XCTestCase {
         func referencesLibxpc(byteCount: Int) -> Bool {
             let object = makeXPCData([UInt8](repeating: 7, count: byteCount))
             let libxpcBase = xpc_data_get_bytes_ptr(object)
-            return GRPCSwiftData(from: object).withUnsafeBytes { $0.baseAddress } == libxpcBase
+            return GRPCDispatchDataPayload(from: object).withUnsafeBytes { $0.baseAddress } == libxpcBase
         }
         XCTAssertFalse(referencesLibxpc(byteCount: 14), "14 bytes should land in inline storage")
         XCTAssertTrue(referencesLibxpc(byteCount: 15), "15 bytes should reference libxpc's buffer")
@@ -102,8 +102,8 @@ final class GRPCSwiftDataTests: XCTestCase {
     /// `init(from:)`'s `count > 0` guard is what makes this a copy of nothing instead of a buffer
     /// over a null pointer.
     func testAnEmptyPayloadRoundTrips() {
-        let empty = GRPCSwiftData([])
-        let received = GRPCSwiftData(from: empty.createXPCRepresentation())
+        let empty = GRPCDispatchDataPayload([])
+        let received = GRPCDispatchDataPayload(from: empty.createXPCRepresentation())
         XCTAssertEqual(received.count, 0)
         XCTAssertEqual(Array(received), [])
     }
@@ -111,8 +111,8 @@ final class GRPCSwiftDataTests: XCTestCase {
     /// A slice does not rebase to zero — the type documents this, so pin it. Subscripting a
     /// decoded body from a hardcoded `0` therefore traps, which is `Data`'s own contract.
     func testASlicedBodyKeepsItsParentIndices() {
-        let blob = GRPCSwiftData([0xEE, 0xEE, 1, 2, 3])
-        let body = GRPCSwiftData(viewing: blob.data[2..<5])
+        let blob = GRPCDispatchDataPayload([0xEE, 0xEE, 1, 2, 3])
+        let body = GRPCDispatchDataPayload(viewing: blob.data[2..<5])
         XCTAssertEqual(body.startIndex, 2)
         XCTAssertEqual(Array(body), [1, 2, 3])
     }
@@ -122,7 +122,7 @@ final class GRPCSwiftDataTests: XCTestCase {
     // ---------------------------------------------------------------------------------------
 
     /// The borrow is **read-only as far as libxpc is concerned**, and nothing above this type
-    /// enforces that: `GRPCContiguousBytes` requires `withUnsafeMutableBytes`, `GRPCSwiftData` is
+    /// enforces that: `GRPCContiguousBytes` requires `withUnsafeMutableBytes`, `GRPCDispatchDataPayload` is
     /// `public`, and an application handler is free to mutate a message body it received.
     ///
     /// Forwarding straight to `Data.withUnsafeMutableBytes` hands out a writable pointer into the
@@ -138,7 +138,7 @@ final class GRPCSwiftDataTests: XCTestCase {
         let object = makeXPCData(Array(0..<128))
         let libxpcBase = xpc_data_get_bytes_ptr(object)!.assumingMemoryBound(to: UInt8.self)
 
-        var received = GRPCSwiftData(from: object)
+        var received = GRPCDispatchDataPayload(from: object)
         XCTAssertEqual(
             received.withUnsafeBytes { $0.baseAddress }, UnsafeRawPointer(libxpcBase),
             "the premise: this value must be borrowing libxpc's buffer before it is mutated")
@@ -177,8 +177,8 @@ final class GRPCSwiftDataTests: XCTestCase {
 
         // The parent blob is deliberately not kept alive past this line — that is the codec's own
         // shape, and it is what makes the slice the sole reference to the borrowed storage.
-        var body = GRPCSwiftData(
-            viewing: GRPCSwiftData(from: object).data[headerLength..<(headerLength + 64)])
+        var body = GRPCDispatchDataPayload(
+            viewing: GRPCDispatchDataPayload(from: object).data[headerLength..<(headerLength + 64)])
         XCTAssertEqual(body.startIndex, headerLength)
 
         body.withUnsafeMutableBytes { $0[0] = 0xFF }
@@ -197,8 +197,8 @@ final class GRPCSwiftDataTests: XCTestCase {
     /// and a synthesized `==` would have compared that too.
     func testEqualityIgnoresWhetherTheStorageIsBorrowed() {
         let bytes = Array<UInt8>(0..<32)
-        let borrowed = GRPCSwiftData(from: makeXPCData(bytes))
-        XCTAssertEqual(borrowed, GRPCSwiftData(bytes))
-        XCTAssertNotEqual(borrowed, GRPCSwiftData(bytes.dropLast()))
+        let borrowed = GRPCDispatchDataPayload(from: makeXPCData(bytes))
+        XCTAssertEqual(borrowed, GRPCDispatchDataPayload(bytes))
+        XCTAssertNotEqual(borrowed, GRPCDispatchDataPayload(bytes.dropLast()))
     }
 }

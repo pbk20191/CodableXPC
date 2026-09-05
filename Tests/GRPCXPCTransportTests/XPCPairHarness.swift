@@ -360,7 +360,7 @@ final class XPCPairHarnessContractTests: XCTestCase {
 ///
 /// `serialize` is generic over `Bytes` because that is how the transport's `Bytes` type reaches a
 /// serializer at all -- `RPCRouter`/`ClientRPCExecutor` call it with `Transport.Bytes`, i.e. with
-/// `GRPCSwiftData`. A serializer hardcoded to `[UInt8]` would not compile against this transport.
+/// `GRPCDispatchDataPayload`. A serializer hardcoded to `[UInt8]` would not compile against this transport.
 @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
 struct UTF8Serializer: MessageSerializer {
     typealias Message = String

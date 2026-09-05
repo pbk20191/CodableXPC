@@ -151,8 +151,8 @@ enum LifecycleMethods {
 /// Past `Data`'s 14-byte inline threshold, so every message here crosses libxpc on the same side
 /// of the borrow/copy boundary as real traffic.
 @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
-func lifecyclePayload(_ n: Int) -> GRPCSwiftData {
-    GRPCSwiftData(Array("lifecycle-payload-\(String(format: "%04d", n))".utf8))
+func lifecyclePayload(_ n: Int) -> GRPCDispatchDataPayload {
+    GRPCDispatchDataPayload(Array("lifecycle-payload-\(String(format: "%04d", n))".utf8))
 }
 
 // ===========================================================================================
@@ -208,14 +208,14 @@ enum RawSeamHandlers {
     /// handler ran" from "the handler ran to completion".
     static func echoing(finished: Observed<Bool>? = nil) -> RawSeamHandler {
         { stream, _ in
-            var bodies: [GRPCSwiftData] = []
+            var bodies: [GRPCDispatchDataPayload] = []
             do {
                 for try await part in stream.inbound {
                     if case .message(let body) = part { bodies.append(body) }
                 }
                 for body in bodies {
                     try await stream.outbound.write(
-                        .message(GRPCSwiftData(Array("echo:".utf8) + Array(body))))
+                        .message(GRPCDispatchDataPayload(Array("echo:".utf8) + Array(body))))
                 }
                 try await stream.outbound.write(.status(Status(code: .ok, message: ""), [:]))
                 finished?.set()
@@ -335,7 +335,7 @@ extension XPCClientTransport {
     /// -- Task 5 §2.1) and do not want twenty lines of stream plumbing to say so.
     func completeOneEchoRPC(
         descriptor: MethodDescriptor = LifecycleMethods.echo,
-        payload: GRPCSwiftData = lifecyclePayload(1),
+        payload: GRPCDispatchDataPayload = lifecyclePayload(1),
         options: CallOptions = .defaults
     ) async throws -> [String] {
         try await withStream(descriptor: descriptor, options: options) { stream, _ in

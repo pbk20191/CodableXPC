@@ -25,7 +25,7 @@ import XCTest
 // the encoder considers valid, which is the one thing the tests need not to be.
 //
 // Several cases run against ``RawOpBytes/offsetBlob(_:leadingPadding:)``, a blob whose bytes do not
-// start at index 0. `GRPCSwiftData` indices do not rebase to zero and in production the codec's
+// start at index 0. `GRPCDispatchDataPayload` indices do not rebase to zero and in production the codec's
 // input is always a slice of a received XPC payload, so an offset input is what distinguishes a
 // correct offset from a hardcoded one.
 
@@ -129,7 +129,7 @@ final class WireProtocolTests: XCTestCase {
     func testAHeaderLevelFailureIsConnectionFatalAndDiscardsTheWholeBlob() throws {
         let legal = RawOpBytes.op(.message, streamID: 1, body: Data(repeating: 0x11, count: 20))
 
-        let cases: [(label: String, blob: GRPCSwiftData)] = [
+        let cases: [(label: String, blob: GRPCDispatchDataPayload)] = [
             ("a truncated header", RawOpBytes.offsetBlob(Data([0x03, 0x00, 0x00, 0x00, 0x01]))),
             (
                 "a legal op followed by a truncated header",
@@ -262,7 +262,7 @@ final class WireProtocolTests: XCTestCase {
 
         func refusal(
             for input: Data, label: String, role: TestPipeCore.Role = .server
-        ) throws -> [GRPCSwiftData] {
+        ) throws -> [GRPCDispatchDataPayload] {
             let core = CoreUnderTest(role: role, label: label)
             defer { core.shutDown() }
             core.pipe.deliverRaw(RawOpBytes.offsetBlob(input))
@@ -459,8 +459,8 @@ final class WireProtocolTests: XCTestCase {
                 .metadata(5, fields: [("a", "b"), ("", ""), ("k", "안녕 hello")])
             ),
             ("metadata, empty field list", .metadata(5, fields: [])),
-            ("message", .message(7, payload: GRPCSwiftData(Array(0..<40).map { UInt8($0) }))),
-            ("message, empty payload", .message(7, payload: GRPCSwiftData([]))),
+            ("message", .message(7, payload: GRPCDispatchDataPayload(Array(0..<40).map { UInt8($0) }))),
+            ("message, empty payload", .message(7, payload: GRPCDispatchDataPayload([]))),
             ("halfClose", .halfClose(9)),
             (
                 "status with a message and trailers",
@@ -879,7 +879,7 @@ final class WireProtocolTests: XCTestCase {
             try Self.codec.encode([
                 .message(
                     1,
-                    payload: GRPCSwiftData(
+                    payload: GRPCDispatchDataPayload(
                         repeating: 0x01, count: CompactWireCodec.maxBodyLength + 1))
             ]))
     }
