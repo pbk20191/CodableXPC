@@ -217,6 +217,13 @@ struct CompactWireCodec: WireCodec {
                     // other kind's -- see `WireDecodeItem.streamOpenFailure`'s doc.
                     items.append(.streamOpenFailure(streamID, error))
                 case .metadata, .message, .halfClose, .status, .cancel, .credit:
+                    // `message` is listed here only because it cannot throw today, and if that
+                    // ever changes **it must move to the `throw error` arm above, not stay in
+                    // this one**. `.streamFailure` carries no payload, so the core charges the
+                    // receive window for a message body and never credits it back -- the peer's
+                    // connection window leaks by the full charge per rejection and the connection
+                    // eventually wedges. ``WireCodec``'s conservation requirement is the whole
+                    // argument; this is the line that would break it.
                     items.append(.streamFailure(streamID, error))
                 }
             }
@@ -344,6 +351,11 @@ struct CompactWireCodec: WireCodec {
 
         case .message:
             // Zero-copy: `body` already views the blob's own storage -- see `decode(_:)`.
+            //
+            // **This arm does not reject, and that is what makes ``WireCodec``'s conservation
+            // requirement true for this codec.** A message body is opaque bytes here. Adding a
+            // rejection -- a compression envelope, a checksum -- is not a local change: see the
+            // `.message` note in `decode(_:)`'s policy switch.
             return .message(streamID, payload: body)
 
         case .halfClose:

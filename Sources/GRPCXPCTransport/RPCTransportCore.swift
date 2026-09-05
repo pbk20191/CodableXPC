@@ -746,6 +746,15 @@ final class RPCTransportCore<Pipe: MessagePipe, Codec: WireCodec>: Sendable {
                 // codec already read off the op's own header -- see `WireDecodeItem`. This takes
                 // exactly the path `deliver(_:toStream:)`'s `.violation` case already takes, not a
                 // parallel one, because it is the same kind of failure caught one layer earlier.
+                //
+                // Nothing is charged or credited here, and that is `WireCodec`'s stated
+                // conservation requirement rather than an oversight: a `message` must never reach
+                // this arm. **It is deliberately not asserted.** The item carries an id and an
+                // error and nothing else -- no kind, no body length -- so there is nothing here to
+                // check the rule against, and giving this case a kind purely to assert on it would
+                // add wire-adjacent plumbing to police a contract one sentence already states. If
+                // a `WireCodec` ever *does* grow a rejectable `message` body, the symptom is a
+                // connection whose receive window drifts down and never recovers.
                 failStream(streamID, dueTo: error)
             case .streamOpenFailure(let streamID, let error):
                 // §O2's carve-out: `openStream` creates state, so a rejection is answered, not
@@ -873,6 +882,12 @@ final class RPCTransportCore<Pipe: MessagePipe, Codec: WireCodec>: Sendable {
         // §O4: the charge is `FlowControl.charge(for:window:)`, on both sides, never a
         // hand-inlined clamp. Recorded before the machine sees the op: bytes the peer sent are
         // owed back to its connection window whether or not the op turns out to be legal.
+        //
+        // **This is the only place a `message`'s charge is recorded, and it is why a `WireCodec`
+        // may not surface a `message` as `.streamFailure`** -- that path has no payload to charge
+        // and credits nothing, so the peer's connection window would leak by the full charge on
+        // every rejection. Stated as a seam requirement on ``WireCodec``; only the codec knows the
+        // body length this line would have measured.
         let charge: Int
         if case .message(_, let payload) = op {
             // §O4's floor makes this at least 1 even for an empty payload, so `charge > 0` below

@@ -115,9 +115,15 @@ enum RPCOp: Sendable {
 enum WireDecodeItem: Sendable {
     /// One op that decoded cleanly.
     case op(RPCOp)
-    /// One op whose body this codec rejected, for a kind that never creates state. The
-    /// `RPCStreamID` comes from the op's own header -- decoded before the body ever was -- so it
-    /// is trustworthy even though the body was not.
+    /// One op whose body this codec rejected, for a kind that never creates state **and is exempt
+    /// from flow control**. The `RPCStreamID` comes from the op's own header -- decoded before the
+    /// body ever was -- so it is trustworthy even though the body was not.
+    ///
+    /// **A `message` may not be surfaced here.** This case carries an id and an error and nothing
+    /// else -- no kind, no body length -- so the core cannot charge or credit the receive window
+    /// for it, and a `message` rejected this way would leak the peer's connection window by its
+    /// full charge, permanently. See ``WireCodec``'s conservation requirement for the whole
+    /// argument; it is a conformer obligation, and it is not checkable from this payload.
     ///
     /// **A `cancel` op is sent only if `id` names a live stream; otherwise this is silently
     /// dropped.** Both outcomes go through the same removal path a state-machine grammar violation
@@ -164,6 +170,37 @@ enum WireDecodeItem: Sendable {
 /// Batching is the codec's business, not the core's: a conformer takes and returns arrays because
 /// one XPC message may carry several ops concatenated into a single blob, and only the codec
 /// knows how its own framing marks where one op ends and the next begins.
+///
+/// # Requirement: a flow-controlled op may not be surfaced as a stream failure
+///
+/// **A `message` op whose header parses must be delivered as `.op`, or the whole `decode(_:)` call
+/// must throw. It may never be surfaced as `.streamFailure`.** Same for any future flow-controlled
+/// kind. This is a conformer obligation, not an implementation detail of the codec that ships
+/// first, and it is the one place where the seam's freedom to reject a body collides with §O4's
+/// receive-window conservation.
+///
+/// The mechanism, stated once so a conformer author does not have to reconstruct it:
+/// `RPCTransportCore.deliver(_:toStream:)` records a `message`'s charge against **both** receive
+/// windows *before* the state machine sees the op -- bytes the peer spent are owed back whether or
+/// not the op turns out to be legal -- and the credit for them is emitted when the message is
+/// consumed. The `.streamFailure` path records nothing and credits nothing: the item carries a
+/// stream id and an `RPCError`, and the core has no payload to derive a charge from, because the
+/// body it would measure is the body this codec just refused to hand over. So a codec that rejected
+/// a `message` **body** -- a bad compression envelope, a failed checksum -- would silently leak the
+/// peer's *connection* window by the full charge, on every rejection, permanently: the peer keeps
+/// deducting, this side never credits back, and the connection wedges once the arrears reach 65 535
+/// bytes. Every other stream on it stops with it.
+///
+/// Only the codec knows the body length the window was charged for, which is why the rule has to
+/// live here rather than being enforced downstream. A codec that *can* reject a `message` body must
+/// throw, which fails the connection -- a loud, immediate, correctly-attributed death instead of a
+/// slow wedge. Rejecting a body of a kind that is exempt from flow control (`metadata`, `halfClose`,
+/// `status`, `cancel`, `credit`) is what `.streamFailure` is for and stays fine, and `openStream`
+/// has its own case.
+///
+/// True by accident today: `CompactWireCodec` treats a `message` body as opaque bytes, so kind 3
+/// has no body-level rejection to make. That is a property of one conformer, not of the seam, and
+/// it is exactly the kind of accident that stops being true the first time someone adds framing.
 @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
 protocol WireCodec: Sendable {
     /// Encodes one or more ops into a single blob. The inverse of `decode(_:)`.
@@ -172,11 +209,16 @@ protocol WireCodec: Sendable {
     /// back into the items it carries, in the order they were encoded -- see `WireDecodeItem` for
     /// why an item, not always an `RPCOp`.
     ///
+    /// - Important: a `message` op whose header parses must come back as `.op` or throw -- never as
+    ///   `.streamFailure`. See the conservation requirement on the protocol itself; the receive
+    ///   window has already been charged for a body only this codec can measure.
+    ///
     /// - Throws: for a **header-level** failure (truncated framing, or a declared body length
     ///   this codec cannot trust) -- those leave no stream id to name and no framing left to
     ///   resynchronise past -- and, by §O2's carve-out, for a malformed `goAway` body, which has
     ///   no stream to name either even though the framing around it is fine. See
     ///   `WireDecodeItem`'s doc for why every other kind's body-level rejection does not throw.
+    ///   A rejectable `message` body joins this list, for the conservation reason above.
     func decode(_ blob: GRPCSwiftData) throws(RPCError) -> [WireDecodeItem]
 }
 
