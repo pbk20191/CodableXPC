@@ -364,6 +364,43 @@ final class RPCTransportCore<Pipe: MessagePipe, Codec: WireCodec>: Sendable {
     /// exactly one thing -- `pipe.send` -- plus, on ``send(_:forStream:)``'s path, the registry
     /// lookup that decides whether to send at all.
     ///
+    /// "Exactly one thing" is narrower than it used to be, and deliberately. `MessagePipe` splits a
+    /// send into `prepare` and `send`, and both send paths here call `prepare` **outside** this
+    /// lock, next to the encode that was already outside it for the same reason: neither is a
+    /// submission, and neither has an order to keep. For the XPC conformer that moves
+    /// `xpc_dictionary_create` and the `Data` -> `xpc_data` payload copy out of the critical
+    /// section. This matters twice over: `submission` is a **blocking** `Mutex`, so every writer
+    /// contending here consumes a cooperative-pool thread for the holder's whole hold -- the width
+    /// of this section is a pool-starvation question, not only a throughput one.
+    ///
+    /// # The hold, measured both ways
+    ///
+    /// A standalone probe over one real `XPCListener`/`XPCSession` pair, timing the critical
+    /// section itself (lock acquired -> lock released) with the message built inside it and then
+    /// before it. Apple M3 Pro, 12 cores; µs; 20 000 sends at 33 B, 4 000 at 64 KiB.
+    ///
+    /// | payload | writers | build | mean | p50 | p90 | p99 |
+    /// |---|---|---|---|---|---|---|
+    /// | 33 B    | 1  | inside  | 0.82 | 0.75 | 0.96 | 2.75 |
+    /// | 33 B    | 1  | outside | **0.41** | 0.42 | 0.50 | **0.62** |
+    /// | 33 B    | 12 | inside  | 1.79 | 1.38 | 3.08 | 7.62 |
+    /// | 33 B    | 12 | outside | **0.97** | 0.83 | 1.50 | **2.54** |
+    /// | 64 KiB  | 1  | inside  | 13.4-19.6 | 12.9-16.7 | 16.6-31.3 | 21.0-46.1 |
+    /// | 64 KiB  | 1  | outside | **10.6-12.7** | 9.5-11.9 | 14.4-16.7 | **17.7-24.2** |
+    /// | 64 KiB  | 12 | inside  | 14.1-20.3 | 13.8-16.8 | 16.8-33.3 | 20.0-55.5 |
+    /// | 64 KiB  | 12 | outside | **10.4-14.5** | 10.1-10.3 | 12.1-16.8 | **16.3-16.8** |
+    ///
+    /// So: the hold roughly **halves** for small messages (the whole of it was message
+    /// construction) and falls by a quarter to a third at 64 KiB, where the syscall itself
+    /// dominates. The tail is where it shows most -- 33 B/12 writers p99 7.62 -> 2.54 µs, 64 KiB/12
+    /// writers p99 20-55 -> ~16.5 µs -- which is the number that bounds a starvation burst.
+    ///
+    /// **Honest caveat on the absolute figures.** The audit that proposed this change quoted a
+    /// ~3.7 µs mean hold at 64 KiB from a `xpc_session_send`-only measurement; this probe saturates
+    /// one connection from one process and sees 13-20 µs, because a flooded session throttles. The
+    /// *delta* is what reproduces, and it reproduces at the predicted size (~3 µs of copy leaving
+    /// the lock at 64 KiB). Do not read the absolute column as a per-send cost in production.
+    ///
     /// It guards **no state**, which is why it lives here and not in the section below: the
     /// registry is still the one lock over this object's mutable state, and this one orders side
     /// effects. Two locks, two jobs, and the nesting is one-way: `submission` may be held while
@@ -1475,11 +1512,17 @@ final class RPCTransportCore<Pipe: MessagePipe, Codec: WireCodec>: Sendable {
         // Deliberately outside the lock: encoding is pure, and it is the widest part of what used
         // to be the racing window. Wire order is submission order, not encode order.
         let blob = try codec.encode(ops)
+        // Outside for exactly the same reason, and it is the same reason twice: building the
+        // substrate's message is pure too. The XPC conformer's `prepare` is where the
+        // `Data` -> `xpc_data` payload copy happens, which used to run under this lock -- see the
+        // measured table on `submission`. Preparation is not submission and has no order to keep;
+        // `pipe.send` is, and stays inside.
+        let prepared = pipe.prepare(blob)
         try submission.withLock { _ throws(RPCError) in
             guard registry.withLock({ $0.streams[id] != nil }) else {
                 throw streamNoLongerOpen(id)
             }
-            try pipe.send(blob)
+            try pipe.send(prepared)
         }
     }
 
@@ -1494,8 +1537,12 @@ final class RPCTransportCore<Pipe: MessagePipe, Codec: WireCodec>: Sendable {
     /// - Throws: the codec's error, or the substrate's `RPCError(code: .unavailable)`.
     private func sendEncoded(_ ops: [RPCOp]) throws(RPCError) {
         guard !ops.isEmpty else { return }
+        // Encode and prepare outside, submit inside -- see ``send(_:forStream:)`` for both halves
+        // of the argument. This path has no registry check, so the critical section is now the
+        // bare `pipe.send`.
         let blob = try codec.encode(ops)
-        try submission.withLock { _ throws(RPCError) in try pipe.send(blob) }
+        let prepared = pipe.prepare(blob)
+        try submission.withLock { _ throws(RPCError) in try pipe.send(prepared) }
     }
 
     /// Sends control ops that have no caller to report a failure to -- credit, `goAway`, teardown
@@ -2168,6 +2215,13 @@ extension ResponseOpEncoder: OutboundOpEncoding {
 /// of the `metadata` that must precede it. `pipe.send` is synchronous and does not block on the
 /// peer, so holding the lock across it costs a short critical section and buys the ordering
 /// outright. Credit, which *does* suspend, is acquired before the lock is taken.
+///
+/// Note where the substrate's message build lands: `core.send(_:forStream:)` calls `pipe.prepare`
+/// outside the connection-wide ``RPCTransportCore/submission`` lock but *inside* this one, because
+/// this one is held around the whole call. That is the right side of the trade -- this lock is
+/// **per writer**, so the only thing it can delay is a second concurrent write to the same stream,
+/// which has no defined order to lose anyway; `submission` is per connection and is what every
+/// stream's writer queues on.
 ///
 /// **``finish()`` obeys this too, and did not always.** It used to encode under the lock and send
 /// after releasing it -- the exact shape this section forbids -- so a `write` racing a `finish`

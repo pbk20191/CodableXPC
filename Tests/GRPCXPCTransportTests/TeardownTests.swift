@@ -428,7 +428,8 @@ final class TeardownTests: XCTestCase {
                 // and nothing else. Sending undecodable bytes would make the server fail the
                 // connection and cancel its own session, which is *also* a peer death for us --
                 // and would leave the test unable to say which teardown it had measured.
-                try pipe.send(CompactWireCodec().encode([.goAway(lastStreamID: 0)]))
+                try pipe.send(
+                    pipe.prepare(CompactWireCodec().encode([.goAway(lastStreamID: 0)])))
                 XCTAssertEqual(
                     deaths.value, 0,
                     "the far end died before the test killed it")

@@ -619,18 +619,59 @@ final class XPCPipe: MessagePipe {
     // MARK: MessagePipe
     // ---------------------------------------------------------------------------------------
 
-    /// Hands one blob to the peer as `{"b": xpc_data}`, one-way -- never the reply overload.
+    /// One blob already turned into the `{"b": xpc_data}` dictionary libxpc will carry. See
+    /// ``MessagePipe/Prepared``.
+    ///
+    /// `@unchecked Sendable`, and the reason is narrow enough to state exactly: the overlay's
+    /// `XPCDictionary` is a *mutable* handle on an `xpc_object_t` and so is rightly not `Sendable`,
+    /// but this wrapper is `frozen` in practice -- one `let`, built in one place
+    /// (``XPCPipe/prepare(_:)``), read in one place (``XPCPipe/send(_:)``), and exposing no way to
+    /// reach or mutate the dictionary in between. libxpc's own objects are refcount-safe across
+    /// threads; what is not safe is two threads mutating one dictionary, and there is no second
+    /// reference here to mutate it through. It also never actually crosses a thread today -- the
+    /// core prepares and submits in one synchronous function -- so the annotation buys uniformity
+    /// at the seam rather than covering for a real hand-off.
+    ///
+    /// The `count` is carried alongside because the error message wants it and the built message
+    /// no longer has the blob to ask.
+    struct Prepared: @unchecked Sendable {
+        fileprivate let message: XPCDictionary
+        fileprivate let count: Int
+    }
+
+    /// Builds the `{"b": xpc_data}` message, which is where the outbound payload copy happens.
+    ///
+    /// **This is the whole reason `MessagePipe` has a prepare step.** `xpc_dictionary_create` plus
+    /// `createXPCRepresentation()` -- the `Data` -> `xpc_data` payload copy -- used to run inside
+    /// `RPCTransportCore`'s submission lock, because they lived at the top of `send`. Every writer
+    /// contending for that lock blocked a cooperative-pool thread for the duration of another
+    /// writer's *copy*, on top of its syscall. Building here moves all of it outside, and the lock
+    /// now spans the `xpc_session_send` and nothing else: measured, that halves the hold for small
+    /// messages and takes a quarter to a third off it at 64 KiB (table on
+    /// ``RPCTransportCore/submission``).
+    ///
+    /// Deliberately **not** phase-checked. A pipe torn down between this call and ``send(_:)``
+    /// would defeat a check here anyway, and the check that matters is the one that guards the
+    /// libxpc call -- see `send`. The worst a shut-down pipe costs here is one wasted message.
+    func prepare(_ blob: GRPCSwiftData) -> Prepared {
+        let message = xpc_dictionary_create(nil, nil, 0)
+        // The outbound libxpc crossing -- the only one in this target.
+        xpc_dictionary_set_value(message, Self.blobKey, blob.createXPCRepresentation())
+        return Prepared(message: XPCDictionary(message), count: blob.count)
+    }
+
+    /// Hands one prepared blob to the peer, one-way -- never the reply overload.
     ///
     /// One-way is load-bearing: this transport's flow control is an explicit `credit` op (§O4),
     /// not an XPC reply, so the reply channel stays unused in both directions and either peer can
     /// originate. (The legacy stack used replies as credit; that is gone.)
     ///
-    /// Callable from any queue, as `MessagePipe` promises. No lock is held across
+    /// Callable from any queue, as `MessagePipe` promises. No lock is held *here* across
     /// `session.send(message:)`: libxpc's own send is thread-safe and totally ordered per
-    /// connection, so serializing sends *here* would buy nothing but a contention point. Two blobs
-    /// handed to `send` concurrently from two threads have no defined order *to* preserve -- what
-    /// the contract promises, and what libxpc delivers, is that whichever order libxpc accepts
-    /// them in is the order the peer's `onReceive` sees.
+    /// connection, so serializing sends *in this file* would buy nothing but a contention point.
+    /// Two blobs handed to `send` concurrently from two threads have no defined order *to*
+    /// preserve -- what the contract promises, and what libxpc delivers, is that whichever order
+    /// libxpc accepts them in is the order the peer's `onReceive` sees.
     ///
     /// **That last sentence is load-bearing above this file, and it is measured rather than
     /// assumed.** `RPCTransportCore` orders its own outbound ops by serialising the *decision to
@@ -641,12 +682,17 @@ final class XPCPipe: MessagePipe {
     /// row **S2** moves the send outside the lock -- allocating the sequence number under it, as a
     /// check-then-send does -- and reorders 10 168 of 20 000. So the ordering the layers above rely
     /// on comes from *their* serialisation plus libxpc's FIFO, and neither half is sufficient
-    /// alone.
+    /// alone. Note what that row does and does not license: it is the *submission* that has to stay
+    /// under the core's lock. ``prepare(_:)`` is not a submission and has no order to keep.
+    ///
+    /// **The phase check stays here, not in `prepare`**, because here is where it is effective: it
+    /// is the guard immediately before the libxpc call, and the core holds its submission lock
+    /// across this function, so a `cancel()` cannot land between the check and the send.
     ///
     /// Errors are shaped, never passed through: once the peer is gone libxpc fails the send with
     /// its own rich error, and every caller in this transport -- and gRPC's machinery above it --
     /// expects a transport failure as an `RPCError`.
-    func send(_ blob: GRPCSwiftData) throws(RPCError) {
+    func send(_ prepared: Prepared) throws(RPCError) {
         // Fail fast on a pipe that is already torn down. This is the only lock the send path
         // takes, and it is read-only.
         let phase = state.withLock { $0.phase }
@@ -655,16 +701,13 @@ final class XPCPipe: MessagePipe {
                 code: .unavailable,
                 message: "the XPC pipe is not running (\(phase)); the blob was not sent")
         }
-        let message = xpc_dictionary_create(nil, nil, 0)
-        // The outbound libxpc crossing -- the only one in this target.
-        xpc_dictionary_set_value(message, Self.blobKey, blob.createXPCRepresentation())
         do {
-            try session.send(message: XPCDictionary(message))
+            try session.send(message: prepared.message)
         } catch {
             throw RPCError(
                 code: .unavailable,
                 message: "the XPC connection is no longer available "
-                    + "(sending a \(blob.count)-byte blob failed: \(error))")
+                    + "(sending a \(prepared.count)-byte blob failed: \(error))")
         }
     }
 

@@ -288,7 +288,10 @@ final class ClientLifecycleTests: XCTestCase {
                 // **The assertion, with the transport, the core and the pipe all still alive.**
                 var sendError: (any Error)?
                 do {
-                    try pipe.send(lifecyclePayload(4))
+                    // Two steps, as the core does it: `prepare` never fails (it only builds the
+                    // xpc message), so the throw under test is `send`'s phase guard and nothing
+                    // else.
+                    try pipe.send(pipe.prepare(lifecyclePayload(4)))
                 } catch {
                     sendError = error
                 }

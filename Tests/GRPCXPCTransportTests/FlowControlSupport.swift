@@ -86,6 +86,13 @@ final class TestPipe: MessagePipe, @unchecked Sendable {
     // MARK: MessagePipe
     // -------------------------------------------------------------------------------------
 
+    /// The blob itself. A `TestPipe` has no substrate message to build, so there is nothing for
+    /// ``prepare(_:)`` to do and the split costs this conformer nothing -- which is the point of
+    /// `Prepared` being an associated type: a substrate that needs no preparation declares so.
+    typealias Prepared = GRPCSwiftData
+
+    func prepare(_ blob: GRPCSwiftData) -> GRPCSwiftData { blob }
+
     func send(_ blob: GRPCSwiftData) throws(RPCError) {
         // Read under the lock, called **outside** it. An observer runs inside whatever core call is
         // doing the sending, and may reach back into the core or the transport above it; doing that

@@ -112,7 +112,7 @@ final class AcceptWindowTests: XCTestCase {
             dialledPipes.append(pipe)
             // A send may legitimately fail for the rejected peer, depending on when libxpc gets
             // round to refusing it; the blob only has to be *attempted* to wake the listener.
-            try? pipe.send(lifecyclePayload(500))
+            try? pipe.send(pipe.prepare(lifecyclePayload(500)))
         }
 
         try runBounded("accept window", timeout: 10) {

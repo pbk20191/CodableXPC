@@ -243,15 +243,56 @@ protocol WireCodec: Sendable {
 /// core processing never interleaving from two different queues. A substrate that cannot promise
 /// either property needs a sequencing adapter in front of it before it can conform here; weakening
 /// this contract to fit such a substrate would just move the bug into the core.
+///
+/// # Sending is two steps, and only the second one is ordered
+///
+/// A send is split into ``prepare(_:)`` and ``send(_:)`` because the core takes a lock across the
+/// submission -- **wire order is submission order**, measured (row S1/S2: moving the submission out
+/// of that lock reordered 10 168 of 20 000 sends) -- and everything a substrate does to turn bytes
+/// into its own message shape is work that does not have to happen in there. For the XPC conformer
+/// that work is `xpc_dictionary_create` plus the `Data` -> `xpc_data` payload copy, and it was
+/// roughly half the hold at small sizes and a quarter to a third of it at 64 KiB; see
+/// ``RPCTransportCore/submission`` for the measured table. The split lets the core prepare outside
+/// the lock, next to the encode that is already outside it for the same reason, and hold the lock
+/// across the submission only.
+///
+/// The obligation this puts on a conformer: **``prepare(_:)`` must not submit anything, and
+/// ``send(_:)`` must not do work that could have been done in `prepare`.** A conformer that
+/// ignored the split -- preparing lazily and doing everything in `send` -- would still be correct,
+/// just no faster.
+///
+/// ``Prepared`` is an associated type rather than an existential or an `xpc_object_t` so that
+/// **nothing substrate-shaped crosses this seam**: the core names `Pipe.Prepared` and never looks
+/// inside it, which is what keeps `RPCTransportCore.swift` free of `import XPC`.
 @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
 protocol MessagePipe: Sendable {
+    /// One blob, in whatever shape this substrate hands to its transport. Opaque to the core.
+    associatedtype Prepared: Sendable
+
     /// All delivery — every `onReceive` and `onPeerDeath` invocation — happens serially on this
     /// queue. See the protocol's ordering contract above.
     var queue: DispatchSerialQueue { get }
 
-    /// Hands one blob to the peer. Conformers queue or block as appropriate to their substrate;
-    /// callers may call this from any queue.
-    func send(_ blob: GRPCSwiftData) throws(RPCError)
+    /// Turns one blob into whatever ``send(_:)`` wants, doing as much of the substrate's per-message
+    /// work as can be done before the send is ordered.
+    ///
+    /// **Pure, and non-submitting.** The core calls this *outside* its submission lock, so a
+    /// conformer that sent from here would break the one property the lock exists for. It is also
+    /// allowed to run on a pipe that is already torn down: nothing is on the wire yet, so the
+    /// liveness question belongs to ``send(_:)`` -- asking it here would be a check the pipe could
+    /// fail between the two calls anyway.
+    ///
+    /// Callable from any queue, like ``send(_:)``.
+    func prepare(_ blob: GRPCSwiftData) -> Prepared
+
+    /// Hands one prepared blob to the peer. Conformers queue or block as appropriate to their
+    /// substrate; callers may call this from any queue.
+    ///
+    /// The core holds a lock across this call and nothing else, so a conformer should do the least
+    /// it can here -- ideally only the substrate's own submission. Two blobs whose `send` calls are
+    /// ordered by a happens-before must reach the peer in that order (see the contract above);
+    /// two `prepare` calls have no order to preserve.
+    func send(_ prepared: Prepared) throws(RPCError)
 
     /// Registers the handler that receives blobs from the peer, in send order, on `queue`. Set
     /// once, before the pipe is activated — a conformer is not required to support replacing or
