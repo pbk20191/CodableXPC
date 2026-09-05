@@ -273,6 +273,45 @@ defaults — not because we are HTTP/2 but because those numbers and that shape 
 
 ## Verified API facts (pinned — do not re-derive, do not guess)
 
+### The actor migration: evaluated, measured, shelved (2026-08-31)
+
+A full feasibility study, a hop/blocking audit, and a partial conversion attempt exist for moving
+`RPCTransportCore` to an actor whose executor is the connection's `DispatchSerialQueue`. The owner
+shelved it on a measured criterion: **the migration costs performance and its value is structural.**
+The current design is already the async-minimal, queue-synchronized point — outbound has zero hops
+and suspends only when backpressure means it should; inbound's one `queue.async` is load-bearing and
+deleting it measured as a regression (~3.0 → ~3.7 µs/msg); the two surviving Mutexes sit exactly
+where a queue cannot (`submission`, because inbound routing itself sends; the flow-control windows,
+because writers park cross-thread).
+
+Numbers that drove the decision (probes in the local-only `docs/xpc-platform-matrix/`):
+actor-submit 8.3–9.7 µs vs mutex 0.66 µs single-writer; ~2× on saturated streaming; actor wins only
+at pool-width concurrent writers (starvation canary 8.9–10.7 ms mutex vs 2.2 ms actor).
+
+**Probe-settled facts a revival inherits** (all 40/40 at the 15.0 floor, `-swift-version 6
+-strict-concurrency=complete`; rows D1–D3, `run-actor.sh`):
+- **D1 refuted the feasibility review's "deinit is blocked without macOS 15.4."** A plain actor
+  `deinit` has exclusive stored-property access at refcount zero, `CheckedContinuation.resume` is
+  legal from any thread, and the pipe is nonisolated — teardown never needs the executor, so
+  `isolated deinit` (15.4) is NOT required. The floor bump is off the migration's cost list.
+- D2: queue-as-executor + `assumeIsolated` (post-hop and via `queue.sync`) + typed-throws actor
+  methods all compile and hold at the 15.0 target. D3: pending weak-upgrade hops find nil cleanly.
+- `RPCWriter.Closable` serialises nothing (verified in grpc-swift source), so same-stream writes
+  genuinely race: the writer's encoder Mutex is load-bearing. The only actor shape that neither
+  reopens the S2 submission window nor drags both payload copies onto the connection queue is
+  enqueue-inside-the-encoder-lock, suspend-outside:
+  `withCheckedContinuation { state.withLock { encode; prepare; core.enqueueSubmission(resuming:) } }`.
+- The frozen-drain anchor test stops discriminating under an actor (its frozen send freezes the
+  connection queue; the L9 mutation then hangs past the hook and passes). A bound-based redesign is
+  specified in `actor-phase1-report.md` but was never run — treat it as unverified.
+
+**Revival gate**: (1) `run-assume.sh` green on a real macOS 15.0 host — `assumeIsolated`'s runtime
+behaviour from these entry points is measured only on macOS 27, and this file already carries one
+row that changed answer across OS versions; (2) either accept the measured streaming cost or build
+the enqueue-inside-lock outbound above; (3) the owner asks. The conversion attempt's full record is
+in `actor-phase1-report.md`, `actor-review.md`, and `hop-audit.md` (session-local, gitignored).
+
+
 ### grpc-swift-2 2.4.2 (`GRPCCore`)
 
 ```swift
