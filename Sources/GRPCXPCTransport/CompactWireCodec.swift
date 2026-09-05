@@ -69,6 +69,51 @@ struct CompactWireCodec: WireCodec {
     // MARK: - WireCodec
     // =======================================================================================
 
+    /// Concatenates `ops` into one blob. A `message` op's body is copied in here -- see
+    /// `encodeOne`'s `.message` arm -- and that copy is **deliberate**, not an oversight anyone has
+    /// yet got round to.
+    ///
+    /// # The concatenation was measured as a deletion candidate, and the deletion lost
+    ///
+    /// The shape that would remove it: hand the substrate a two-segment `dispatch_data` -- a small
+    /// contiguous prefix (every preceding op plus this op's 10-byte header) and the payload itself
+    /// -- so the payload never gets copied on the way to libxpc. The shape fits: a `message` op is
+    /// always **last** in a batch (`StreamStateMachines` emits `[message]`, `[metadata, message]` or
+    /// `[openStream, message]`, never a suffix), and the receiver cannot tell -- libxpc flattens
+    /// during serialisation, so a chained `xpc_data` arrives contiguous and the inbound zero-copy
+    /// survives (`docs/xpc-platform-matrix/OutboundCopyMatrix.swift` row **C5**, non-NULL
+    /// `xpc_data_get_bytes_ptr` at 33 B / 1 KiB / 64 KiB / 1 MiB for all three send shapes).
+    ///
+    /// It is slower anyway. Row **C7**, real session pair, §O4's 65 535-byte window, fresh payload
+    /// per message, arms interleaved, 9 repeats (medians, µs, from one run):
+    ///
+    /// | payload | today: prepare / send / e2e | zero-copy chain | e2e ratio, 3 runs |
+    /// |---------|-----------------------------|-----------------|-------------------|
+    /// | 16 KiB  | 14.9 / 15.7 / 38.0          | 2.3 / **34.6** / 51.8 | 1.36× 1.36× 1.35× |
+    /// | 64 KiB  | 9.7 / 34.0 / 81.6           | 2.8 / 38.9 / 87.8 | 1.08× 1.08× 2.68× |
+    /// | 1 MiB   | 71.6 / 163.7 / 285.8        | 1.9 / **210.5** / 502.0 | 1.76× 1.73× 2.07× |
+    ///
+    /// The absolute microseconds drift between runs -- the last column is there so the next reader
+    /// does not treat them as reproducible to three digits -- but **the chain is slower in every
+    /// run at every size**, and the ratio is what reproduces.
+    ///
+    /// Two measured reasons. **The copy reappears inside `xpc_session_send`**, which runs under
+    /// ``RPCTransportCore/submission`` -- so the chain trades work that is outside the lock for work
+    /// that is inside it, and at 16 KiB it doubles the hold, undoing what `4e23f79` was for. And **a
+    /// no-copy wrap defers the payload's `free` to a global queue**: `DispatchData`'s deallocator is
+    /// asynchronous and runs on another thread (row **C4**), so malloc's per-thread magazine cannot
+    /// recycle the block and the *next* message's serialisation faults in fresh pages -- payload
+    /// synthesis went 39.7 → 119.2 µs at 1 MiB with RSS climbing 236 MiB over 400 messages (row
+    /// **C8**, whose `today+hold` arm proves it is the deferred cross-thread free and not merely the
+    /// longer lifetime). Neither is fixed by page-aligning the payload or pre-converting it to a
+    /// dispatch-owned buffer; both were tried and land within noise of each other.
+    ///
+    /// The one variant that comes close keeps `prepare`'s conversion and deletes only this copy. It
+    /// reliably halves `prepare`'s CPU at ≥ 64 KiB (−46 % ± 2 across runs at 256 KiB and 1 MiB), but
+    /// its end-to-end effect does not converge -- −8 % to +19 % at 1 MiB over three runs -- and
+    /// below 64 KiB it doubles the lock hold for nothing. So the concatenation stays for the whole
+    /// size range, not merely the small end. The numbers, and the four conditions that would make it
+    /// worth revisiting, are in `.superpowers/sdd/2026-08-27-grpc-xpc-op-transport/nocopy-report.md`.
     func encode(_ ops: [RPCOp]) throws(RPCError) -> GRPCDispatchDataPayload {
         var out = Data()
         out.reserveCapacity(Self.encodedLengthLowerBound(ops))

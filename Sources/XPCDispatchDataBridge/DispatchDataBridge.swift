@@ -23,15 +23,45 @@ private extension NSData {
 ///      1 MiB   0.092 ms -> 0.014 ms
 ///     64 MiB   5.123 ms -> 2.370 ms
 ///
-/// It is not zero-copy, and it cannot be. A Swift `Data` is never backed by
-/// dispatch data — it bridges to `__NSSwiftData`, while an `NSData` built in
-/// Objective-C at size *is* an `OS_dispatch_data` — so there is nothing to hand
-/// over for free. This trades libxpc's copy for dispatch's, which is vm-based
-/// once the payload is large enough to matter.
+/// It is not zero-copy. A Swift `Data` is never *itself* backed by dispatch data
+/// — it bridges to `__NSSwiftData`, while an `NSData` built in Objective-C at
+/// size *is* an `OS_dispatch_data` — so there is no dispatch object to hand over
+/// as-is. This trades libxpc's copy for dispatch's, which is vm-based once the
+/// payload is large enough to matter.
 ///
-/// For a genuinely zero-copy payload the caller has to own the buffer's
-/// lifetime, which means holding a `DispatchData` and passing the object
-/// through ``XPCNativeObject``.
+/// ## Zero-copy is reachable, and measured slower
+///
+/// This doc used to say zero-copy "cannot be", which is wrong and worth
+/// correcting where the next reader will act on it. `NSData.bytes` is stable for
+/// the NSData's lifetime, so this wraps a Swift `Data` with no copy at all:
+///
+/// ```swift
+/// let ns = data as NSData
+/// let dd = DispatchData(
+///     bytesNoCopy: UnsafeRawBufferPointer(start: ns.bytes, count: ns.length),
+///     deallocator: .custom(nil, { withExtendedLifetime(ns) {} }))
+/// ```
+///
+/// It is pointer-identical for every shape this package produces, including a
+/// slice with a non-zero `startIndex`
+/// (`docs/xpc-platform-matrix/OutboundCopyMatrix.swift` row **C6**; only ≤ 14-byte
+/// inline `Data` copies, since `_NSInlineData` has nothing to point at).
+/// `xpc_data_create_with_dispatch_data` then retains it rather than copying it
+/// (row **C1**), and the peer still receives contiguous bytes (row **C5**).
+///
+/// It is nonetheless the wrong trade, measured over a real session pair (row
+/// **C7**): the copy this function skips reappears inside `xpc_session_send`,
+/// because libxpc serialises a dispatch-owned buffer faster than a foreign one;
+/// and the payload's `free` moves onto a global queue, since `DispatchData`'s
+/// deallocator is asynchronous and cross-thread (row **C4**), which stops
+/// malloc recycling the block for the next message. `GRPCXPCTransport` measured
+/// the substitution at every size from 16 KiB to 1 MiB and kept this copy —
+/// see `CompactWireCodec.encode` and `XPCPipe.prepare` for the numbers.
+///
+/// So the copy is buying two things, not one: dispatch's cheaper transfer *and*
+/// a buffer libxpc and dispatch can both dispose of on the fast path. For a
+/// caller that genuinely wants to own the buffer's lifetime, the route is still
+/// holding a `DispatchData` and passing the object through ``XPCNativeObject``.
 ///
 /// ## Why the threshold is not ours
 ///

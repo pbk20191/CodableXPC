@@ -653,6 +653,23 @@ final class XPCPipe: MessagePipe {
     /// Deliberately **not** phase-checked. A pipe torn down between this call and ``send(_:)``
     /// would defeat a check here anyway, and the check that matters is the one that guards the
     /// libxpc call -- see `send`. The worst a shut-down pipe costs here is one wasted message.
+    ///
+    /// # That copy is load-bearing, and deleting it costs more than it saves
+    ///
+    /// `createXPCRepresentation()` reaches `DispatchDataBridge`, which at ≥ ~64 KiB converts the
+    /// blob into a **dispatch-owned, vm-backed** buffer. The hop audit counts that as the second of
+    /// two wasted payload memcpys. It is not waste: measured, libxpc serialises a dispatch-owned
+    /// contiguous buffer ~20 % faster than a foreign no-copy one, and dispatch frees it promptly
+    /// with `vm_deallocate` instead of handing a malloc'd block to a deferred free on another
+    /// thread. Replacing it with a genuine zero-copy wrap -- which is *possible*
+    /// (`docs/xpc-platform-matrix/OutboundCopyMatrix.swift` row **C1**: pointer identity, and the
+    /// deallocator fires only when the `xpc_data` dies) and *wire-safe* (row **C5**: the peer still
+    /// sees contiguous bytes) -- moves the cost into `xpc_session_send`, i.e. **inside**
+    /// ``RPCTransportCore/submission``, and loses at every size from 16 KiB to 1 MiB (row **C7**).
+    ///
+    /// So both outbound payload copies stay. `CompactWireCodec.encode` carries the other half of
+    /// the argument and the numbers; the write-up is
+    /// `.superpowers/sdd/2026-08-27-grpc-xpc-op-transport/nocopy-report.md`.
     func prepare(_ blob: GRPCDispatchDataPayload) -> Prepared {
         let message = xpc_dictionary_create(nil, nil, 0)
         // The outbound libxpc crossing -- the only one in this target.
